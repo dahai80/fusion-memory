@@ -15,6 +15,23 @@ pub enum MemoryType {
 }
 
 impl MemoryType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MemoryType::Episodic => "Episodic",
+            MemoryType::Semantic => "Semantic",
+            MemoryType::Procedural => "Procedural",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "Episodic" => Some(Self::Episodic),
+            "Semantic" => Some(Self::Semantic),
+            "Procedural" => Some(Self::Procedural),
+            _ => None,
+        }
+    }
+
     /// 初始权重 W0（PRD §5.1）。
     pub fn initial_weight(self) -> f64 {
         match self {
