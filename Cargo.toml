@@ -51,7 +51,21 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # ID
 ulid = "1"
 
+# 存储
+rusqlite = { version = "0.40", features = ["bundled"] }
+# sled 1.0-alpha 的 Db/Tree 非 Sync（RefCell EBR），换稳定 0.34（Send+Sync）。Rule 7。
+sled = "0.34"
+hnsw_rs = "0.3"
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+
+# HTTP client (fusion-mlx embedding/chat, 127.0.0.1 only, 无 TLS)
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+
 # 测试
+tempfile = "3"
+
 [profile.release]
 opt-level = 3
 lto = "thin"

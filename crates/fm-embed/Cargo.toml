@@ -5,9 +5,22 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "fusion-memory fm-embed crate (M0 stub)"
+description = "fusion-memory embedding: fusion-mlx bge-m3 + LRU 缓存 + 背压。PRD §3.3, §6.3, A3"
+
+[features]
+# 真实模型集成测试 (需起 fusion-mlx 加载 bge-m3)
+mlx-live = []
 
 [dependencies]
 fm-core = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+reqwest = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+fm-similarity = { workspace = true }

@@ -5,9 +5,24 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "fusion-memory fm-cli crate (M0 stub)"
+description = "fusion-memory CLI: commit/query/stats/doctor。PRD §11.5"
+
+[[bin]]
+name = "fm"
+path = "src/main.rs"
 
 [dependencies]
 fm-core = { workspace = true }
+fm-engine = { workspace = true }
+fm-store = { workspace = true }
+fm-persist = { workspace = true }
+fm-embed = { workspace = true }
+fm-graph = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+tokio = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+ulid = { workspace = true }
+rusqlite = { workspace = true }

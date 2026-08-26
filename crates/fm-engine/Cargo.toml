@@ -5,9 +5,24 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "fusion-memory fm-engine crate (M0 stub)"
+description = "fusion-memory 引擎: commit/retrieve/consolidate + 实体抽取 + 融合评分。PRD §6, §11.1, §11.4"
 
 [dependencies]
 fm-core = { workspace = true }
+fm-store = { workspace = true }
+fm-persist = { workspace = true }
+fm-embed = { workspace = true }
+fm-similarity = { workspace = true }
+fm-graph = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+ulid = { workspace = true }
+thiserror = { workspace = true }
+reqwest = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+tempfile = { workspace = true }
+fm-embed = { workspace = true }
