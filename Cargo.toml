@@ -1,0 +1,57 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/fm-core",
+    "crates/fm-engine",
+    "crates/fm-similarity",
+    "crates/fm-graph",
+    "crates/fm-store",
+    "crates/fm-embed",
+    "crates/fm-persist",
+    "crates/fm-server",
+    "crates/fm-py",
+    "crates/fm-cli",
+]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.87"
+license = "Apache-2.0"
+authors = ["Fusion-MLX Team"]
+repository = "https://github.com/dahai80/fusion-memory"
+
+[workspace.dependencies]
+# 内部 crate
+fm-core = { path = "crates/fm-core" }
+fm-engine = { path = "crates/fm-engine" }
+fm-similarity = { path = "crates/fm-similarity" }
+fm-graph = { path = "crates/fm-graph" }
+fm-store = { path = "crates/fm-store" }
+fm-embed = { path = "crates/fm-embed" }
+fm-persist = { path = "crates/fm-persist" }
+fm-server = { path = "crates/fm-server" }
+fm-py = { path = "crates/fm-py" }
+
+# 序列化
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# 异步
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+
+# 错误处理
+anyhow = "1"
+thiserror = "1"
+
+# 日志
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# ID
+ulid = "1"
+
+# 测试
+[profile.release]
+opt-level = 3
+lto = "thin"
