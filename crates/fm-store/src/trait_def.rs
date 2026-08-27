@@ -5,8 +5,10 @@
 
 use fm_core::MemoryResult;
 
-/// 零拷贝缓冲（store-fusion 下为 mmap 切片；store-stub 不用）。
-/// M1 保留类型签名，实际 store-stub 走 owned。
+/// 字节缓冲。
+/// §3.16: 类型名 ZeroCopyBuffer 源自 store-fusion mmap 零拷贝蓝图; 当前后端 store-stub 走 owned
+/// (sled::IVec 生命周期绑 db, 必须拷出), 非真零拷贝。保留类型名以稳定 trait ABI, 文档标注此处 owned。
+/// store-fusion 落地后, data 可换 mmap 切片实现真零拷贝。
 pub struct ZeroCopyBuffer {
     pub data: Vec<u8>,
 }
@@ -40,6 +42,10 @@ pub trait FusionStoreEngine: Send + Sync {
 
     /// 删向量（A1/C3 修正: tombstone 软删，compact 物理删）。
     fn delete_vector(&self, id: u64) -> MemoryResult<()>;
+
+    /// §1.4: 枚举所有非 tombstone 向量 id (reconcile 反向对账: store→SQLite 孤儿扫描)。
+    /// trait 化后 store 后端可换 (store-stub/store-fusion), 引擎不绑死具体类型。
+    fn list_vector_ids(&self) -> MemoryResult<Vec<u64>>;
 
     /// 维度。
     fn dimension(&self) -> usize;

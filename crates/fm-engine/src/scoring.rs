@@ -4,8 +4,7 @@
 //! α=0.5, β=0.3, γ=0.2。W(t) 由 fm_similarity::weight_at 算。
 
 use fm_core::{EntityNode, MemoryItem, MemoryType};
-use fm_graph::GraphResult;
-use fm_persist::Persist;
+use fm_graph::{GraphResult, GraphStore};
 use fm_similarity::weight_at;
 use tracing::debug;
 
@@ -46,8 +45,9 @@ pub fn entity_ids(entities: &[EntityNode]) -> Vec<String> {
 }
 
 /// 带 DB 的完整评分: 取 cosine + W(t) + graph_affinity。PRD §6.4。
+/// §1.5: 取 `&dyn GraphStore` (非具体 Persist), 经 fm_graph::GraphStore trait 解耦图层。
 pub fn score_candidate(
-    persist: &Persist,
+    store: &dyn GraphStore,
     cosine: f64,
     item: &MemoryItem,
     query_entity_ids: &[String],
@@ -58,7 +58,7 @@ pub fn score_candidate(
     let graph_aff = if query_entity_ids.is_empty() || cand_ids.is_empty() {
         0.0
     } else {
-        fm_graph::graph_affinity(persist, query_entity_ids, &cand_ids, GRAPH_HOP_LIMIT)?
+        fm_graph::graph_affinity(store, query_entity_ids, &cand_ids, GRAPH_HOP_LIMIT)?
     };
     let score = fuse_score(cosine, w_t, graph_aff);
     debug!(cosine, w_t, graph_aff, score, "candidate scored");
@@ -92,6 +92,7 @@ pub fn should_promote(item: &MemoryItem, now: u64) -> bool {
 mod tests {
     use super::*;
     use fm_core::{EntityNode, EntityType, MemoryItem, MemoryTier, MemoryType};
+    use fm_persist::Persist;
 
     fn mk_item(
         weight: f64,

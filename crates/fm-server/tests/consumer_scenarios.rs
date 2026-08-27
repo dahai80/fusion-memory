@@ -211,10 +211,10 @@ async fn agent_studio_dispatcher_backend_replace_mapping() {
         "studio delete body={body}"
     );
 
-    // delete 无 confirm → -32602 (二次确认 B5)
+    // delete 无 confirm → -32602 (二次确认 B5)。§2.9: invalid_params 映射 HTTP 400 (旧版误返 200)。
     let del_no = r#"{"jsonrpc":"2.0","method":"delete","params":{"id":"x"},"id":5}"#;
     let (code, body) = post_path(&app, "/v1/memory/delete", del_no).await;
-    assert_eq!(code, 200, "studio delete noconfirm body={body}");
+    assert_eq!(code, 400, "studio delete noconfirm body={body}");
     assert!(
         body.contains("-32602"),
         "studio delete noconfirm body={body}"

@@ -60,6 +60,8 @@ mod tests {
             Ok(FormattedContext {
                 blocks: vec![],
                 total_tokens: 0,
+                stale_read: false,
+                last_sync_at: 0,
             })
         }
         async fn consolidate_memories(&self) -> fm_core::MemoryResult<ConsolidationReport> {

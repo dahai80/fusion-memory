@@ -2,27 +2,30 @@
 //!
 //! commit/import 写入路径在 embed+persist 前脱敏, 故向量/图谱/检索全用脱敏后内容。
 //! 占位符 [REDACTED:type], 不含原文。已脱敏内容不重复处理 (幂等)。
-//! 默认关, env FUSION_MEMORY_REDACT_PII=1 开启 (MemoryEngine::redact 字段控制)。
+//! §1.16: 默认开 (fail-closed 安全默认), env FUSION_MEMORY_REDACT_PII=0/false 显式关闭 (测试/无 PII 场景)。
+//! MemoryEngine::redact 字段控制; engine_builder 与 fm-py 入口读 env 决定是否调 with_redact()。
 
 use regex::Regex;
 use std::sync::OnceLock;
 
 // PII 模式 (中文语境优先, regex crate 无 lookaround, 靠顺序敏感避免误吞):
-// 0 手机号: 1[3-9] 开头 11 位
+// 0 手机号: 1[3-9] 开头 11 位, 或 +86/0086 前缀的国际写法 (§1.16 扩覆盖)
 // 1 邮箱
 // 2 身份证: 18 位 (末位 X), 前 17 数字
 // 3 银行卡: 13-19 位连续数字 (配 Luhn 校验, 避免误吞订单号/时间戳等长数字串)
 // 4 IPv4
+// 5 护照: 大写字母开头 8-9 位字母数字 (中国因私护照 E+8数字 / 通用 G/E/D+8位)
 static PATTERNS: &[&str] = &[
-    r"1[3-9]\d{9}",
+    r"(?:\+86|0086)?1[3-9]\d{9}",
     r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}",
     r"[1-9]\d{5}(?:19|20)\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])\d{3}[\dXx]",
     r"\d{13,19}",
     r"\b(?:\d{1,3}\.){3}\d{1,3}\b",
+    r"\b[EeGgDd]\d{8}\b",
 ];
 
 // 占位符标签 (与 PATTERNS 下标对应)
-const TAGS: &[&str] = &["phone", "email", "idcard", "bankcard", "ip"];
+const TAGS: &[&str] = &["phone", "email", "idcard", "bankcard", "ip", "passport"];
 
 static REDACT_REGEXES: OnceLock<Vec<Regex>> = OnceLock::new();
 
@@ -66,8 +69,8 @@ pub fn redact_text(input: &str) -> String {
         return input.to_string();
     }
     let mut out = input.to_string();
-    // 顺序: 身份证(2) > 银行卡(3) > 手机(0) > 邮箱(1) > IP(4)
-    let order = [2usize, 3, 0, 1, 4];
+    // 顺序: 身份证(2) > 银行卡(3) > 手机(0) > 邮箱(1) > IP(4) > 护照(5)
+    let order = [2usize, 3, 0, 1, 4, 5];
     for idx in order {
         let re = &regexes[idx];
         if idx == 3 {
@@ -98,10 +101,12 @@ fn parse_env_bool(v: &str) -> bool {
 
 /// 是否开启脱敏。每次调用读 env (并发读安全; 引擎层 redact 字段已缓存 builder 期结果,
 /// 此 fn 仅在 engine_builder/import 路径调用, 非热路径)。
+/// §1.16: 默认开启 (fail-closed 安全默认)。旧版默认关 → 未显式设 env 时原始 PII 落
+/// memory.db + sled + 集群明文。显式 FUSION_MEMORY_REDACT_PII=0/false 关闭 (测试/无 PII 场景)。
 pub fn redact_enabled_env() -> bool {
     std::env::var("FUSION_MEMORY_REDACT_PII")
         .map(|v| parse_env_bool(&v))
-        .unwrap_or(false)
+        .unwrap_or(true)
 }
 
 #[cfg(test)]
@@ -203,5 +208,28 @@ mod tests {
         assert!(!parse_env_bool("0"));
         assert!(!parse_env_bool(""));
         assert!(!parse_env_bool("yes"));
+    }
+
+    #[test]
+    fn intl_phone_redacted() {
+        // §1.16: +86/0086 前缀国际写法应脱敏
+        let out = redact_text("call +8613912345678 or 008613912345678");
+        assert!(out.contains("[REDACTED:phone]"), "+86 前缀应脱敏");
+        assert!(!out.contains("13912345678"), "脱敏后不应残留原始号码段");
+    }
+
+    #[test]
+    fn passport_redacted() {
+        // §1.16: 中国因私护照 E+8 数字应脱敏
+        let out = redact_text("护照号 E12345678 请登记");
+        assert!(out.contains("[REDACTED:passport]"));
+        assert!(!out.contains("E12345678"));
+    }
+
+    #[test]
+    fn bare_phone_still_redacted_after_pattern_extend() {
+        // §1.16 回归: 扩覆盖后裸 11 位手机仍命中
+        let out = redact_text("电话 13912345678");
+        assert!(out.contains("[REDACTED:phone]"));
     }
 }

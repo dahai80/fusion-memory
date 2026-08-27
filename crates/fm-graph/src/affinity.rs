@@ -6,11 +6,14 @@
 //! - 否则 → 0.0
 //!
 //! DB 遍历下沉 fm-persist::Persist::n_hop_reachable (WITH RECURSIVE CTE)。
+//!
+//! §1.5: graph_affinity 取 `&dyn GraphStore` (非具体 Persist), 图层可注入内存 mock 单测。
+//! Persist 适配在 fm_graph::store (impl GraphStore for Persist)。
 
-use fm_persist::Persist;
 use tracing::debug;
 
 use crate::error::GraphResult;
+use crate::store::GraphStore;
 
 pub const GRAPH_HOP_LIMIT: usize = 2;
 
@@ -50,8 +53,9 @@ pub fn affinity_from_reachability(
 }
 
 /// DB 版: 对每个 query 实体查 N-hop 可达, 取最大亲和。PRD §7.2。
+/// §1.5: 取 `&dyn GraphStore` (非具体 Persist), 图层可注入内存 mock 单测。
 pub fn graph_affinity(
-    persist: &Persist,
+    store: &dyn GraphStore,
     query_ids: &[String],
     candidate_ids: &[String],
     hop_limit: usize,
@@ -67,7 +71,7 @@ pub fn graph_affinity(
         if candidate_ids.iter().any(|c| c == q) {
             return Ok(1.0);
         }
-        let reachable = persist.n_hop_reachable(q, hop_limit)?;
+        let reachable = store.n_hop_reachable(q, hop_limit)?;
         let aff = affinity_from_reachability(std::slice::from_ref(q), candidate_ids, &reachable);
         if aff > best {
             best = aff;
@@ -197,5 +201,41 @@ mod tests {
         let r = vec![("c1".into(), 1_usize)];
         let aff = affinity_from_reachability(&["q".into()], &["zzz".into()], &r);
         assert_eq!(aff, 0.0);
+    }
+
+    // §1.5: 内存 mock 证明图层单测不依赖 SQLite/Persist::open_in_memory()。
+    // 审计 §1.5 故障场景: "任何想用内存图单测 graph_affinity 的测试必须起真实 Persist + SQL 填数据"。
+    struct MockGraph {
+        reach: std::collections::HashMap<String, Vec<(String, usize)>>,
+    }
+    impl crate::store::GraphStore for MockGraph {
+        fn n_hop_reachable(
+            &self,
+            start: &str,
+            _hop_limit: usize,
+        ) -> GraphResult<Vec<(String, usize)>> {
+            Ok(self.reach.get(start).cloned().unwrap_or_default())
+        }
+        fn list_entities_by_type(
+            &self,
+            _entity_type: &str,
+        ) -> GraphResult<Vec<(String, String, String)>> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[test]
+    fn mock_store_no_sqlite_needed() {
+        // q -> mid (hop1), mid -> c1 (hop2): 无 SQLite, 纯内存 HashMap。
+        let mut reach = std::collections::HashMap::new();
+        reach.insert(
+            "q1".into(),
+            vec![("mid".into(), 1_usize), ("c1".into(), 2_usize)],
+        );
+        let mock = MockGraph { reach };
+        let aff1 = graph_affinity(&mock, &["q1".into()], &["mid".into()], 2).unwrap();
+        assert!((aff1 - 0.5).abs() < 1e-9, "mock hop1 = 0.5");
+        let aff2 = graph_affinity(&mock, &["q1".into()], &["c1".into()], 2).unwrap();
+        assert!((aff2 - 0.25).abs() < 1e-9, "mock hop2 = 0.25");
     }
 }

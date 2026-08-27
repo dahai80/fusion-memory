@@ -27,3 +27,19 @@ jobs:
         run: cargo check --workspace
       - name: test
         run: cargo test --workspace
+
+  # §1.6: 生产路径编译门禁。
+  # 审计 §1.6: CI 默认构建中 mlx-live 门禁测试 (MlxEmbedder bge-m3 / consolidate saga /
+  # 真实 HTTP) 编译 0 次, 生产路径覆盖率 = 0%。离线 325 绿对 live 路径零回归保护。
+  # 本 job 编译全部 live-gated 测试 (--no-run), 每个 PR 验证 live 代码路径类型检查通过。
+  # 实际执行 (需 fusion-mlx on Apple Silicon) 仍手工: 见 README "Live 测试"。
+  live-compile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: compile mlx-live test paths
+        run: |
+          cargo test -p fm-embed  --features mlx-live --no-run
+          cargo test -p fm-engine --features mlx-live --no-run
+          cargo test -p fm-server --features mlx-live --no-run
