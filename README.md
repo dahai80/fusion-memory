@@ -12,7 +12,7 @@ Fusion 生态（"一核九端"）系统级长/短期记忆与认知图谱中枢�
 
 **M3 已完成**：fm-server（UDS JSON-RPC 0600 + HTTP axum 强制 Bearer B5，端口 11435，无 API_KEY 拒启 HTTP）+ fm-py PyO3 绑定（`allow_threads` GIL 安全 C2）+ consolidate_memories saga（增量遗忘 + merge/summarize/reconcile，跨库对账 + merge_log + unmerge）+ fm-cli（consolidate/merges/unmerge/reconcile）+ start.sh（start/stop/restart/status/log/doctor）。验收：PyO3 往返 GIL 不冻结（commit→2 ids / retrieve→block / consolidate→report）；HTTP 无 token 被拒 + DELETE 无 confirm 被拒 + 无 API_KEY 拒启 HTTP；consolidate 报告字段完整 + 对账差异检出；start.sh 三命令可用。242 离线 + live 测试全绿，regions 离线 90.63% / live 92.07%。
 
-**M4 in-scope 已完成**（消费方接入参考实现 + 契约测试，本仓库内）：`clients/` 三消费方参考客户端 — TS HTTP 客户端（`ts/fusionMemoryClient.ts`，fusion-code vendor，默认端口 11440 避让 fusion-kb 11435）+ Python HTTP 客户端（`python/fusion_memory_client.py`，cowork/agent-studio 备选路径，默认 11435）+ `clients/README.md` 接入文档（协议矩阵 + wire 契约 + 三消费方接入缝 + port 冲突告警 + agent-studio 9 handler→6 RPC 映射表）。契约场景测试 `crates/fm-server/tests/consumer_scenarios.rs`（3 场景：cowork memory_commit/retrieve 节点流、fusion-code retrieve 注入→commit→跨 turn 召回、agent-studio 9 handler 后端替换映射 + delete 无 confirm -32602）。stub engine HTTP oneshot 往返，离线无 mlx。验收：3 契约场景 pass + 248 离线测试全绿 + clippy/fmt clean + regions 91.76%（升，新场景扩 trait path 覆盖）。**outward PR 待用户确认**（跨工程，3 消费方仓库 issue→PR）。
+**M4 in-scope 已完成**（消费方接入参考实现 + 契约测试，本仓库内）：`clients/` 三消费方参考客户端 — TS HTTP 客户端（`ts/fusionMemoryClient.ts`，fusion-code vendor，默认端口 11440 避让 fusion-kb 11435）+ Python HTTP 客户端（`python/fusion_memory_client.py`，cowork/agent-studio 备选路径，默认 11435）+ `clients/README.md` 接入文档（协议矩阵 + wire 契约 + 三消费方接入缝 + port 冲突告警 + agent-studio 9 handler→6 RPC 映射表）。契约场景测试 `crates/fm-server/tests/consumer_scenarios.rs`（3 场景：cowork memory_commit/retrieve 节点流、fusion-code retrieve 注入→commit→跨 turn 召回、agent-studio 9 handler 后端替换映射 + delete 无 confirm -32602）。stub engine HTTP oneshot 往返，离线无 mlx。验收：3 契约场景 pass + 248 离线测试全绿 + clippy/fmt clean + regions 91.76%（升，新场景扩 trait path 覆盖）。**outward PR 已落地**（跨工程，3 消费方仓库 issue→PR→land）：fusion-cowork #67→#68（merged，memory_commit/retrieve 两节点）、fusion-agent-studio #246→#247（merged，FusionMemoryAdapter 9 handler→6 RPC env-gated swap）、fusion-code #150→#151（merged 5311b00，turn-end commit；retrieve-inject 半延后，tracked #154）。三消费方接入文件均已在各仓库 main 验证存在。
 
 **M1 已完成**：store-stub 后端（hnsw_rs + sled）+ SQLite WAL 持久化 + StubEngine（确定性 stub embedding）+ CLI（commit/query/stats/delete/doctor）。验收：CLI 写 100 条（50 interaction × 2 turn）→ query 聚合每 block 还原 2 turn → doctor 报组件状态。测试覆盖率 lines 94.6% / regions 91.1%（cargo-llvm-cov）。
 
@@ -26,7 +26,7 @@ Fusion 生态（"一核九端"）系统级长/短期记忆与认知图谱中枢�
 | M1 | store-stub 后端 + 引擎可跑（stub embedding）+ CLI | ✅ |
 | M2 | 真实 embedding + 实体抽取 + 图 + 融合评分 + 导入 | ✅ |
 | M3 | 服务化 + PyO3 + consolidate + 鉴权 | ✅ |
-| M4 | 消费方接入 (in-scope ✅ / outward PR ⏳) | 🟡 |
+| M4 | 消费方接入 (in-scope ✅ / outward ✅) | ✅ |
 | M5 | PII 脱敏 + perf 基线 + store-fusion/guard 降级 | ✅（部分） |
 | M6 | 集群同步 leader-follower | ✅ |
 

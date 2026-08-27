@@ -10,18 +10,19 @@ Authoritative spec: `architecture/fusion-memory-prd-0825.md` (repo root `archite
 
 ## Current Status
 
-**Greenfield — not yet scaffolded.** No `Cargo.toml`, `src/`, or build tooling exists yet. Work is PRD-driven: implement against the data structures and trait API defined in the PRD, following the monorepo Rust conventions below.
+**Built — M0 through M6 landed.** Rust Cargo workspace, 11 crates (`fm-cli`/`fm-core`/`fm-embed`/`fm-engine`/`fm-graph`/`fm-persist`/`fm-py`/`fm-server`/`fm-similarity`/`fm-store`/`fm-cluster`). 301 offline tests green, regions 90.82% offline / 92.47% live. Milestone detail + PRD deviation records in `README.md`. Remaining: M5 partially done (PII redaction + perf baseline landed; store-fusion switch + guard DLP gate degraded — see README "M5 PRD 偏离记录"). M4 outward integration PRs: `fusion-cowork` #68 + `fusion-agent-studio` #247 merged; `fusion-code` #151 open.
 
 ## Architecture (from PRD)
 
 ### Tech Selection
 
-| Module | Choice | Rationale |
-|--------|--------|-----------|
-| Core language | Rust | High-performance memory control, no GC pauses during retrieval |
-| Graph storage | SQLite + Kuzu DB (embedded graph) | Local lightweight embedded graph DB, no separate server process |
-| Vector retrieval | `fusion-store` (HNSW) | Reuse the shared zero-copy vector index |
-| Memory association | Apple Silicon NEON SIMD | Microsecond-scale cosine similarity and relevance decay on CPU / unified memory |
+| Module | PRD plan | Actual implementation | Why diverged |
+|--------|----------|----------------------|--------------|
+| Core language | Rust | Rust (edition 2021, MSRV 1.87) | as planned |
+| Graph storage | SQLite + Kuzu DB | SQLite + recursive CTE (`WITH RECURSIVE` N-hop) | Kuzu has no Rust binding (Rule 7, see README "M2 PRD 偏离记录") |
+| Vector retrieval | `fusion-store` (HNSW zero-copy) | `store-stub` (hnsw_rs + sled) | fusion-store trait API mismatch + cross-project constraint + A4 denied zero-copy (see README "M5 PRD 偏离记录"); store-stub is long-term production backend |
+| Embedding | (M2) fusion-mlx bge-m3 | `fm-embed` MlxEmbedder (bge-m3, dim=1024) + StubEmbedder (FNV-1a, offline) | as planned |
+| Memory scoring | NEON SIMD | Rust `f32` cosine in `fm-similarity` | Rule 2 simplicity; PRD SIMD was speculative |
 
 ### Business Boundary
 
@@ -63,18 +64,20 @@ pub trait FusionMemoryEngine {
 
 ## Build, Test, Lint
 
-Not yet scaffolded. When implemented, follow the monorepo Rust pattern (see `fusion-cli` / `fusion-design`):
+Follows the monorepo Rust pattern (see `fusion-cli` / `fusion-design`):
 
 ```bash
-cargo check --workspace        # Compile check
-cargo test --workspace         # Run all tests
-cargo build --workspace        # Full build
-cargo test -p <crate>          # Single crate
-cargo fmt --check              # Format check
-cargo clippy -- -D warnings    # Lint (warnings are errors in CI)
+cargo check --workspace                            # Compile check
+cargo test --workspace                             # All offline tests (301 cases, excludes fm-py cdylib)
+cargo test -p fm-engine --test mlx_live_extract --features mlx-live -- --include-ignored   # Single live test (needs fusion-mlx)
+cargo clippy --workspace --all-targets -- -D warnings   # Lint (warnings are errors in CI)
+cargo fmt --all --check                            # Format check
+cargo bench -p fm-engine --bench retrieve_bench    # §13.2 perf baseline (store-stub 10k, no model)
 ```
 
-Rust toolchain follows the monorepo standard: channel `1.94` (see `fusion-design/rust-toolchain.toml`). Add a `rust-toolchain.toml` when scaffolding.
+Toolchain: edition 2021, MSRV 1.87. System `rustc` (Homebrew, 1.96) compiles directly — no `rustup`, no `rust-toolchain.toml` (pinning 1.94 would block the Homebrew toolchain; Rule 7 deviation noted in README).
+
+Coverage (`cargo-llvm-cov` + `llvm-tools`): run `cargo llvm-cov clean` first — stale profraw (including untriggered bench instrumentation) dilutes regions. Offline regions 90.82%; live regions 92.47% (PRD acceptance caliber = live, covers `engine.rs` summarize/consolidate saga + `engine_builder.rs` `!stub` branch). See `README.md` for exact commands + `fm-py` exclusion rationale.
 
 ## Rust Conventions (inherited from monorepo Rust projects)
 
