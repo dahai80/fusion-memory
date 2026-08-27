@@ -36,4 +36,20 @@ pub trait FusionMemoryEngine: Send + Sync {
 
     /// 审计接口：供 fusion-guard 查询含某实体的记忆（PRD §10.4）。
     async fn audit_memory_access(&self, entity_ids: &[String]) -> MemoryResult<Vec<MemoryItem>>;
+
+    /// 按 scope (session_id) 批量软删 + 清向量（issue #2 delete_scope RPC）。
+    /// 返回被删条数。默认实现 unsupported, 生产 MemoryEngine 覆写。
+    async fn delete_scope(&self, _scope: &str) -> MemoryResult<u64> {
+        Err(crate::error::MemoryError::Unsupported(
+            "delete_scope not implemented for this engine".into(),
+        ))
+    }
+
+    /// 计数（issue #2 count RPC）。None → 全量, Some(scope) → 按 session_id 过滤。
+    /// 默认实现 unsupported, 生产 MemoryEngine 覆写。
+    async fn count(&self, _scope: Option<&str>) -> MemoryResult<u64> {
+        Err(crate::error::MemoryError::Unsupported(
+            "count not implemented for this engine".into(),
+        ))
+    }
 }

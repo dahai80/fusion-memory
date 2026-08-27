@@ -30,6 +30,9 @@ pub enum MemoryError {
     #[error("not found: {0}")]
     NotFound(String),
 
+    #[error("unsupported operation: {0}")]
+    Unsupported(String),
+
     #[error("auth error: {0}")]
     Auth(String),
 

@@ -19,11 +19,22 @@ use crate::replay::{replay_wops, ReplaySink, WopSource};
 pub struct Leader {
     source: Arc<dyn WopSource>,
     port: u16,
+    /// H3 鉴权: 配置则校验 follower hello.token, 不一致拒连接。None → 不校验 (仅 loopback)。
+    cluster_token: Option<String>,
 }
 
 impl Leader {
     pub fn new(source: Arc<dyn WopSource>, port: u16) -> Self {
-        Self { source, port }
+        Self {
+            source,
+            port,
+            cluster_token: None,
+        }
+    }
+
+    pub fn with_token(mut self, token: Option<String>) -> Self {
+        self.cluster_token = token;
+        self
     }
 
     pub fn port(&self) -> u16 {
@@ -66,7 +77,7 @@ impl Leader {
     }
 
     async fn handle_conn(self: Arc<Self>, mut stream: TcpStream) -> ClusterResult<()> {
-        // 1. hello 握手
+        // 1. hello 握手 + H3 token 鉴权
         let hello_frame = read_frame(&mut stream)
             .await?
             .ok_or(ClusterError::Transport("hello missing".into()))?;
@@ -76,7 +87,13 @@ impl Leader {
                 hello_frame.kind
             )));
         }
-        let _hello: Hello = hello_frame.decode_payload()?;
+        let hello: Hello = hello_frame.decode_payload()?;
+        if let Some(expected) = &self.cluster_token {
+            if !constant_time_eq(expected, &hello.token) {
+                warn!("leader: follower token mismatch, rejecting conn");
+                return Err(ClusterError::Transport("auth: token mismatch".into()));
+            }
+        }
         // 2. 循环响应 SyncRequest / Ping
         while let Some(frame) = read_frame(&mut stream).await? {
             match frame.kind {
@@ -103,6 +120,18 @@ impl Leader {
     }
 }
 
+/// 常时比较 token (防 timing attack)。同长逐字节 XOR, 不短路。
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff: u8 = 0;
+    for (x, y) in a.bytes().zip(b.bytes()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 /// follower: 连 leader, 周期 fetch wop 增量本地重放 + 心跳。PRD §16.5。
 pub struct Follower {
     cfg: SyncConfig,
@@ -123,11 +152,17 @@ impl Follower {
         self.local_last_seq
     }
 
-    /// 单次同步: 连 leader → hello → sync request → 重放。返回新 last_seq + 应用数。
-    pub async fn sync_once(&mut self) -> ClusterResult<(i64, usize)> {
+    /// 单次同步: 连 leader → hello(token) → sync request → 重放。
+    /// 返回 (新 last_seq, 应用数, 本批是否含落地失败条目)。
+    /// H2 修正: local_last_seq 推进到本批已落地条目的最大 seq (last_applied_seq),
+    /// 而非 leader_last_seq。失败条目下轮重拉, 已落地条目不重复重放 (stub 幂等)。
+    /// 传输层失败 (connect/帧坏/decode) 仍返 Err → caller 判 leader 宕机倾向。
+    /// 单条落地失败 → Ok(_, _, true), 不抛 Err → caller 不触发 failover (非 leader 宕机)。
+    pub async fn sync_once(&mut self) -> ClusterResult<(i64, usize, bool)> {
         let mut stream = TcpStream::connect(&self.cfg.leader_addr).await?;
         let hello = Hello {
             follower_last_seq: self.local_last_seq,
+            token: self.cfg.cluster_token.clone().unwrap_or_default(),
         };
         write_frame(&mut stream, &Frame::new(FrameKind::Hello, hello)?).await?;
         let req = SyncRequest {
@@ -145,11 +180,13 @@ impl Follower {
             )));
         }
         let resp: SyncResponse = resp_frame.decode_payload()?;
-        let (applied, _skipped) = replay_wops(self.sink.as_ref(), &resp.entries).await?;
-        if resp.leader_last_seq > self.local_last_seq {
-            self.local_last_seq = resp.leader_last_seq;
+        let outcome = replay_wops(self.sink.as_ref(), &resp.entries).await;
+        // H2: 推进到 last_applied_seq (已落地/跳过最大 seq), 非 leader_last_seq。
+        // 失败条目不计入 last_applied_seq → 游标卡在失败条目前, 下轮重拉。
+        if outcome.last_applied_seq > self.local_last_seq {
+            self.local_last_seq = outcome.last_applied_seq;
         }
-        Ok((self.local_last_seq, applied))
+        Ok((self.local_last_seq, outcome.applied, outcome.failed))
     }
 
     /// 心跳: 连 leader 发 ping, 期待 pong。成功 true。
@@ -161,6 +198,7 @@ impl Follower {
                 FrameKind::Hello,
                 Hello {
                     follower_last_seq: self.local_last_seq,
+                    token: self.cfg.cluster_token.clone().unwrap_or_default(),
                 },
             )?,
         )
@@ -173,20 +211,32 @@ impl Follower {
     }
 
     /// 持续同步循环: fetch → sleep → repeat。心跳 N 失败 → LeaderDown。
+    /// H2 修正: 区分 transport-fail (连不上 leader, 真宕机 → 计 fails → LeaderDown)
+    /// 与 replay-fail (连上但单条落地失败, 与 leader 存活无关 → 不计 fails, 退避重试, 不触发 failover)。
     pub async fn run(mut self) -> ClusterResult<()> {
         info!(leader = %self.cfg.leader_addr, "follower sync loop start");
         let mut fails: u32 = 0;
+        let mut replay_backoff: u64 = 1;
         loop {
             match self.sync_once().await {
-                Ok((seq, applied)) => {
+                Ok((_seq, applied, replay_failed)) => {
                     if applied > 0 {
-                        info!(seq, applied, "follower synced");
+                        info!(applied, "follower synced");
                     }
                     fails = 0;
+                    if replay_failed {
+                        // 连上 leader 但本批有单条落地失败 → 非 leader 宕机, 退避重试, 不触发 failover。
+                        warn!("follower replay fail (leader alive), backoff retry");
+                        replay_backoff = (replay_backoff * 2).min(60);
+                        sleep(Duration::from_secs(replay_backoff)).await;
+                        continue;
+                    }
+                    replay_backoff = 1;
                 }
                 Err(e) => {
+                    // transport/io/serde → 连不上或帧坏, 真宕机倾向 → 计 fails。
                     fails += 1;
-                    warn!(fails, error = %e, "follower sync fail");
+                    warn!(fails, error = %e, "follower sync fail (transport)");
                     if fails >= self.cfg.heartbeat_fails {
                         return Err(ClusterError::LeaderDown(fails));
                     }
@@ -252,13 +302,15 @@ mod tests {
                 heartbeat_secs: 1,
                 heartbeat_fails: 3,
                 fetch_limit: 64,
+                cluster_token: None,
             },
             sink.clone(),
             0,
         );
-        let (seq, applied) = follower.sync_once().await.unwrap();
+        let (seq, applied, failed) = follower.sync_once().await.unwrap();
         assert_eq!(seq, 1);
         assert_eq!(applied, 1);
+        assert!(!failed);
         assert_eq!(sink.tombstones(), vec!["x".to_string()]);
         leader_task.abort();
     }
@@ -278,6 +330,7 @@ mod tests {
                 heartbeat_secs: 1,
                 heartbeat_fails: 3,
                 fetch_limit: 64,
+                cluster_token: None,
             },
             sink,
             0,
@@ -295,6 +348,7 @@ mod tests {
                 heartbeat_secs: 0,
                 heartbeat_fails: 2,
                 fetch_limit: 64,
+                cluster_token: None,
             },
             sink,
             0,
@@ -318,6 +372,7 @@ mod tests {
                 heartbeat_secs: 1,
                 heartbeat_fails: 3,
                 fetch_limit: 64,
+                cluster_token: None,
             },
             sink,
             42,
@@ -354,6 +409,7 @@ mod tests {
                 heartbeat_secs: 1,
                 heartbeat_fails: 3,
                 fetch_limit: 64,
+                cluster_token: None,
             },
             sink,
             0,
@@ -389,7 +445,7 @@ mod tests {
     #[tokio::test]
     async fn follower_sync_once_rejects_non_sync_response() {
         // 覆盖 sync_once: leader 回非 SyncResponse → 错误。
-        use crate::protocol::{write_frame, Frame, FrameKind, Hello};
+        use crate::protocol::{write_frame, Frame, FrameKind};
         // 假 leader: 回 Pong 而非 SyncResponse
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -410,16 +466,67 @@ mod tests {
                 heartbeat_secs: 1,
                 heartbeat_fails: 3,
                 fetch_limit: 64,
+                cluster_token: None,
             },
             sink,
             0,
         );
-        let _ = Hello {
-            follower_last_seq: 0,
-        };
         let err = follower.sync_once().await;
         assert!(err.is_err());
         fake_task.abort();
+    }
+
+    #[tokio::test]
+    async fn leader_rejects_token_mismatch() {
+        // H3: leader 配 token, follower 带错 token → leader 拒连接, sync_once 报 transport err。
+        let source = Arc::new(StubSource {
+            entries: Mutex::new(vec![]),
+        });
+        let leader = Arc::new(Leader::new(source, 0).with_token(Some("secret-token".into())));
+        let (listener, port) = leader.bind().await.unwrap();
+        let leader_task = tokio::spawn(Arc::clone(&leader).serve_listener(listener));
+        let sink = Arc::new(CountingSink::new());
+        let mut follower = Follower::new(
+            SyncConfig {
+                leader_addr: format!("127.0.0.1:{port}"),
+                heartbeat_secs: 1,
+                heartbeat_fails: 3,
+                fetch_limit: 64,
+                cluster_token: Some("wrong-token".into()),
+            },
+            sink,
+            0,
+        );
+        let err = follower.sync_once().await;
+        assert!(err.is_err(), "token mismatch must reject");
+        leader_task.abort();
+    }
+
+    #[tokio::test]
+    async fn leader_accepts_matching_token() {
+        // H3: leader + follower 同 token → sync_once 成功。
+        let source = Arc::new(StubSource {
+            entries: Mutex::new(vec![]),
+        });
+        let leader = Arc::new(Leader::new(source, 0).with_token(Some("shared-secret".into())));
+        let (listener, port) = leader.bind().await.unwrap();
+        let leader_task = tokio::spawn(Arc::clone(&leader).serve_listener(listener));
+        let sink = Arc::new(CountingSink::new());
+        let mut follower = Follower::new(
+            SyncConfig {
+                leader_addr: format!("127.0.0.1:{port}"),
+                heartbeat_secs: 1,
+                heartbeat_fails: 3,
+                fetch_limit: 64,
+                cluster_token: Some("shared-secret".into()),
+            },
+            sink,
+            0,
+        );
+        let (seq, _applied, failed) = follower.sync_once().await.unwrap();
+        assert_eq!(seq, 0, "empty source, no advance");
+        assert!(!failed);
+        leader_task.abort();
     }
 
     // 简单计数 sink, 记 tombstone/put/vector

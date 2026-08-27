@@ -1,7 +1,9 @@
 //! JSON-RPC 2.0 共用 dispatch。UDS + HTTP 复用。PRD §11.2。
 //!
-//! 方法: commit/retrieve/consolidate/get/delete/audit/health。
-//! delete 需 params.confirm=true（B5 二次确认）。
+//! 方法: commit/retrieve/consolidate/get/delete/audit/health
+//!      + memory.retrieve_context (issue #1/#4 fusion-event 契约)
+//!      + delete_scope/count (issue #2 fusion-agent-studio adapter 契约)。
+//! delete/delete_scope 需 params.confirm=true（B5 二次确认）。
 
 use fm_core::{
     ConsolidationReport, FormattedContext, Interaction, MemoryId, MemoryItem, RetrieveQuery,
@@ -73,9 +75,14 @@ pub async fn dispatch(req: &RpcRequest, engine: &EngineHandle) -> RpcResponse {
     let res: Result<Value, RpcError> = match req.method.as_str() {
         "commit" => commit(req, engine).await,
         "retrieve" => retrieve(req, engine).await,
+        // issue #1/#4: fusion-event 契约别名 (text-in, fused shape out)。
+        "memory.retrieve_context" => retrieve_context_contract(req, engine).await,
         "consolidate" => consolidate(engine).await,
         "get" => get(req, engine).await,
         "delete" => delete(req, engine).await,
+        // issue #2: fusion-agent-studio adapter 契约 (scope 批量删 + 计数)。
+        "delete_scope" => delete_scope(req, engine).await,
+        "count" => count(req, engine).await,
         "audit" => audit(req, engine).await,
         "health" => Ok(Value::String("ok".into())),
         other => Err(RpcError::method_not_found(other)),
@@ -222,6 +229,102 @@ async fn audit(req: &RpcRequest, engine: &EngineHandle) -> Result<Value, RpcErro
     serde_json::to_value(ms).map_err(|e| RpcError::internal(e.to_string()))
 }
 
+/// delete_scope params (issue #2)。scope = session_id。confirm 必填 true (B5)。
+#[derive(Debug, Deserialize)]
+struct DeleteScopeParams {
+    scope: String,
+    #[serde(default)]
+    confirm: bool,
+}
+
+async fn delete_scope(req: &RpcRequest, engine: &EngineHandle) -> Result<Value, RpcError> {
+    let p: DeleteScopeParams = serde_json::from_value(req.params.clone())
+        .map_err(|e| RpcError::invalid_params(e.to_string()))?;
+    if !p.confirm {
+        return Err(RpcError::invalid_params(
+            "delete_scope requires confirm=true (B5 二次确认)",
+        ));
+    }
+    let n = engine
+        .delete_scope(&p.scope)
+        .await
+        .map_err(|e| RpcError::internal(e.to_string()))?;
+    serde_json::to_value(serde_json::json!({"deleted_count": n}))
+        .map_err(|e| RpcError::internal(e.to_string()))
+}
+
+/// count params (issue #2)。scope 可选 (None → 全量)。
+#[derive(Debug, Deserialize)]
+struct CountParams {
+    #[serde(default)]
+    scope: Option<String>,
+}
+
+async fn count(req: &RpcRequest, engine: &EngineHandle) -> Result<Value, RpcError> {
+    let p: CountParams = serde_json::from_value(req.params.clone())
+        .map_err(|e| RpcError::invalid_params(e.to_string()))?;
+    let n = engine
+        .count(p.scope.as_deref())
+        .await
+        .map_err(|e| RpcError::internal(e.to_string()))?;
+    serde_json::to_value(serde_json::json!({"count": n}))
+        .map_err(|e| RpcError::internal(e.to_string()))
+}
+
+/// memory.retrieve_context params (issue #1/#4, fusion-event 冻结契约)。
+/// query 为文本串 (target_path|event_type), memory 内部 embed; trigger_id/node_id 仅透传留痕,
+/// 不影响检索结果 (node_id 多节点集群留待 M6+ 扩展, 当前本地全检索)。
+#[derive(Debug, Deserialize)]
+struct RetrieveContextContractParams {
+    #[serde(default)]
+    trigger_id: String,
+    query: String,
+    #[serde(default = "default_top_k")]
+    top_k: usize,
+    #[serde(default)]
+    node_id: String,
+}
+
+/// 契约返回: {context, memory_ids, cache_hit}。context = block turns_text 拼接;
+/// memory_ids = 命中 interaction_id 去重列表; cache_hit 恒 false (memory 端不缓存, 调用方自管 TTL)。
+async fn retrieve_context_contract(
+    req: &RpcRequest,
+    engine: &EngineHandle,
+) -> Result<Value, RpcError> {
+    let p: RetrieveContextContractParams = serde_json::from_value(req.params.clone())
+        .map_err(|e| RpcError::invalid_params(e.to_string()))?;
+    debug!(trigger = %p.trigger_id, node = %p.node_id, "memory.retrieve_context contract");
+    let q = RetrieveQuery {
+        text: p.query,
+        top_k: p.top_k,
+        session_id: None,
+        tier_filter: None,
+        token_budget: default_budget(),
+        aggregate: true,
+    };
+    let ctx: FormattedContext = engine
+        .retrieve_context(&q)
+        .await
+        .map_err(|e| RpcError::internal(e.to_string()))?;
+    let context = ctx
+        .blocks
+        .iter()
+        .map(|b| b.turns_text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n---\n");
+    let mut memory_ids: Vec<String> = Vec::new();
+    for b in &ctx.blocks {
+        if !memory_ids.contains(&b.interaction_id) {
+            memory_ids.push(b.interaction_id.clone());
+        }
+    }
+    Ok(serde_json::json!({
+        "context": context,
+        "memory_ids": memory_ids,
+        "cache_hit": false,
+    }))
+}
+
 /// 解析单行 JSON-RPC（UDS 行协议）。
 pub fn parse_line(line: &str) -> Option<RpcRequest> {
     serde_json::from_str::<RpcRequest>(line).ok()
@@ -334,6 +437,16 @@ mod tests {
         }
         async fn delete_memory(&self, _id: &str) -> fm_core::MemoryResult<()> {
             Ok(())
+        }
+        async fn delete_scope(&self, scope: &str) -> fm_core::MemoryResult<u64> {
+            if scope == "sess-A" {
+                Ok(3)
+            } else {
+                Ok(0)
+            }
+        }
+        async fn count(&self, _scope: Option<&str>) -> fm_core::MemoryResult<u64> {
+            Ok(42)
         }
         async fn audit_memory_access(
             &self,
@@ -459,6 +572,68 @@ mod tests {
         let (eng, _) = stub_handle();
         let e = dispatch_err(&rpc("frobnicate", serde_json::json!({}), 10), &eng).await;
         assert_eq!(e.code, -32601);
+    }
+
+    #[tokio::test]
+    async fn dispatch_delete_scope_with_confirm() {
+        let (eng, _) = stub_handle();
+        let v = dispatch_ok(
+            &rpc(
+                "delete_scope",
+                serde_json::json!({"scope":"sess-A","confirm":true}),
+                12,
+            ),
+            &eng,
+        )
+        .await;
+        assert_eq!(v["deleted_count"], 3);
+    }
+
+    #[tokio::test]
+    async fn dispatch_delete_scope_without_confirm_rejected() {
+        let (eng, _) = stub_handle();
+        let e = dispatch_err(
+            &rpc("delete_scope", serde_json::json!({"scope":"sess-A"}), 13),
+            &eng,
+        )
+        .await;
+        assert_eq!(e.code, -32602);
+    }
+
+    #[tokio::test]
+    async fn dispatch_count() {
+        let (eng, _) = stub_handle();
+        let v = dispatch_ok(&rpc("count", serde_json::json!({}), 14), &eng).await;
+        assert_eq!(v["count"], 42);
+    }
+
+    #[tokio::test]
+    async fn dispatch_count_with_scope() {
+        let (eng, _) = stub_handle();
+        let v = dispatch_ok(
+            &rpc("count", serde_json::json!({"scope":"sess-A"}), 15),
+            &eng,
+        )
+        .await;
+        assert_eq!(v["count"], 42);
+    }
+
+    #[tokio::test]
+    async fn dispatch_retrieve_context_contract() {
+        // issue #1/#4 契约: memory.retrieve_context → {context, memory_ids, cache_hit}
+        let (eng, _) = stub_handle();
+        let v = dispatch_ok(
+            &rpc(
+                "memory.retrieve_context",
+                serde_json::json!({"trigger_id":"t1","query":"/a.swift|fileModified","top_k":5,"node_id":"macbook"}),
+                16,
+            ),
+            &eng,
+        )
+        .await;
+        assert!(v["context"].is_string(), "context 应为 string, got {v}");
+        assert!(v["memory_ids"].is_array(), "memory_ids 应为 array");
+        assert_eq!(v["cache_hit"], false);
     }
 
     #[tokio::test]
