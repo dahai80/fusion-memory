@@ -111,6 +111,17 @@ CREATE INDEX IF NOT EXISTS idx_memory_tier ON memory_item(tier, tombstone)";
 pub const INDEX_WOP_SEQ: &str = "\
 CREATE INDEX IF NOT EXISTS idx_wop_at ON wop_log(at)";
 
+// §1.15: memory_entity(entity_id) 索引 — audit_by_entities 的 IN(entity_id...) join 走此索引而非全表扫。
+// PK (memory_id, entity_id) 只对 memory_id 前缀有效, entity_id 反查需单独索引。
+pub const INDEX_MEMORY_ENTITY_EID: &str = "\
+CREATE INDEX IF NOT EXISTS idx_memory_entity_eid ON memory_entity(entity_id)";
+
+// §1.3: memory_item(vector_ref) 索引 — retrieve_context 按 KNN 命中的 vector_ref 集合
+// 定向 SELECT ... WHERE vector_ref IN (...) 走此索引, 替代旧版 list_all 全表扫 + HashMap。
+// 旧版每 retrieve 加载全部非 tombstone 行 clone 进 HashMap 仅为查 ~10 个 KNN 命中, 10k 记忆 ≈ 2MB/次。
+pub const INDEX_MEMORY_VECTOR_REF: &str = "\
+CREATE INDEX IF NOT EXISTS idx_memory_vector_ref ON memory_item(vector_ref)";
+
 pub const ALL_DDL: &[&str] = &[
     MEMORY_ITEM_DDL,
     ENTITY_DDL,
@@ -124,6 +135,43 @@ pub const ALL_DDL: &[&str] = &[
     INDEX_SESSION,
     INDEX_TIER,
     INDEX_WOP_SEQ,
+    INDEX_MEMORY_ENTITY_EID,
+    INDEX_MEMORY_VECTOR_REF,
 ];
 
 pub const ALL_PRAGMAS: &[&str] = &[PRAGMA_BUSY, PRAGMA_SYNC, PRAGMA_FK];
+
+// §1.10: 当前 schema 版本。每次不兼容变更 (加列/改类型/删表) 递增并写 migration。
+// v0: 初始 (M0-M6 累积表结构, 全 CREATE TABLE IF NOT EXISTS, 无 user_version)。
+// v1: 加 idx_memory_entity_eid 索引 (§1.15 audit 反查); 旧库已由 IF NOT EXISTS 补建, 版本号记录此点。
+// v2: 加 idx_memory_vector_ref 索引 (§1.3 retrieve 定向查询); 旧库由 v1→v2 迁移步补建。
+pub const SCHEMA_VERSION: u32 = 2;
+
+/// §1.10: 读旧库 user_version。新库/空 PRAGMA 返 0。
+pub fn user_version(conn: &rusqlite::Connection) -> rusqlite::Result<u32> {
+    let v: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    Ok(v as u32)
+}
+
+/// §1.10: 写 user_version。
+pub fn set_user_version(conn: &rusqlite::Connection, version: u32) -> rusqlite::Result<()> {
+    // PRAGMA user_version 不支持绑定参数, 拼字符串 (version 为内部常量, 非用户输入, 无注入面)。
+    conn.execute_batch(&format!("PRAGMA user_version = {}", version))
+}
+
+/// §1.10: 从旧版本迁移到当前 SCHEMA_VERSION。
+/// 旧版无 user_version (恒 0) → 跑全量 ALL_DDL (IF NOT EXISTS 幂等) + 设版本号。
+/// 后续不兼容变更在此按 from..to 分支加 ALTER/数据回填, 每段独立可回溯。
+pub fn migrate(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    let from = user_version(conn)?;
+    if from >= SCHEMA_VERSION {
+        return Ok(());
+    }
+    // v0 → v1: 表/索引全 IF NOT EXISTS 幂等补建 (含 §1.15 新索引)。
+    for ddl in ALL_DDL {
+        conn.execute_batch(ddl)?;
+    }
+    set_user_version(conn, SCHEMA_VERSION)?;
+    tracing::info!(from = from, to = SCHEMA_VERSION, "schema migrated");
+    Ok(())
+}

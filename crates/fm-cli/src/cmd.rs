@@ -6,7 +6,7 @@ use fm_core::{FusionMemoryEngine, Interaction, RetrieveQuery};
 use fm_embed::{Embedder, StubEmbedder};
 use fm_engine::MemoryEngine;
 use fm_persist::Persist;
-use fm_store::{FusionStoreEngine, StoreStub};
+use fm_store::StoreStub;
 use tracing::info;
 
 use crate::paths::resolve_home;
@@ -216,26 +216,40 @@ async fn cluster(home: &Option<String>, sub: &ClusterCmd) -> Result<(), String> 
             Ok(())
         }
         ClusterCmd::Promote => {
-            // 手动 failover: 写 home/role=leader, 清 follower leader env 指引重启。
+            // 手动 failover: 写 home/role=leader, §1.8 递增 epoch (fencing 旧 leader 防脑裂双写)。
             std::fs::create_dir_all(&dir).map_err(|e| format!("create home dir: {e}"))?;
             let path = fm_cluster::write_role_file(&dir, fm_cluster::NodeRole::Leader)
                 .map_err(|e| format!("write role file: {e}"))?;
+            // §1.8: 读旧 epoch +1 落地。新 leader 重启经 ClusterConfig::with_home 读此 epoch,
+            // 自报给 follower; follower (同样读此 epoch 或 env) 拒 epoch < 此值的旧 leader。
+            let old_epoch = fm_cluster::read_epoch_file(&dir);
+            let new_epoch = old_epoch + 1;
+            let epoch_path = fm_cluster::write_epoch_file(&dir, new_epoch)
+                .map_err(|e| format!("write epoch file: {e}"))?;
             println!("promoted: role=leader written to {}", path.display());
+            println!(
+                "  epoch: {} -> {} (fencing, written to {})",
+                old_epoch,
+                new_epoch,
+                epoch_path.display()
+            );
             println!("next steps:");
             println!("  1. stop old leader (if any): FUSION_MEMORY_ROLE unset + fm-server stop");
             println!(
-                "  2. restart this node's fm-server (reads {}/role)",
+                "  2. restart this node's fm-server (reads {}/role + {}/epoch)",
+                dir.display(),
                 dir.display()
             );
             println!(
-                "  3. point followers: FUSION_MEMORY_LEADER=<this-node-addr>:{}",
+                "  3. point followers: FUSION_MEMORY_LEADER=<this-node-addr>:{} (and set FUSION_MEMORY_CLUSTER_EPOCH={new_epoch} on followers, or share {}/epoch)",
                 {
                     std::env::var("FUSION_MEMORY_SYNC_PORT").unwrap_or_else(|_| {
                         fm_cluster::ClusterConfig::default().sync_port.to_string()
                     })
-                }
+                },
+                dir.display()
             );
-            info!(path = %path.display(), "cluster promote done");
+            info!(path = %path.display(), old_epoch, new_epoch, "cluster promote done");
             Ok(())
         }
     }

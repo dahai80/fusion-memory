@@ -27,22 +27,36 @@ pub struct ServeOpts {
 }
 
 /// 启动服务：UDS + HTTP 并发。阻塞至任一退出。
+/// §1.11: 安装 SIGTERM/ctrl_c 信号处理, 广播 shutdown 让 http/uds graceful drain,
+/// 不打断在飞 consolidate saga (saga 非事务跨库, 中断产幽灵状态)。
 pub async fn serve(cfg: ServerConfig, opts: ServeOpts) -> Result<(), String> {
     let ServerEngine { engine } = build_server_engine(&cfg, opts.stub)?;
     let engine: Arc<MemoryEngine> = Arc::new(engine);
     let handle = EngineHandle::new(engine.clone());
+
+    // §1.11: shutdown 广播。signal task 持 TX, http/uds 各持 RX 副本 (broadcast)。
+    // 用 broadcast channel: 同一信号扇出给多个消费者。oneshot 只能一收, 故用 broadcast(1)。
+    let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
+    install_signal_handler(shutdown_tx.clone());
 
     let mut set: tokio::task::JoinSet<Result<(), String>> = tokio::task::JoinSet::new();
 
     // M6 集群: leader/follower 同步 task 装配 (standalone → 空)。PRD §16。
     // role 解析: env 优先, 次读 data_dir/role 文件 (fm cluster promote 落地), 末 standalone。
     let role = fm_cluster::detect_role_with_home(Some(&cfg.data_dir));
-    cluster::spawn_cluster(engine.clone(), role, &mut set);
+    cluster::spawn_cluster(engine.clone(), role, &cfg.data_dir, &mut set);
 
     if cfg.uds_enabled {
         let h = handle.clone();
         let sock = cfg.sock_path.clone();
-        set.spawn(async move { uds::serve(sock, h).await });
+        // broadcast → oneshot 适配 (uds/http 签名收 oneshot::Receiver)
+        let mut brx = shutdown_tx.subscribe();
+        let (otx, orx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let _ = brx.recv().await;
+            let _ = otx.send(());
+        });
+        set.spawn(async move { uds::serve(sock, h, orx).await });
     }
 
     let http_enabled = cfg.http_ok();
@@ -53,9 +67,15 @@ pub async fn serve(cfg: ServerConfig, opts: ServeOpts) -> Result<(), String> {
         let h = handle.clone();
         let port = cfg.http_port;
         let api_key = Arc::new(cfg.api_key.clone());
+        let mut brx = shutdown_tx.subscribe();
+        let (otx, orx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let _ = brx.recv().await;
+            let _ = otx.send(());
+        });
         set.spawn(async move {
             let state = http::HttpState { engine: h, api_key };
-            http::serve(state, port).await
+            http::serve(state, port, orx).await
         });
     }
 
@@ -74,6 +94,29 @@ pub async fn serve(cfg: ServerConfig, opts: ServeOpts) -> Result<(), String> {
         Some(Err(e)) => Err(format!("server task panicked: {e}")),
         None => Ok(()),
     }
+}
+
+/// §1.11: 安装 SIGINT(ctrl_c) + SIGTERM 处理。信号到 → 广播 shutdown。
+/// 只在二进制 main 路径有效; 测试中 tokio::signal::ctrl_c 依赖 unix signal pipe, spawn 安全。
+fn install_signal_handler(shutdown_tx: tokio::sync::broadcast::Sender<()>) {
+    tokio::spawn(async move {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut term = signal(SignalKind::terminate()).expect("install SIGTERM handler");
+            let mut int = signal(SignalKind::interrupt()).expect("install SIGINT handler");
+            tokio::select! {
+                _ = term.recv() => info!("received SIGTERM, initiating graceful shutdown"),
+                _ = int.recv() => info!("received SIGINT, initiating graceful shutdown"),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+            info!("received ctrl_c, initiating graceful shutdown");
+        }
+        let _ = shutdown_tx.send(());
+    });
 }
 
 #[cfg(test)]

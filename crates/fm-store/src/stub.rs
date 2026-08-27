@@ -43,6 +43,12 @@ fn cosine_sim(a: &[f32], b: &[f32]) -> f32 {
 
 pub struct StoreStub {
     db: Db,
+    // §3.11: 旧版每次 vec_tree()/tomb_tree()/kv_tree() 都 db.open_tree → 每调用一次 sled 路径解析 + tree 句柄分配。
+    // search_knn 单次至少 open vec+tomb 两次; 高 QPS 下成倍放大 open_tree 开销。
+    // 改: open 时一次性打开三棵 tree 缓存, 后续直接复用 (sled::Tree 是 Arc handle, clone 廉价)。
+    vec_tree: sled::Tree,
+    tomb_tree: sled::Tree,
+    kv_tree: sled::Tree,
     dim: usize,
     hnsw: RwLock<Hnsw<'static, f32, DistCosine>>,
 }
@@ -57,12 +63,26 @@ impl StoreStub {
         }
         let db = sled::Config::new()
             .path(path)
+            // §2.13: 旧版 flush_every_ms(Some(1_000)) 每 1s 批刷; 进程突崩丢 ≤1s 写。
+            // 配合 Drop flush (§2.13 下半) 保优雅退出落盘; 默认值不变, 仅补 Drop 兜底。
             .flush_every_ms(Some(1_000))
             .open()
+            .map_err(|e| StoreError::Sled(e.to_string()))?;
+        let vec_tree = db
+            .open_tree(TREE_VEC)
+            .map_err(|e| StoreError::Sled(e.to_string()))?;
+        let tomb_tree = db
+            .open_tree(TREE_TOMB)
+            .map_err(|e| StoreError::Sled(e.to_string()))?;
+        let kv_tree = db
+            .open_tree(TREE_KV)
             .map_err(|e| StoreError::Sled(e.to_string()))?;
         let hnsw = Hnsw::new(HNSW_M, 1024, HNSW_MAX_LAYER, HNSW_EF_CONSTRUCT, DistCosine);
         let stub = Self {
             db,
+            vec_tree,
+            tomb_tree,
+            kv_tree,
             dim,
             hnsw: RwLock::new(hnsw),
         };
@@ -76,45 +96,38 @@ impl StoreStub {
         Self::open(&dir, dim)
     }
 
-    fn vec_tree(&self) -> StoreResult<sled::Tree> {
-        self.db
-            .open_tree(TREE_VEC)
-            .map_err(|e| StoreError::Sled(e.to_string()))
-    }
-
-    fn tomb_tree(&self) -> StoreResult<sled::Tree> {
-        self.db
-            .open_tree(TREE_TOMB)
-            .map_err(|e| StoreError::Sled(e.to_string()))
-    }
-
-    fn kv_tree(&self) -> StoreResult<sled::Tree> {
-        self.db
-            .open_tree(TREE_KV)
-            .map_err(|e| StoreError::Sled(e.to_string()))
-    }
-
     fn is_tombstoned(&self, id: u64) -> StoreResult<bool> {
-        let tree = self.tomb_tree()?;
-        let exists = tree
+        let exists = self
+            .tomb_tree
             .contains_key(id.to_be_bytes())
             .map_err(|e| StoreError::Sled(e.to_string()))?;
         Ok(exists)
+    }
+
+    // §3.3: 解析 8 字节大端 u64 key。坏 key (非 8 字节) 不再 unwrap_or([0u8;8]) 静默归零 → id0 碰撞,
+    // 改跳过并 warn (返回 None); 调用方 filter_map 跳过坏行, 不污染 id0 也不 panic。
+    fn parse_id_key(key: &[u8]) -> Option<u64> {
+        if key.len() != 8 {
+            warn!(
+                len = key.len(),
+                "store key not 8 bytes, skip (would corrupt id0)"
+            );
+            return None;
+        }
+        let arr: [u8; 8] = key.try_into().expect("len==8 checked");
+        Some(u64::from_be_bytes(arr))
     }
 
     // P4: 一次性加载全部 tombstone id 入 HashSet, 供 search_knn 批量过滤。
     // 旧版对每个邻居/每个 fallback 向量逐个 is_tombstoned 单点查 sled → N 次 I/O/搜索。
     /// 单次 tree.iter 扫描替代 N 次点查; tomb 集合通常远小于全量, 内存可控。
     fn tombstone_set(&self) -> StoreResult<std::collections::HashSet<u64>> {
-        let tomb = self.tomb_tree()?;
         let mut out = std::collections::HashSet::new();
-        for item in tomb.iter() {
+        for item in self.tomb_tree.iter() {
             let (k, _v) = item.map_err(|e| StoreError::Sled(e.to_string()))?;
-            if k.len() != 8 {
-                continue;
+            if let Some(id) = Self::parse_id_key(&k) {
+                out.insert(id);
             }
-            let arr: [u8; 8] = k.as_ref().try_into().expect("len==8 checked");
-            out.insert(u64::from_be_bytes(arr));
         }
         Ok(out)
     }
@@ -122,17 +135,14 @@ impl StoreStub {
     /// 枚举所有非 tombstone 向量 id (L3 反向对账: store→SQLite 孤儿扫描)。
     /// 跳过 tomb tree 标记的软删向量。用于 reconcile 检测 store 有向量但 SQLite 无元数据的孤儿。
     pub fn list_vector_ids(&self) -> StoreResult<Vec<u64>> {
-        let tree = self.vec_tree()?;
-        let tomb = self.tomb_tree()?;
         let mut out = Vec::new();
-        for item in tree.iter() {
+        for item in self.vec_tree.iter() {
             let (key, _val) = item.map_err(|e| StoreError::Sled(e.to_string()))?;
-            if key.len() != 8 {
+            let Some(id) = Self::parse_id_key(&key) else {
                 continue;
-            }
-            let arr: [u8; 8] = key.as_ref().try_into().expect("len==8 checked");
-            let id = u64::from_be_bytes(arr);
-            if tomb
+            };
+            if self
+                .tomb_tree
                 .contains_key(&key)
                 .map_err(|e| StoreError::Sled(e.to_string()))?
             {
@@ -171,12 +181,14 @@ impl StoreStub {
 
     /// 从 sled vec tree 重放重建 hnsw 索引（崩溃恢复 / 启动加载）。
     pub fn rebuild_from_sled(&self) -> StoreResult<usize> {
-        let tree = self.vec_tree()?;
         let mut loaded = 0usize;
         let new_hnsw = Hnsw::new(HNSW_M, 1024, HNSW_MAX_LAYER, HNSW_EF_CONSTRUCT, DistCosine);
-        for item in tree.iter() {
+        for item in self.vec_tree.iter() {
             let (key, val) = item.map_err(|e| StoreError::Sled(e.to_string()))?;
-            let id = u64::from_be_bytes(key.as_ref().try_into().unwrap_or([0u8; 8]));
+            // §3.3: 坏 key 不再 unwrap_or([0u8;8]) 归零 (→ 全部碰撞到真实 id0 的向量, 索引污染)。
+            let Some(id) = Self::parse_id_key(&key) else {
+                continue;
+            };
             if self.is_tombstoned(id)? {
                 debug!(id, "skip tombstoned on rebuild");
                 continue;
@@ -200,18 +212,15 @@ impl StoreStub {
 
     /// 物理删所有 tombstoned 向量并重建索引（compact）。
     pub fn compact(&self) -> StoreResult<usize> {
-        let tomb = self.tomb_tree()?;
-        let vec_tree = self.vec_tree()?;
         let mut removed = 0usize;
-        let tomb_keys: Vec<u64> = tomb
+        // §3.3: 坏 tomb key 不再 unwrap_or([0u8;8]) 归零 (→ 误删 id0 真实向量)。
+        let tomb_keys: Vec<u64> = self
+            .tomb_tree
             .iter()
-            .filter_map(|item| {
-                item.ok()
-                    .map(|(k, _)| u64::from_be_bytes(k.as_ref().try_into().unwrap_or([0u8; 8])))
-            })
+            .filter_map(|item| item.ok().and_then(|(k, _)| Self::parse_id_key(&k)))
             .collect();
         for id in &tomb_keys {
-            vec_tree
+            self.vec_tree
                 .remove(id.to_be_bytes())
                 .map_err(|e| StoreError::Sled(e.to_string()))?;
             removed += 1;
@@ -233,17 +242,19 @@ impl StoreStub {
 
 impl FusionStoreEngine for StoreStub {
     fn put_kv(&self, key: &[u8], value: &[u8]) -> fm_core::MemoryResult<()> {
-        let tree = self.kv_tree().map_err(StoreError::to_memory)?;
-        tree.insert(key, value)
+        self.kv_tree
+            .insert(key, value)
             .map_err(|e| StoreError::to_memory(StoreError::Sled(e.to_string())))?;
         Ok(())
     }
 
     fn get_kv_zero_copy(&self, key: &[u8]) -> fm_core::MemoryResult<Option<ZeroCopyBuffer>> {
-        let tree = self.kv_tree().map_err(StoreError::to_memory)?;
-        let res = tree
+        let res = self
+            .kv_tree
             .get(key)
             .map_err(|e| StoreError::to_memory(StoreError::Sled(e.to_string())))?;
+        // §3.16: store-stub 非 mmap, sled::IVec 需 .as_ref().to_vec() 拷出 (IVec 生命周期绑 db)。
+        // ZeroCopyBuffer 类型名源自 store-fusion mmap 蓝图; stub 下实为 owned, 已在 trait_def 注释标注。
         Ok(res.map(|ia| ZeroCopyBuffer::new(ia.as_ref().to_vec())))
     }
 
@@ -254,11 +265,11 @@ impl FusionStoreEngine for StoreStub {
                 got: vec.len(),
             }));
         }
-        let tree = self.vec_tree().map_err(StoreError::to_memory)?;
         // H2 幂等: 同 id 已落盘且未 tombstone → 视为已存在, 跳过 hnsw.insert。
         // replay 重放同一条目 (leader 重发/follower 重启) 不重复入索引, 避免 hnsw 重复点。
         // tombstone 状态 → 清 tomb 后照常重插入 (复活路径)。
-        let already_present = tree
+        let already_present = self
+            .vec_tree
             .contains_key(id.to_be_bytes())
             .map_err(|e| StoreError::to_memory(StoreError::Sled(e.to_string())))?;
         if already_present && !self.is_tombstoned(id).map_err(StoreError::to_memory)? {
@@ -270,12 +281,13 @@ impl FusionStoreEngine for StoreStub {
         }
         if self.is_tombstoned(id).map_err(StoreError::to_memory)? {
             warn!(id, "insert_vector: id tombstoned, clearing tombstone");
-            let tomb = self.tomb_tree().map_err(StoreError::to_memory)?;
-            tomb.remove(id.to_be_bytes())
+            self.tomb_tree
+                .remove(id.to_be_bytes())
                 .map_err(|e| StoreError::to_memory(StoreError::Sled(e.to_string())))?;
         }
         let bytes = Self::serialize_vec(vec).map_err(StoreError::to_memory)?;
-        tree.insert(id.to_be_bytes(), bytes)
+        self.vec_tree
+            .insert(id.to_be_bytes(), bytes)
             .map_err(|e| StoreError::to_memory(StoreError::Sled(e.to_string())))?;
         let hnsw = self.hnsw.read().map_err(|e| {
             StoreError::to_memory(StoreError::Hnsw(format!("hnsw lock poisoned: {e}")))
@@ -312,12 +324,14 @@ impl FusionStoreEngine for StoreStub {
         // hnsw 近似召回在小数据集/边界 ef 下可能返回 < top_k。补齐: 线性扫 vec_tree
         // 取未命中活向量, 按 cosine 补足 top_k。保正确召回完整性 (Rule 12 不静默少返)。
         if out.len() < top_k {
-            let tree = self.vec_tree().map_err(StoreError::to_memory)?;
             let mut candidates: Vec<(u64, f32)> = Vec::new();
-            for item in tree.iter() {
+            for item in self.vec_tree.iter() {
                 let (k, v) =
                     item.map_err(|e| StoreError::to_memory(StoreError::Sled(e.to_string())))?;
-                let id = u64::from_be_bytes(k.as_ref().try_into().unwrap_or([0u8; 8]));
+                // §3.3/§3.10: 坏 key 不再 unwrap_or([0u8;8]) 归零 (会污染 id0), 跳过坏行。
+                let Some(id) = Self::parse_id_key(&k) else {
+                    continue;
+                };
                 if seen.contains(&id) || tombs.contains(&id) {
                     continue;
                 }
@@ -339,8 +353,8 @@ impl FusionStoreEngine for StoreStub {
         if self.is_tombstoned(id).map_err(StoreError::to_memory)? {
             return Ok(None);
         }
-        let tree = self.vec_tree().map_err(StoreError::to_memory)?;
-        let res = tree
+        let res = self
+            .vec_tree
             .get(id.to_be_bytes())
             .map_err(|e| StoreError::to_memory(StoreError::Sled(e.to_string())))?;
         match res {
@@ -353,15 +367,40 @@ impl FusionStoreEngine for StoreStub {
     }
 
     fn delete_vector(&self, id: u64) -> fm_core::MemoryResult<()> {
-        let tomb = self.tomb_tree().map_err(StoreError::to_memory)?;
-        tomb.insert(id.to_be_bytes(), &[1u8])
+        self.tomb_tree
+            .insert(id.to_be_bytes(), &[1u8])
             .map_err(|e| StoreError::to_memory(StoreError::Sled(e.to_string())))?;
         debug!(id, "delete_vector: tombstoned");
         Ok(())
     }
 
+    // §1.4: trait 化 list_vector_ids, 引擎经 dyn FusionStoreEngine 调用, 不绑死 StoreStub。
+    fn list_vector_ids(&self) -> fm_core::MemoryResult<Vec<u64>> {
+        StoreStub::list_vector_ids(self).map_err(StoreError::to_memory)
+    }
+
     fn dimension(&self) -> usize {
         self.dim
+    }
+}
+
+// §2.13: 进程退出时 sled 异步刷盘可能丢尾写。Drop 显式 flush + flush trees 兜底优雅落盘。
+// flush 失败只 warn 不 panic (析构中 panic 不安全); 1s 批刷窗口外的写已落 WAL, 崩溃可恢复。
+impl Drop for StoreStub {
+    fn drop(&mut self) {
+        if let Err(e) = self.tomb_tree.flush() {
+            warn!(error = %e, "Drop: tomb_tree flush failed");
+        }
+        if let Err(e) = self.vec_tree.flush() {
+            warn!(error = %e, "Drop: vec_tree flush failed");
+        }
+        if let Err(e) = self.kv_tree.flush() {
+            warn!(error = %e, "Drop: kv_tree flush failed");
+        }
+        if let Err(e) = self.db.flush() {
+            warn!(error = %e, "Drop: db flush failed");
+        }
+        debug!("store-stub dropped (flushed)");
     }
 }
 

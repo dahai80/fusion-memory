@@ -38,6 +38,15 @@ pub struct FormattedContext {
     pub blocks: Vec<ContextBlock>,
     /// 经 Qwen tokenizer 实算（C4 修正），供消费方截断。
     pub total_tokens: usize,
+    /// §2.5: follower 节点陈旧读信号。true = 本节点落后于 leader (分区/同步停滞),
+    /// 检索结果可能缺最近 commit。standalone/leader 恒 false。消费方可据此降级或告警,
+    /// 不再静默退化为 "越用越懂用户" 的反面 (follower 视图冻结无信号)。
+    #[serde(default)]
+    pub stale_read: bool,
+    /// §2.5: 本节点最近一次成功同步 leader 的时间戳 (ms, 0=从未同步/非 follower)。
+    /// 消费方算 staleness 阈值。standalone/leader 恒 0。
+    #[serde(default)]
+    pub last_sync_at: u64,
 }
 
 /// 上下文块（聚合后的 Interaction 视图，含多 Turn）。PRD §5.5。

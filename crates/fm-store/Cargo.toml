@@ -1,6 +1,6 @@
 [package]
 name = "fm-store"
-version = "0.1.1"
+version = "0.2.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -10,6 +10,9 @@ description = "fusion-memory 向量存储 trait + store-stub 生产后端"
 [features]
 default = ["store-stub"]
 store-stub = ["hnsw_rs", "sled"]
+# §1.4: store-fusion 与 store-stub 互斥后端。非空壳: 命中时 fusion.rs 显式 compile_error
+# (上游 fusion-store trait 对齐前阻断编译), 不再产出"无 store 实现的废 crate"。
+# 上游就绪后换真实 impl (见 fusion.rs)。
 store-fusion = []
 
 [dependencies]

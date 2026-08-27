@@ -79,7 +79,7 @@ fn append_commit(source: &Persist, id: &str, seq_vec: u64) {
 async fn e2e_leader_commit_follower_catchup() {
     let (source, _dir) = open_source();
     append_commit(&source, "m-1", 11);
-    let leader = Arc::new(Leader::new(source.clone(), 0));
+    let leader = Arc::new(Leader::new(source.clone(), 0).with_allow_no_token(true));
     let (listener, port) = leader.bind().await.unwrap();
     let leader_task = tokio::spawn(Arc::clone(&leader).serve_listener(listener));
 
@@ -91,11 +91,12 @@ async fn e2e_leader_commit_follower_catchup() {
             heartbeat_fails: 3,
             fetch_limit: 64,
             cluster_token: None,
+            epoch: 0,
         },
         sink.clone(),
         0,
     );
-    let (seq, applied, _failed) = follower.sync_once().await.unwrap();
+    let (seq, applied, _failed, _perm) = follower.sync_once().await.unwrap();
     assert_eq!(seq, 1);
     assert_eq!(applied, 1);
     assert_eq!(sink.puts.lock().unwrap().clone(), vec!["m-1".to_string()]);
@@ -107,7 +108,7 @@ async fn e2e_leader_commit_follower_catchup() {
 async fn e2e_incremental_sync_advances_seq() {
     let (source, _dir) = open_source();
     append_commit(&source, "a", 1);
-    let leader = Arc::new(Leader::new(source.clone(), 0));
+    let leader = Arc::new(Leader::new(source.clone(), 0).with_allow_no_token(true));
     let (listener, port) = leader.bind().await.unwrap();
     let leader_task = tokio::spawn(Arc::clone(&leader).serve_listener(listener));
 
@@ -119,12 +120,13 @@ async fn e2e_incremental_sync_advances_seq() {
             heartbeat_fails: 3,
             fetch_limit: 64,
             cluster_token: None,
+            epoch: 0,
         },
         sink.clone(),
         0,
     );
     // 第一轮: 取 a
-    let (seq1, app1, _f1) = follower.sync_once().await.unwrap();
+    let (seq1, app1, _f1, _p1) = follower.sync_once().await.unwrap();
     assert_eq!((seq1, app1), (1, 1));
 
     // leader 追加第二条 (delete) + 第三条 (commit b)
@@ -132,7 +134,7 @@ async fn e2e_incremental_sync_advances_seq() {
     append_commit(&source, "b", 2);
 
     // 第二轮: 增量取 seq 2,3 (delete a + commit b)
-    let (seq2, app2, _f2) = follower.sync_once().await.unwrap();
+    let (seq2, app2, _f2, _p2) = follower.sync_once().await.unwrap();
     assert_eq!(seq2, 3);
     assert_eq!(app2, 2);
     let tombs = sink.tombs.lock().unwrap().clone();
@@ -149,7 +151,7 @@ async fn e2e_leader_down_then_promote_new_leader() {
     // 旧 leader: 写一条后 abort (模拟宕机)。
     let (source_a, _dir_a) = open_source();
     append_commit(&source_a, "old-1", 7);
-    let leader_a = Arc::new(Leader::new(source_a.clone(), 0));
+    let leader_a = Arc::new(Leader::new(source_a.clone(), 0).with_allow_no_token(true));
     let (listener_a, port_a) = leader_a.bind().await.unwrap();
     let leader_task_a = tokio::spawn(Arc::clone(&leader_a).serve_listener(listener_a));
 
@@ -161,6 +163,7 @@ async fn e2e_leader_down_then_promote_new_leader() {
             heartbeat_fails: 2,
             fetch_limit: 64,
             cluster_token: None,
+            epoch: 0,
         },
         sink.clone(),
         0,
@@ -184,7 +187,7 @@ async fn e2e_leader_down_then_promote_new_leader() {
     // 新 leader 续写 (原 follower 数据 + 新 wop)
     let (source_b, _dir_b) = open_source();
     append_commit(&source_b, "new-1", 8);
-    let leader_b = Arc::new(Leader::new(source_b.clone(), 0));
+    let leader_b = Arc::new(Leader::new(source_b.clone(), 0).with_allow_no_token(true));
     let (listener_b, port_b) = leader_b.bind().await.unwrap();
     let leader_task_b = tokio::spawn(Arc::clone(&leader_b).serve_listener(listener_b));
 
@@ -197,11 +200,12 @@ async fn e2e_leader_down_then_promote_new_leader() {
             heartbeat_fails: 3,
             fetch_limit: 64,
             cluster_token: None,
+            epoch: 0,
         },
         sink2.clone(),
         0,
     );
-    let (seq_new, app_new, _fnew) = follower2.sync_once().await.unwrap();
+    let (seq_new, app_new, _fnew, _pnew) = follower2.sync_once().await.unwrap();
     assert_eq!(seq_new, 1);
     assert_eq!(app_new, 1);
     assert_eq!(

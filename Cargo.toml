@@ -55,6 +55,11 @@ ulid = "1"
 
 # 存储
 rusqlite = { version = "0.40", features = ["bundled"] }
+# §1.1: SQLite 连接池。打破单 Mutex<Connection> 串行 (WAL 多读并发被单连接抵消)。
+# r2d2 连接池 → 多读并发 + 写串行 (WAL 原生 1 写 N 读)。PooledConnection Deref → Connection,
+# 调用点 (conn.prepare_cached 等) 零改动。
+r2d2 = "0.8"
+r2d2_sqlite = "0.35"
 # sled 1.0-alpha 的 Db/Tree 非 Sync（RefCell EBR），换稳定 0.34（Send+Sync）。Rule 7。
 sled = "0.34"
 hnsw_rs = "0.3"

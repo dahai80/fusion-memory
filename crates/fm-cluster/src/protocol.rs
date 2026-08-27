@@ -17,13 +17,18 @@ pub enum FrameKind {
     Pong,
 }
 
-/// 握手包: follower 告知本地 last_seq + 共享 secret token (H3 鉴权)。
+/// 握手包: follower 告知本地 last_seq + 共享 secret token (H3 鉴权) + 已知 epoch (§1.8 fencing)。
 /// token 经 env FUSION_MEMORY_CLUSTER_TOKEN 下发, leader 校验不一致 → 拒连接。
+/// §1.8: epoch = follower 期望的 leader epoch (env FUSION_MEMORY_CLUSTER_EPOCH)。leader 回复
+/// 自身 epoch, follower 拒 epoch < 期望的 leader (陈旧 leader fencing, 防脑裂双写)。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Hello {
     pub follower_last_seq: i64,
     #[serde(default)]
     pub token: String,
+    /// §1.8: follower 期望的 leader epoch。0 = 未配 (不 fencing)。默认 0 向后兼容旧 follower。
+    #[serde(default)]
+    pub epoch: u64,
 }
 
 /// follower → leader 拉增量: 自 since_seq 之后。
@@ -33,11 +38,17 @@ pub struct SyncRequest {
     pub limit: usize,
 }
 
-/// leader → follower: wop 条目 + 当前 leader 最大 seq。
+/// leader → follower: wop 条目 + leader epoch (§1.8 fencing + §3.19 去 leader_last_seq 死字段)。
+/// §3.19: 旧 leader_last_seq 被算法忽略 (follower 用 outcome.last_applied_seq 推游标), 算它
+/// 是 leader 热路径每请求额外 SQLite 查询 → 浪费。改载 leader_epoch: follower 据 §1.8 fencing
+/// 判断 leader 是否陈旧 (epoch < 期望 → 拒, 防脑裂)。未配 epoch → 0, follower 不 fencing。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SyncResponse {
     pub entries: Vec<fm_persist::WopEntry>,
-    pub leader_last_seq: i64,
+    /// §1.8: leader 自报 epoch。follower 校验 ≥ 期望 epoch, 否则拒同步 (陈旧 leader)。
+    /// #[serde(default)] 向后兼容旧 leader 不带此字段 (按 0, 不 fencing)。
+    #[serde(default)]
+    pub leader_epoch: u64,
 }
 
 /// 统一帧封装 (kind + json payload)。
@@ -110,13 +121,31 @@ mod tests {
                 payload: "{}".into(),
                 at: 100,
             }],
-            leader_last_seq: 1,
+            leader_epoch: 3,
         };
         let frame = Frame::new(FrameKind::SyncResponse, resp).unwrap();
         assert_eq!(frame.kind, FrameKind::SyncResponse);
         let back: SyncResponse = frame.decode_payload().unwrap();
-        assert_eq!(back.leader_last_seq, 1);
+        assert_eq!(back.leader_epoch, 3);
         assert_eq!(back.entries.len(), 1);
+    }
+
+    #[test]
+    fn hello_epoch_default_compat() {
+        // §1.8: 旧 follower hello 不带 epoch → 反序列化默认 0 (不 fencing)。
+        let json = r#"{"follower_last_seq":5,"token":"t"}"#;
+        let h: Hello = serde_json::from_str(json).unwrap();
+        assert_eq!(h.follower_last_seq, 5);
+        assert_eq!(h.epoch, 0);
+    }
+
+    #[test]
+    fn sync_response_epoch_default_compat() {
+        // §3.19: 旧 leader resp 不带 leader_epoch → 反序列化默认 0 (不 fencing)。
+        let json = r#"{"entries":[]}"#;
+        let r: SyncResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(r.leader_epoch, 0);
+        assert!(r.entries.is_empty());
     }
 
     #[tokio::test]

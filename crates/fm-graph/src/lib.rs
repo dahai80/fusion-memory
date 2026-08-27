@@ -17,8 +17,12 @@ pub mod affinity;
 pub mod alias_dict;
 pub mod align;
 pub mod error;
+// §1.5: 图层存储抽象 trait (解耦 fm-graph 与具体 Persist)。
+pub mod store;
 
 pub use affinity::graph_affinity;
 pub use alias_dict::{alias_dict, canonical};
 pub use align::{align_entity, AlignOutcome};
 pub use error::{GraphError, GraphResult};
+// §1.5: 导出 GraphStore trait + Persist 适配 (consumer 经 `&dyn GraphStore` 注入)。
+pub use store::GraphStore;

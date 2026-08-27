@@ -16,7 +16,7 @@ use fm_core::{EntityNode, EntityType, MemoryItem, MemoryTier, MemoryType};
 use fm_embed::{EmbedConfig, Embedder, MlxEmbedder, StubEmbedder};
 use fm_engine::MemoryEngine;
 use fm_persist::Persist;
-use fm_store::{FusionStoreEngine, StoreStub};
+use fm_store::StoreStub;
 use rusqlite::Connection;
 use tracing::{info, warn};
 

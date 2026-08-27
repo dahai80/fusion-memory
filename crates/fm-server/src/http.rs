@@ -4,7 +4,7 @@
 //! POST /v1/memory/commit | retrieve | consolidate | audit | delete
 //! POST /v1/memory/delete_scope | count          (issue #2)
 //! GET  /v1/memory/{id}
-//! GET  /healthz (公开)
+//! GET  /healthz (公开, §1.7 探活子系统)
 //! 所有 /v1/* 强制 Bearer（B5）。delete/delete_scope 需 body.confirm=true。
 
 use std::sync::Arc;
@@ -16,11 +16,11 @@ use axum::routing::{get, post};
 use axum::Json;
 use serde_json::Value;
 use tower_http::trace::TraceLayer;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::auth::check_bearer;
 use crate::engine_handle::EngineHandle;
-use crate::jsonrpc::{dispatch, RpcRequest, RpcResponse};
+use crate::jsonrpc::{dispatch, http_status_for_error, RpcRequest, RpcResponse};
 
 /// HTTP 服务共享状态。
 #[derive(Clone)]
@@ -45,11 +45,33 @@ pub fn app(state: HttpState) -> axum::Router {
         .with_state(state)
 }
 
-async fn healthz() -> impl IntoResponse {
-    (StatusCode::OK, "ok")
+/// §1.7: /healthz 不再永远 200。探活 persist+store (经 engine.count, 触 SQLite+store 路径),
+/// 失败返 503 + 诊断体。编排器/liveness 据此判定功能性宕机, 而非仅 TCP 存活。
+/// count(None) 全量计数 — 轻量 SELECT COUNT(*), 持续暴露 SQLite 锁死/WAL 损坏/store 中毒。
+async fn healthz(State(st): State<HttpState>) -> Response {
+    match st.engine.count(None).await {
+        Ok(n) => {
+            info!(count = n, "healthz ok");
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({"status":"ok","count":n})),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            warn!(error = %e, "healthz probe failed");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"status":"unhealthy","error":e.to_string()})),
+            )
+                .into_response()
+        }
+    }
 }
 
-/// 鉴权 + 解析 RPC 请求 → dispatch。
+/// §3.8: axum `Json<Value>` 已解析体, 直接 `from_value` 进 RpcRequest (一次反序列化), 不再二解。
+/// §2.9: dispatch 返 RpcResponse; 若 error 已设 → 按 http_status_for_error 映射 HTTP 状态码,
+/// 不再无条件 200 把引擎错误埋进 body。
 async fn handle_rpc(
     State(st): State<HttpState>,
     headers: HeaderMap,
@@ -60,16 +82,22 @@ async fn handle_rpc(
     }
     let rpc: RpcRequest = match serde_json::from_value(req) {
         Ok(r) => r,
-        Err(_) => {
+        Err(e) => {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error":"invalid json-rpc request"})),
+                Json(
+                    serde_json::json!({"error":"invalid json-rpc request","detail":e.to_string()}),
+                ),
             )
                 .into_response();
         }
     };
-    let resp: RpcResponse = dispatch(&rpc, &st.engine).await;
-    Json(resp).into_response()
+    let resp: RpcResponse = dispatch(rpc, &st.engine).await;
+    let status = match &resp.error {
+        Some(e) => http_status_for_error(e.code),
+        None => StatusCode::OK,
+    };
+    (status, Json(resp)).into_response()
 }
 
 async fn commit(st: State<HttpState>, h: HeaderMap, j: Json<Value>) -> Response {
@@ -108,21 +136,33 @@ async fn get_memory(
         params: serde_json::json!({"id": id}),
         id: Value::from(0i64),
     };
-    let resp = dispatch(&rpc, &st.engine).await;
-    Json(resp).into_response()
+    let resp = dispatch(rpc, &st.engine).await;
+    let status = match &resp.error {
+        Some(e) => http_status_for_error(e.code),
+        None => StatusCode::OK,
+    };
+    (status, Json(resp)).into_response()
 }
 
 /// 启动 HTTP 监听。cfg.http_ok() 已由调用方保证。
-pub async fn serve(state: HttpState, port: u16) -> Result<(), String> {
+/// §1.11: shutdown 信号到 → axum graceful drain, 不打断在飞 consolidate saga。
+pub async fn serve(
+    state: HttpState,
+    port: u16,
+    shutdown: tokio::sync::oneshot::Receiver<()>,
+) -> Result<(), String> {
     let app = app(state);
     let addr = format!("127.0.0.1:{port}");
     info!(%addr, "http server listening");
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .map_err(|e| format!("bind {addr}: {e}"))?;
-    axum::serve(listener, app)
-        .await
-        .map_err(|e| format!("serve: {e}"))?;
+    // §1.11: with_graceful_shutdown 让在飞请求 drain 完再退, 不被 SIGTERM 打断 saga。
+    let serve_fut = axum::serve(listener, app).with_graceful_shutdown(async move {
+        let _ = shutdown.await;
+        info!("http graceful shutdown triggered");
+    });
+    serve_fut.await.map_err(|e| format!("serve: {e}"))?;
     Ok(())
 }
 
@@ -164,6 +204,8 @@ mod tests {
             Ok(FormattedContext {
                 blocks: vec![],
                 total_tokens: 0,
+                stale_read: false,
+                last_sync_at: 0,
             })
         }
         async fn consolidate_memories(&self) -> fm_core::MemoryResult<ConsolidationReport> {
@@ -257,21 +299,9 @@ mod tests {
         let app = app(st);
         let body = r#"{"jsonrpc":"2.0","method":"delete","params":{"id":"m1"},"id":1}"#;
         let (code, body) = req(&app, "/v1/memory/delete", body, Some("Bearer sekret")).await;
-        assert_eq!(code, StatusCode::OK);
+        // §2.9: invalid_params(-32602) → 400, 不再 200 埋进 body
+        assert_eq!(code, StatusCode::BAD_REQUEST);
         assert!(body.contains("-32602"), "body={body}");
-    }
-
-    #[tokio::test]
-    async fn healthz_open() {
-        let (st, _) = test_state("sekret");
-        let app = app(st);
-        let r = Request::builder()
-            .method("GET")
-            .uri("/healthz")
-            .body(Body::empty())
-            .unwrap();
-        let resp = tower::ServiceExt::oneshot(app, r).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -336,7 +366,8 @@ mod tests {
         let body =
             r#"{"jsonrpc":"2.0","method":"delete_scope","params":{"scope":"sess-A"},"id":1}"#;
         let (code, body) = req(&app, "/v1/memory/delete_scope", body, Some("Bearer sekret")).await;
-        assert_eq!(code, StatusCode::OK);
+        // §2.9: invalid_params(-32602) → 400
+        assert_eq!(code, StatusCode::BAD_REQUEST);
         assert!(body.contains("-32602"), "body={body}");
     }
 
@@ -410,7 +441,140 @@ mod tests {
         let app = app(st);
         let body = r#"{"jsonrpc":"2.0","method":"bogus","params":{},"id":1}"#;
         let (code, body) = req(&app, "/v1/memory/commit", body, Some("Bearer sekret")).await;
-        assert_eq!(code, StatusCode::OK);
+        // §2.9: method_not_found(-32601) → 400, 不再 200 (缺陷被烤进契约, 现修正)
+        assert_eq!(code, StatusCode::BAD_REQUEST);
         assert!(body.contains("-32601"));
+    }
+
+    // §1.7: /healthz 探活子系统。stub engine.count 返 Ok(7) → 200; 坏引擎 → 503。
+    #[tokio::test]
+    async fn healthz_probe_ok() {
+        let (st, _) = test_state("sekret");
+        let app = app(st);
+        let r = Request::builder()
+            .method("GET")
+            .uri("/healthz")
+            .body(Body::empty())
+            .unwrap();
+        let resp = tower::ServiceExt::oneshot(app, r).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // §1.7: 坏引擎 (count 抛错) → healthz 503, 不再永远 200。
+    #[tokio::test]
+    async fn healthz_probe_unhealthy_503() {
+        struct SickEngine;
+        #[async_trait::async_trait]
+        impl fm_core::FusionMemoryEngine for SickEngine {
+            async fn commit_episodic_memory(
+                &self,
+                _: &str,
+                _: &fm_core::Interaction,
+            ) -> fm_core::MemoryResult<Vec<fm_core::MemoryId>> {
+                Ok(vec![])
+            }
+            async fn retrieve_context(
+                &self,
+                _: &fm_core::RetrieveQuery,
+            ) -> fm_core::MemoryResult<fm_core::FormattedContext> {
+                Ok(fm_core::FormattedContext {
+                    blocks: vec![],
+                    total_tokens: 0,
+                    stale_read: false,
+                    last_sync_at: 0,
+                })
+            }
+            async fn consolidate_memories(
+                &self,
+            ) -> fm_core::MemoryResult<fm_core::ConsolidationReport> {
+                Ok(fm_core::ConsolidationReport::default())
+            }
+            async fn get_memory(
+                &self,
+                _: &str,
+            ) -> fm_core::MemoryResult<Option<fm_core::MemoryItem>> {
+                Ok(None)
+            }
+            async fn delete_memory(&self, _: &str) -> fm_core::MemoryResult<()> {
+                Ok(())
+            }
+            async fn audit_memory_access(
+                &self,
+                _: &[String],
+            ) -> fm_core::MemoryResult<Vec<fm_core::MemoryItem>> {
+                Ok(vec![])
+            }
+            async fn count(&self, _: Option<&str>) -> fm_core::MemoryResult<u64> {
+                Err(fm_core::MemoryError::Sqlite(
+                    "persist conn lock poisoned".into(),
+                ))
+            }
+        }
+        let st = HttpState {
+            engine: EngineHandle::from_concrete(SickEngine),
+            api_key: Arc::new("sekret".into()),
+        };
+        let app = app(st);
+        let r = Request::builder()
+            .method("GET")
+            .uri("/healthz")
+            .body(Body::empty())
+            .unwrap();
+        let resp = tower::ServiceExt::oneshot(app, r).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    // §2.9: 引擎 NotFound → HTTP 404 (旧版恒 200)。
+    #[tokio::test]
+    async fn not_found_returns_404() {
+        struct NotFoundEngine;
+        #[async_trait::async_trait]
+        impl fm_core::FusionMemoryEngine for NotFoundEngine {
+            async fn commit_episodic_memory(
+                &self,
+                _: &str,
+                _: &fm_core::Interaction,
+            ) -> fm_core::MemoryResult<Vec<fm_core::MemoryId>> {
+                Ok(vec![])
+            }
+            async fn retrieve_context(
+                &self,
+                _: &fm_core::RetrieveQuery,
+            ) -> fm_core::MemoryResult<fm_core::FormattedContext> {
+                Err(fm_core::MemoryError::NotFound("vector missing".into()))
+            }
+            async fn consolidate_memories(
+                &self,
+            ) -> fm_core::MemoryResult<fm_core::ConsolidationReport> {
+                Ok(fm_core::ConsolidationReport::default())
+            }
+            async fn get_memory(
+                &self,
+                _: &str,
+            ) -> fm_core::MemoryResult<Option<fm_core::MemoryItem>> {
+                Ok(None)
+            }
+            async fn delete_memory(&self, _: &str) -> fm_core::MemoryResult<()> {
+                Ok(())
+            }
+            async fn audit_memory_access(
+                &self,
+                _: &[String],
+            ) -> fm_core::MemoryResult<Vec<fm_core::MemoryItem>> {
+                Ok(vec![])
+            }
+            async fn count(&self, _: Option<&str>) -> fm_core::MemoryResult<u64> {
+                Ok(0)
+            }
+        }
+        let st = HttpState {
+            engine: EngineHandle::from_concrete(NotFoundEngine),
+            api_key: Arc::new("sekret".into()),
+        };
+        let app = app(st);
+        let body = r#"{"jsonrpc":"2.0","method":"retrieve","params":{"text":"hi"},"id":1}"#;
+        let (code, body) = req(&app, "/v1/memory/retrieve", body, Some("Bearer sekret")).await;
+        assert_eq!(code, StatusCode::NOT_FOUND);
+        assert!(body.contains("-32001"), "body={body}");
     }
 }

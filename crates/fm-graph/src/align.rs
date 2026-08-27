@@ -12,11 +12,12 @@
 //! LLM alias 仅候选, 不作判定 (运行期写入 entity.aliases, 不在 align 内决策)。
 
 use fm_core::{EntityNode, EntityType};
-use fm_persist::Persist;
 use tracing::{debug, info};
 
 use crate::alias_dict::canonical;
 use crate::error::GraphResult;
+// §1.5: align 取 `&dyn GraphStore` (非具体 Persist), 图层可注入内存 mock 单测。
+use crate::store::GraphStore;
 
 /// 向量回退提供者 (engine 注入, fm-graph 不依赖 fm-embed)。
 /// 返回某 entity 的向量 (若有)。align 用其算余弦判合并。
@@ -68,12 +69,12 @@ fn cosine_impl(a: &[f32], b: &[f32]) -> Option<f64> {
 
 /// 规则 1+2: normalize → 精确名匹配 (同 type)。仅返回存量 id (priority 由 caller 定)。
 fn match_by_name(
-    persist: &Persist,
+    store: &dyn GraphStore,
     name: &str,
     entity_type: EntityType,
 ) -> GraphResult<Option<String>> {
     let norm = normalize_name(name);
-    let rows = persist.list_entities_by_type(entity_type.as_str())?;
+    let rows = store.list_entities_by_type(entity_type.as_str())?;
     if let Some((id, _ename, _)) = rows.iter().find(|(_, ename, _)| ename == &norm) {
         return Ok(Some(id.clone()));
     }
@@ -82,12 +83,12 @@ fn match_by_name(
 
 /// 规则 3: name/alias 精确命中 (case-insensitive, 同 type)。仅返回存量 id。
 fn match_by_existing(
-    persist: &Persist,
+    store: &dyn GraphStore,
     name: &str,
     entity_type: EntityType,
 ) -> GraphResult<Option<String>> {
     let target = normalize_name(name).to_ascii_lowercase();
-    let rows = persist.list_entities_by_type(entity_type.as_str())?;
+    let rows = store.list_entities_by_type(entity_type.as_str())?;
     for (id, ename, aliases_json) in &rows {
         if ename.to_ascii_lowercase() == target {
             return Ok(Some(id.clone()));
@@ -104,7 +105,7 @@ fn match_by_existing(
 
 /// 规则 4: 向量 fallback。按 EntityType 阈值, 同 type 内取最相似且超阈值者。
 fn match_by_vector(
-    persist: &Persist,
+    store: &dyn GraphStore,
     provider: &dyn EntityVectorProvider,
     candidate_id: &str,
     entity_type: EntityType,
@@ -117,7 +118,7 @@ fn match_by_vector(
         Some(v) => v,
         None => return Ok(None),
     };
-    let rows = persist.list_entities_by_type(entity_type.as_str())?;
+    let rows = store.list_entities_by_type(entity_type.as_str())?;
     let mut best: Option<(String, f64)> = None;
     for (id, _ename, _aliases) in &rows {
         if id.as_str() == candidate_id {
@@ -138,14 +139,15 @@ fn match_by_vector(
 }
 
 /// 对齐单个候选实体。返回对齐结果 (不写库; 写库由 caller 用 result 处理)。
+/// §1.5: 取 `&dyn GraphStore` (非具体 Persist), 图层可注入内存 mock 单测。
 pub fn align_entity(
-    persist: &Persist,
+    store: &dyn GraphStore,
     candidate: &EntityNode,
     provider: Option<&dyn EntityVectorProvider>,
 ) -> GraphResult<AlignOutcome> {
     let etype = candidate.entity_type;
     // 规则 1: normalize 精确名匹配 (priority=3)
-    if let Some(id) = match_by_name(persist, &candidate.name, etype)? {
+    if let Some(id) = match_by_name(store, &candidate.name, etype)? {
         debug!(rule = 1, %id, "align rule1 normalize match");
         return Ok(AlignOutcome {
             canonical_id: id,
@@ -156,7 +158,7 @@ pub fn align_entity(
     }
     // 规则 2: alias 字典 → 规范名 → 精确名匹配 (priority=2)
     if let Some(canon_name) = canonical(&candidate.name) {
-        if let Some(id) = match_by_name(persist, &canon_name, etype)? {
+        if let Some(id) = match_by_name(store, &canon_name, etype)? {
             debug!(rule = 2, %id, "align rule2 alias-dict match");
             return Ok(AlignOutcome {
                 canonical_id: id,
@@ -166,7 +168,7 @@ pub fn align_entity(
             });
         }
         // alias 改名后无存量, 保留规范名; 用规范名继续走规则 3
-        if let Some(id) = match_by_existing(persist, &canon_name, etype)? {
+        if let Some(id) = match_by_existing(store, &canon_name, etype)? {
             debug!(rule = 2, %id, "align rule2 alias-dict existing match");
             return Ok(AlignOutcome {
                 canonical_id: id,
@@ -177,7 +179,7 @@ pub fn align_entity(
         }
     }
     // 规则 3: 同 type name/alias 精确命中 (priority=1)
-    if let Some(id) = match_by_existing(persist, &candidate.name, etype)? {
+    if let Some(id) = match_by_existing(store, &candidate.name, etype)? {
         debug!(rule = 3, %id, "align rule3 existing match");
         return Ok(AlignOutcome {
             canonical_id: id,
@@ -188,7 +190,7 @@ pub fn align_entity(
     }
     // 规则 4: 向量 fallback (priority=0)
     if let Some(provider) = provider {
-        if let Some((id, sim)) = match_by_vector(persist, provider, &candidate.id, etype)? {
+        if let Some((id, sim)) = match_by_vector(store, provider, &candidate.id, etype)? {
             info!(rule = 4, %id, sim, "align rule4 vector fallback merge");
             return Ok(AlignOutcome {
                 canonical_id: id,

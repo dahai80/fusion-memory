@@ -70,6 +70,24 @@ Fusion 生态（"一核九端"）系统级长/短期记忆与认知图谱中枢�
 
 验收：325 离线测试全绿（基线 301 → +24 新增，persist 3 + dispatch 5 + http 4 + trait/引擎 12），clippy `-D warnings` + fmt clean，`cargo check --workspace` clean。CI 受 GitHub 账户计费阻断（`recent account payments have failed`，非代码问题，本地 fmt/clippy/check/test gate 为代理口径）。
 
+### v0.2.0 审计二轮深度修复（2026-08-28，架构层 + 生产路径门禁）
+
+审计报告 `audit/fusion-memory-audit-result-0827.md` §1/§2/§3 深度项（48 findings，分 8 批落地）全部修复。本轮聚焦架构层耦合、生产路径零覆盖、错误类型语义化，与 v0.1.x 的行为缺陷修复互补。354 离线测试全绿（基线 325 → +29 新增回归测试），clippy `-D warnings` + fmt clean。
+
+**架构层解耦（§1.1/§1.4/§1.5）**
+- **§1.1 连接池打破单 Mutex 串行**：`Persist` 从 `Mutex<Connection>` 改 `r2d2::Pool<SqliteConnectionManager>`（POOL_SIZE=8）。WAL 原生 1 写 N 读并发此前被单连接抵消；`PooledConnection` Deref→`Connection`，`prepare_cached`/`transaction()` 调用点零改动。新增 `PersistError::Pool` + `From<r2d2::Error>`，超时/busy → `MemoryError::Busy` 可重试。`fm-persist/src/store.rs`、`fm-persist/src/error.rs`、`Cargo.toml`（r2d2 0.8 / r2d2_sqlite 0.35，匹配 rusqlite 0.40 bundled）。
+- **§1.4 store 后端 trait 化**：`MemoryEngine.store` 字段从 `Arc<StoreStub>` 改 `Arc<dyn FusionStoreEngine>`（动态分发，不绑死具体后端）。`FusionStoreEngine` trait 补 `list_vector_ids`（reconcile 反向对账 store→SQLite 孤儿扫描）。store-fusion 后端从空壳改 `compile_error!` 显式阻断（上游 fusion-store trait 对齐前）。`fm-store/src/trait_def.rs`、`fm-store/src/stub.rs`、`fm-store/src/fusion.rs`、`fm-engine/src/engine.rs`。
+- **§1.5 图层存储抽象**：新增 `fm_graph::GraphStore` trait（仅 `n_hop_reachable` + `list_entities_by_type` 两方法，图层所需最小接口），`impl GraphStore for Persist`。`graph_affinity`/`align_entity`/`score_candidate` 签名从 `&Persist` 改 `&dyn GraphStore`，图层不再 `use fm_persist::Persist`。新增 mock 测试 `mock_store_no_sqlite_needed` 证图层可纯内存单测（无需 `Persist::open_in_memory()` + SQL 填数据）。`fm-graph/src/store.rs`、`fm-graph/src/affinity.rs`、`fm-graph/src/align.rs`、`fm-engine/src/scoring.rs`。
+
+**生产路径门禁（§1.6/§1.12）**
+- **§1.6 CI live-compile 门禁**：CI 新增 `live-compile` job，每 PR 编译全部 mlx-live 门禁测试（`--features mlx-live --no-run`），验证 `MlxEmbedder` bge-m3 / consolidate saga / 真实 HTTP 代码路径类型检查通过。此前 CI 默认构建中这些生产路径编译 0 次（live 测试 `#![cfg(feature = "mlx-live")]` + `#[ignore]` 双门禁），"325 绿"对 live 路径零回归保护。实际执行仍手工（需 fusion-mlx on Apple Silicon）。`.github/workflows/ci.yml`。
+- **§1.12 桩对桩同义反复**：91 条 stub 测试（`StubEngine`/`DispatchStub`/`EchoEngine` 返魔数常量）标注为接线测试（证 wire passes params，非行为测试）；真实 `MemoryEngine` 经 HTTP/JSON-RPC 真栈往返的行为覆盖由 `tests/offline_integration.rs` + `tests/consumer_scenarios.rs` 承担（stub engine + 真栈，已在 `cargo test --workspace` 默认运行）。`fm-server/src/jsonrpc.rs`。
+
+**错误类型语义化（§2.8）**
+- **§2.8 错误类型 finalize**：`MemoryError` 补 `Poisoned`/`Busy`/`NotFound` 语义变体（旧版全压成 `Sqlite(String)`，运维误当 sqlite 错误跑 VACUUM，真诊断被隐藏）。`PersistError::to_memory` 区分映射：Poisoned→Poisoned（永久不可重试）、SQLITE_BUSY/locked→Busy（瞬时可重试）、Pool 超时→Busy。`retryable()`/`is_not_found()` helper 供调用方决策。`fm-core/src/error.rs`、`fm-persist/src/error.rs`。
+
+> 完整 8 批分批记录（Batch 0–7，按文件簇 + checkpoint）见 git 历史 `fix/audit-p0-p3-layering-0828` 分支。验收口径：354 离线测试全绿 + clippy `-D warnings` + fmt clean + live-compile 门禁编译通过。
+
 ### M2 PRD 偏离记录（Rule 7）
 
 - **Kuzu DB → SQLite 递归 CTE**（裁定 2026-08-26）：PRD §9.2 选 Kuzu DB 嵌入图，但 Kuzu 无 Rust binding。改用 SQLite 递归 CTE（`relation` 表 + `WITH RECURSIVE` N-hop 遍历），`fm-persist` 内实现，`fm-graph::graph_affinity` 消费。功能等价（N-hop 可达性 + 直接命中），无需额外 server 进程。
