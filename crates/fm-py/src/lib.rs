@@ -15,7 +15,7 @@
 // 触发 clippy::useless_conversion 误报（span 落在签名返回类型）。整体豁免。
 #![allow(clippy::useless_conversion)]
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use fm_core::{FusionMemoryEngine, Interaction, RetrieveQuery};
 use fm_embed::{Embedder, StubEmbedder};
@@ -28,10 +28,25 @@ use pyo3::types::PyString;
 use tokio::runtime::Runtime;
 use tracing::error;
 
+// M3: 全进程单 tokio runtime。旧版每个 Python Engine 各建 Runtime (多 worker 线程),
+// N 个 Engine → N×worker 线程爆炸。改 OnceLock 共享单 runtime, 所有 PyEngine 复用。
+static SHARED_RUNTIME: OnceLock<Runtime> = OnceLock::new();
+
+fn shared_runtime() -> &'static Runtime {
+    SHARED_RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("tokio runtime build (infallible config)")
+    })
+}
+
 /// Python 暴露的引擎句柄。持 tokio runtime + MemoryEngine。
+/// M3: runtime 改共享单例 (&'static), 不再 per-Engine 新建。
 #[pyclass(name = "Engine")]
 struct PyEngine {
-    runtime: Runtime,
+    runtime: &'static Runtime,
     engine: Arc<MemoryEngine>,
 }
 
@@ -78,7 +93,8 @@ impl PyEngine {
                 .map_err(|e| perr(e.to_string()))?;
             engine = engine.with_extractor(Arc::new(extractor));
         }
-        let runtime = tokio::runtime::Runtime::new().map_err(|e| perr(format!("runtime: {e}")))?;
+        // M3: 复用进程级共享 runtime, 不再 per-Engine Runtime::new()。
+        let runtime = shared_runtime();
         Ok(Self {
             runtime,
             engine: Arc::new(engine),

@@ -7,9 +7,12 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info};
 
-use crate::error::PersistResult;
+use crate::error::{PersistError, PersistResult};
 use crate::schema;
 use fm_core::{ConsolidationReport, EntityNode, MemoryItem, MemoryTier, MemoryType};
+
+// P4: 递归 CTE 结果集扇出上限 (graph_affinity 远端节点贡献 0.5^h 指数衰减, 截断无损精度)。
+const N_HOP_RESULT_LIMIT: i64 = 256;
 
 pub struct Persist {
     conn: Mutex<Connection>,
@@ -45,10 +48,23 @@ impl Persist {
         Ok(())
     }
 
+    // P1: 单点锁取连, poison 不 panic 放大, 统一上抛 Poisoned (调用方按 MemoryError 决策)。
+    fn conn(&self) -> PersistResult<std::sync::MutexGuard<'_, Connection>> {
+        self.conn.lock().map_err(|_| PersistError::Poisoned)
+    }
+
+    // P1: transaction 路径需 &mut Connection, 取可变 guard。
+    fn conn_mut(&self) -> PersistResult<std::sync::MutexGuard<'_, Connection>> {
+        self.conn.lock().map_err(|_| PersistError::Poisoned)
+    }
+
     pub fn put_memory(&self, item: &MemoryItem) -> PersistResult<()> {
-        let conn = self.conn.lock().expect("persist conn lock poisoned");
+        // H1: memory_item + entity + memory_entity 三类 INSERT 包进单 transaction,
+        // 中途任一失败 → rollback, 不留半截实体行 (无事务时 insert 成功后 entity 循环失败留孤儿)。
+        let mut conn = self.conn_mut()?;
+        let tx = conn.transaction()?;
         let entities_json = serde_json::to_string(&item.entities)?;
-        conn.execute(
+        tx.execute(
             schema::MEMORY_ITEM_DDL_INSERT,
             params![
                 item.id,
@@ -70,7 +86,7 @@ impl Persist {
             ],
         )?;
         for e in &item.entities {
-            conn.execute(
+            tx.execute(
                 "INSERT OR IGNORE INTO entity(id,name,aliases,entity_type) VALUES(?1,?2,?3,?4)",
                 params![
                     e.id,
@@ -79,23 +95,24 @@ impl Persist {
                     e.entity_type.as_str()
                 ],
             )?;
-            conn.execute(
+            tx.execute(
                 "INSERT OR IGNORE INTO memory_entity(memory_id,entity_id) VALUES(?1,?2)",
                 params![item.id, e.id],
             )?;
         }
+        tx.commit()?;
         Ok(())
     }
 
     pub fn get_memory(&self, id: &str) -> PersistResult<Option<MemoryItem>> {
-        let conn = self.conn.lock().expect("persist conn lock poisoned");
+        let conn = self.conn()?;
         let mut stmt = conn.prepare(schema::MEMORY_ITEM_DDL_SELECT_BY_ID)?;
         let row = stmt.query_row(params![id], row_to_memory).optional()?;
         Ok(row)
     }
 
     pub fn list_by_interaction(&self, interaction_id: &str) -> PersistResult<Vec<MemoryItem>> {
-        let conn = self.conn.lock().expect("persist conn lock poisoned");
+        let conn = self.conn()?;
         let mut stmt = conn.prepare(
             "SELECT * FROM memory_item WHERE interaction_id=?1 AND tombstone=0 ORDER BY turn_idx ASC",
         )?;
@@ -108,7 +125,7 @@ impl Persist {
     }
 
     pub fn list_all(&self) -> PersistResult<Vec<MemoryItem>> {
-        let conn = self.conn.lock().expect("persist conn lock poisoned");
+        let conn = self.conn()?;
         let mut stmt = conn.prepare(
             "SELECT * FROM memory_item WHERE tombstone=0 ORDER BY created_timestamp ASC",
         )?;
@@ -121,7 +138,7 @@ impl Persist {
     }
 
     pub fn count(&self) -> PersistResult<u64> {
-        let conn = self.conn.lock().expect("persist conn lock poisoned");
+        let conn = self.conn()?;
         let n: i64 = conn.query_row(
             "SELECT COUNT(*) FROM memory_item WHERE tombstone=0",
             [],
@@ -131,7 +148,7 @@ impl Persist {
     }
 
     pub fn tombstone_memory(&self, id: &str) -> PersistResult<()> {
-        let conn = self.conn.lock().expect("persist conn lock poisoned");
+        let conn = self.conn()?;
         conn.execute(
             "UPDATE memory_item SET tombstone=1 WHERE id=?1",
             params![id],
@@ -140,11 +157,45 @@ impl Persist {
     }
 
     pub fn touch_access(&self, id: &str, now_ts: u64) -> PersistResult<()> {
-        let conn = self.conn.lock().expect("persist conn lock poisoned");
+        let conn = self.conn()?;
         conn.execute(
             "UPDATE memory_item SET access_count=access_count+1, last_accessed_timestamp=?1 WHERE id=?2",
             params![now_ts as i64, id],
         )?;
+        Ok(())
+    }
+
+    /// 批量 touch_access (L2: 一次 retrieve 对 N 条命中逐条单行写 → 改单次批量 UPDATE)。
+    /// 去重后 `WHERE id IN (...)` 一次写, 降 N 次 SQLite 写为 1 次。每条 access_count +1 (相对更新, 防丢失更新)。
+    pub fn touch_access_batch(&self, ids: &[String], now_ts: u64) -> PersistResult<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        // 去重 (同 id 多 turn 命中只 +1, "检索会话"计次而非"命中 turn"计次)。
+        let mut seen = std::collections::HashSet::new();
+        let unique: Vec<&str> = ids
+            .iter()
+            .filter(|id| seen.insert(id.as_str()))
+            .map(|id| id.as_str())
+            .collect();
+        if unique.is_empty() {
+            return Ok(());
+        }
+        let conn = self.conn()?;
+        // rusqlite 无绑定数组 → 用 IN (?, ?, ...) 拼占位。
+        let placeholders: Vec<String> = (0..unique.len()).map(|_| "?".to_string()).collect();
+        let sql = format!(
+            "UPDATE memory_item SET access_count=access_count+1, last_accessed_timestamp=?1 WHERE id IN ({})",
+            placeholders.join(", ")
+        );
+        let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::with_capacity(unique.len() + 1);
+        params_vec.push(Box::new(now_ts as i64));
+        for id in &unique {
+            params_vec.push(Box::new((*id).to_string()));
+        }
+        let params_refs: Vec<&dyn rusqlite::ToSql> =
+            params_vec.iter().map(|p| p.as_ref()).collect();
+        conn.execute(&sql, params_refs.as_slice())?;
         Ok(())
     }
 
@@ -153,7 +204,7 @@ impl Persist {
         report: &ConsolidationReport,
         started_at: u64,
     ) -> PersistResult<()> {
-        let conn = self.conn.lock().expect("persist conn lock poisoned");
+        let conn = self.conn()?;
         conn.execute(
             "INSERT INTO consolidation_log(started_at,elapsed_ms,dropped,promoted,merged,summarized,reextracted,reconciled) \
              VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
@@ -178,7 +229,7 @@ impl Persist {
     }
 
     pub fn append_wop(&self, op: &str, payload: &str, at: u64) -> PersistResult<i64> {
-        let conn = self.conn.lock().expect("persist conn lock poisoned");
+        let conn = self.conn()?;
         conn.execute(
             "INSERT INTO wop_log(op,payload,at) VALUES(?1,?2,?3)",
             params![op, payload, at as i64],
@@ -190,7 +241,7 @@ impl Persist {
 
     // 返回最大 seq，空表返回 0。follower 拉增量基线。
     pub fn last_wop_seq(&self) -> PersistResult<i64> {
-        let conn = self.conn.lock().expect("persist conn lock poisoned");
+        let conn = self.conn()?;
         let seq: i64 = conn.query_row("SELECT COALESCE(MAX(seq), 0) FROM wop_log", [], |r| {
             r.get(0)
         })?;
@@ -199,7 +250,7 @@ impl Persist {
 
     // 增量拉取 seq > since 的 wop 条目，按 seq 升序，最多 limit 条。leader→follower 复制读路径。
     pub fn list_wop_since(&self, since_seq: i64, limit: usize) -> PersistResult<Vec<WopEntry>> {
-        let conn = self.conn.lock().expect("persist conn lock poisoned");
+        let conn = self.conn()?;
         let mut stmt = conn.prepare(
             "SELECT seq,op,payload,at FROM wop_log WHERE seq > ?1 ORDER BY seq ASC LIMIT ?2",
         )?;
@@ -225,7 +276,7 @@ impl Persist {
         reason: &str,
         at: u64,
     ) -> PersistResult<()> {
-        let conn = self.conn.lock().expect("persist conn lock poisoned");
+        let conn = self.conn()?;
         conn.execute(
             "INSERT INTO merge_log(at,source_id,target_id,reason) VALUES(?1,?2,?3,?4)",
             params![at as i64, source_id, target_id, reason],
@@ -243,7 +294,7 @@ impl Persist {
         rule_priority: i64,
         first_seen: u64,
     ) -> PersistResult<()> {
-        let conn = self.conn.lock().expect("persist conn lock poisoned");
+        let conn = self.conn()?;
         conn.execute(
             "INSERT OR IGNORE INTO relation(src,dst,rel_type,weight,rule_priority,first_seen) \
              VALUES(?1,?2,?3,?4,?5,?6)",
@@ -254,7 +305,7 @@ impl Persist {
 
     /// 取某实体的直接邻居 (1-hop)。供对齐/图遍历用。
     pub fn list_relations_from(&self, src: &str) -> PersistResult<Vec<(String, String, f64)>> {
-        let conn = self.conn.lock().expect("persist conn lock poisoned");
+        let conn = self.conn()?;
         let mut stmt = conn.prepare("SELECT dst, rel_type, weight FROM relation WHERE src=?1")?;
         let rows = stmt.query_map(params![src], |row| {
             Ok((
@@ -272,23 +323,27 @@ impl Persist {
 
     /// N-hop 可达节点 (WITH RECURSIVE CTE)。PRD §7.2 graph_affinity, B4 N 跳上限。
     /// 返回 (node_id, hop) — 从 start 出发 hop_limit 跳内可达的所有 entity id。
+    /// P4: 稠密图递归 CTE 扇出无度上限, hop_limit=2 仍可达数千节点。加 LIMIT 早终止
+    /// (graph_affinity 只取最近 hop 的 0.5^h, 远端节点贡献指数衰减, 截断无损评分精度)。
     pub fn n_hop_reachable(
         &self,
         start: &str,
         hop_limit: usize,
     ) -> PersistResult<Vec<(String, usize)>> {
-        let conn = self.conn.lock().expect("persist conn lock poisoned");
+        let conn = self.conn()?;
         let sql = r"WITH RECURSIVE hop(lvl, node) AS (
   SELECT 0, ?1
   UNION ALL
   SELECT h.lvl+1, r.dst FROM hop h JOIN relation r ON r.src=h.node
   WHERE h.lvl < ?2
 )
-SELECT DISTINCT node, MIN(lvl) AS first_hop FROM hop WHERE node != ?1 GROUP BY node";
+SELECT DISTINCT node, MIN(lvl) AS first_hop FROM hop WHERE node != ?1 GROUP BY node
+ORDER BY first_hop ASC LIMIT ?3";
         let mut stmt = conn.prepare(sql)?;
-        let rows = stmt.query_map(params![start, hop_limit as i64], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as usize))
-        })?;
+        let rows = stmt.query_map(
+            params![start, hop_limit as i64, N_HOP_RESULT_LIMIT],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as usize)),
+        )?;
         let mut out = Vec::new();
         for r in rows {
             out.push(r?);
@@ -301,7 +356,7 @@ SELECT DISTINCT node, MIN(lvl) AS first_hop FROM hop WHERE node != ?1 GROUP BY n
         &self,
         entity_type: &str,
     ) -> PersistResult<Vec<(String, String, String)>> {
-        let conn = self.conn.lock().expect("persist conn lock poisoned");
+        let conn = self.conn()?;
         let mut stmt = conn.prepare("SELECT id, name, aliases FROM entity WHERE entity_type=?1")?;
         let rows = stmt.query_map(params![entity_type], |row| {
             Ok((
@@ -319,7 +374,7 @@ SELECT DISTINCT node, MIN(lvl) AS first_hop FROM hop WHERE node != ?1 GROUP BY n
 
     /// 更新实体别名 (LLM 候选写入, A5: 仅候选不作判定)。
     pub fn append_entity_alias(&self, entity_id: &str, alias: &str) -> PersistResult<()> {
-        let conn = self.conn.lock().expect("persist conn lock poisoned");
+        let conn = self.conn()?;
         let row: Option<String> = conn
             .query_row(
                 "SELECT aliases FROM entity WHERE id=?1",
@@ -345,7 +400,7 @@ SELECT DISTINCT node, MIN(lvl) AS first_hop FROM hop WHERE node != ?1 GROUP BY n
 
     /// 上次 consolidate 的 started_at (增量扫描边界)。无记录返 0。
     pub fn last_consolidate_at(&self) -> PersistResult<u64> {
-        let conn = self.conn.lock().expect("persist conn lock poisoned");
+        let conn = self.conn()?;
         let at: Option<i64> = conn
             .query_row("SELECT MAX(started_at) FROM consolidation_log", [], |row| {
                 row.get(0)
@@ -356,7 +411,7 @@ SELECT DISTINCT node, MIN(lvl) AS first_hop FROM hop WHERE node != ?1 GROUP BY n
 
     /// 增量变更集: last_accessed 或 created > since 的非 tombstone 记忆。B4。
     pub fn list_changed_since(&self, since: u64) -> PersistResult<Vec<MemoryItem>> {
-        let conn = self.conn.lock().expect("persist conn lock poisoned");
+        let conn = self.conn()?;
         let mut stmt = conn.prepare(
             "SELECT * FROM memory_item WHERE tombstone=0 \
              AND (last_accessed_timestamp > ?1 OR created_timestamp > ?1) \
@@ -372,7 +427,7 @@ SELECT DISTINCT node, MIN(lvl) AS first_hop FROM hop WHERE node != ?1 GROUP BY n
 
     /// 全部已 tombstone 记忆 (reconcile 物理删候选)。
     pub fn list_tombstoned(&self) -> PersistResult<Vec<MemoryItem>> {
-        let conn = self.conn.lock().expect("persist conn lock poisoned");
+        let conn = self.conn()?;
         let mut stmt = conn.prepare("SELECT * FROM memory_item WHERE tombstone=1")?;
         let rows = stmt.query_map([], row_to_memory)?;
         let mut out = Vec::new();
@@ -382,16 +437,21 @@ SELECT DISTINCT node, MIN(lvl) AS first_hop FROM hop WHERE node != ?1 GROUP BY n
         Ok(out)
     }
 
-    /// 物理删 (含级联 memory_entity)。reconcile 三库一致后调用。§8.4。
+    /// 物理删 memory_item + 显式级联 memory_entity (reconcile 三库一致后调用, §8.4)。
+    /// 旧版仅删 memory_item 依赖 FK ON DELETE CASCADE, 但 PRAGMA foreign_keys 仅在
+    /// init_conn 单连接开启, 跨连接/未来变体不保证 → 显式 DELETE memory_entity 双保险。
     pub fn physical_delete(&self, id: &str) -> PersistResult<()> {
-        let conn = self.conn.lock().expect("persist conn lock poisoned");
-        conn.execute("DELETE FROM memory_item WHERE id=?1", params![id])?;
+        let mut conn = self.conn_mut()?;
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM memory_entity WHERE memory_id=?1", params![id])?;
+        tx.execute("DELETE FROM memory_item WHERE id=?1", params![id])?;
+        tx.commit()?;
         Ok(())
     }
 
     /// 全部 merge_log (fm-cli unmerge 列表用)。
     pub fn list_merge_log(&self) -> PersistResult<Vec<MergeLogEntry>> {
-        let conn = self.conn.lock().expect("persist conn lock poisoned");
+        let conn = self.conn()?;
         let mut stmt = conn
             .prepare("SELECT id,at,source_id,target_id,reason FROM merge_log ORDER BY id DESC")?;
         let rows = stmt.query_map([], |row| {
@@ -412,7 +472,7 @@ SELECT DISTINCT node, MIN(lvl) AS first_hop FROM hop WHERE node != ?1 GROUP BY n
 
     /// 回滚单次合并: 删 merge_log 行, 返回 (source_id,target_id) 供引擎恢复 source。
     pub fn unmerge(&self, merge_id: u64) -> PersistResult<Option<(String, String)>> {
-        let conn = self.conn.lock().expect("persist conn lock poisoned");
+        let conn = self.conn()?;
         let row: Option<(String, String)> = conn
             .query_row(
                 "SELECT source_id,target_id FROM merge_log WHERE id=?1",
@@ -438,7 +498,7 @@ SELECT DISTINCT node, MIN(lvl) AS first_hop FROM hop WHERE node != ?1 GROUP BY n
         stage: &str,
         error: &str,
     ) -> PersistResult<()> {
-        let conn = self.conn.lock().expect("persist conn lock poisoned");
+        let conn = self.conn()?;
         conn.execute(
             "INSERT INTO reconcile_report(at,memory_id,stage,error) VALUES(?1,?2,?3,?4)",
             params![at as i64, memory_id, stage, error],
@@ -529,6 +589,83 @@ mod tests {
         assert_eq!(got.tier, MemoryTier::Short);
         assert_eq!(got.content, "content-0");
         assert!(!got.tombstone);
+    }
+
+    #[test]
+    fn put_memory_with_entities_writes_memory_entity_rows() {
+        // H1 事务: put_memory 带 entity → memory_item + entity + memory_entity 三行同事务落地。
+        let p = Persist::open_in_memory().unwrap();
+        let mut m = sample_item("m-ent", "ix1", 0);
+        m.entities.push(EntityNode::new(
+            "ent-a".into(),
+            "Entity A".into(),
+            EntityType::Tech,
+        ));
+        p.put_memory(&m).unwrap();
+        let got = p.get_memory("m-ent").unwrap().unwrap();
+        assert_eq!(got.entities.len(), 1);
+        assert_eq!(got.entities[0].id, "ent-a");
+        // memory_entity 行存在 (FK 关联)
+        let n: i64 = p
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM memory_entity WHERE memory_id=?1",
+                params!["m-ent"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1, "memory_entity 行应写入");
+    }
+
+    #[test]
+    fn physical_delete_removes_memory_entity_rows() {
+        // L3/M1: physical_delete 显式级联 memory_entity (不靠 FK pragma)。
+        let p = Persist::open_in_memory().unwrap();
+        let mut m = sample_item("m-del", "ix1", 0);
+        m.entities.push(EntityNode::new(
+            "ent-b".into(),
+            "Entity B".into(),
+            EntityType::Tech,
+        ));
+        p.put_memory(&m).unwrap();
+        p.physical_delete("m-del").unwrap();
+        assert!(p.get_memory("m-del").unwrap().is_none(), "memory_item 应删");
+        let n: i64 = p
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM memory_entity WHERE memory_id=?1",
+                params!["m-del"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 0, "memory_entity 行应随 physical_delete 级联删");
+    }
+
+    #[test]
+    fn touch_access_batch_dedup_and_increment() {
+        // L2: 批量 touch 去重 + 每条 access_count +1。
+        let p = Persist::open_in_memory().unwrap();
+        p.put_memory(&sample_item("a", "ix", 0)).unwrap();
+        p.put_memory(&sample_item("b", "ix", 1)).unwrap();
+        // 含重复 id "a" 两次 → 去重后 "a" 只 +1。
+        let ids = vec!["a".to_string(), "b".to_string(), "a".to_string()];
+        p.touch_access_batch(&ids, 5000).unwrap();
+        let ga = p.get_memory("a").unwrap().unwrap();
+        let gb = p.get_memory("b").unwrap().unwrap();
+        assert_eq!(ga.access_count, 1, "重复 id 去重后应只 +1");
+        assert_eq!(gb.access_count, 1);
+        assert_eq!(ga.last_accessed_timestamp, 5000);
+        // 再 batch 一次 → 累计 2。
+        p.touch_access_batch(&["a".to_string(), "b".to_string()], 6000)
+            .unwrap();
+        assert_eq!(p.get_memory("a").unwrap().unwrap().access_count, 2);
+        assert_eq!(p.get_memory("b").unwrap().unwrap().access_count, 2);
+        // 空切片不报错。
+        assert!(p.touch_access_batch(&[], 7000).is_ok());
     }
 
     #[test]

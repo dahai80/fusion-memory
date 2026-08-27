@@ -4,7 +4,7 @@ use std::io;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-use crate::error::ClusterResult;
+use crate::error::{ClusterError, ClusterResult};
 
 /// 帧类型: hello 握手 / sync 请求 / sync 响应 / ping 心跳 / pong。
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -17,10 +17,13 @@ pub enum FrameKind {
     Pong,
 }
 
-/// 握手包: follower 告知本地 last_seq。
+/// 握手包: follower 告知本地 last_seq + 共享 secret token (H3 鉴权)。
+/// token 经 env FUSION_MEMORY_CLUSTER_TOKEN 下发, leader 校验不一致 → 拒连接。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Hello {
     pub follower_last_seq: i64,
+    #[serde(default)]
+    pub token: String,
 }
 
 /// follower → leader 拉增量: 自 since_seq 之后。
@@ -58,6 +61,8 @@ impl Frame {
 }
 
 const LEN_BYTES: usize = 4;
+/// 帧长度上限 (16MB)。防 H3: 4B 长度前缀无上限 → len=0xFFFFFFFF 触发 4GB 分配 OOM。
+const MAX_FRAME_LEN: usize = 16 * 1024 * 1024;
 
 /// 写一帧: 4B 长度 + JSON。
 pub async fn write_frame(stream: &mut TcpStream, frame: &Frame) -> ClusterResult<()> {
@@ -69,7 +74,7 @@ pub async fn write_frame(stream: &mut TcpStream, frame: &Frame) -> ClusterResult
     Ok(())
 }
 
-/// 读一帧: 先 4B 长度，再读 payload。EOF → None。
+/// 读一帧: 先 4B 长度，再读 payload。EOF → None。len 超 MAX_FRAME_LEN → 错误 (防 OOM)。
 pub async fn read_frame(stream: &mut TcpStream) -> ClusterResult<Option<Frame>> {
     let mut len_buf = [0u8; LEN_BYTES];
     match stream.read_exact(&mut len_buf).await {
@@ -80,6 +85,11 @@ pub async fn read_frame(stream: &mut TcpStream) -> ClusterResult<Option<Frame>> 
     let len = u32::from_be_bytes(len_buf) as usize;
     if len == 0 {
         return Ok(None);
+    }
+    if len > MAX_FRAME_LEN {
+        return Err(ClusterError::Transport(format!(
+            "frame len {len} exceeds max {MAX_FRAME_LEN} (possible DoS)"
+        )));
     }
     let mut buf = vec![0u8; len];
     stream.read_exact(&mut buf).await?;

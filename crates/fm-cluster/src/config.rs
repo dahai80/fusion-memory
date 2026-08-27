@@ -4,11 +4,15 @@ pub const DEFAULT_SYNC_PORT: u16 = 11436;
 pub const DEFAULT_HEARTBEAT_SECS: u64 = 5;
 pub const DEFAULT_HEARTBEAT_FAILS: u32 = 3;
 pub const DEFAULT_FETCH_LIMIT: usize = 256;
+pub const ENV_CLUSTER_TOKEN: &str = "FUSION_MEMORY_CLUSTER_TOKEN";
 
-/// 集群全局配置 (角色 + 端口)。
+/// 集群全局配置 (角色 + 端口 + 鉴权 token)。
 #[derive(Debug, Clone)]
 pub struct ClusterConfig {
     pub sync_port: u16,
+    /// H3 鉴权: leader/follower 共享 secret。未配置 → 任意 follower 可连 (仅本机 loopback 部署可接受)。
+    /// 生产部署必须配 FUSION_MEMORY_CLUSTER_TOKEN, leader/follower 一致, 否则 leader 拒非授权连接。
+    pub cluster_token: Option<String>,
 }
 
 impl Default for ClusterConfig {
@@ -18,6 +22,7 @@ impl Default for ClusterConfig {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(DEFAULT_SYNC_PORT),
+            cluster_token: env::var(ENV_CLUSTER_TOKEN).ok().filter(|t| !t.is_empty()),
         }
     }
 }
@@ -29,6 +34,8 @@ pub struct SyncConfig {
     pub heartbeat_secs: u64,
     pub heartbeat_fails: u32,
     pub fetch_limit: usize,
+    /// H3 鉴权 token, follower 握手带上, leader 校验。
+    pub cluster_token: Option<String>,
 }
 
 impl SyncConfig {
@@ -48,6 +55,7 @@ impl SyncConfig {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(DEFAULT_FETCH_LIMIT),
+            cluster_token: env::var(ENV_CLUSTER_TOKEN).ok().filter(|t| !t.is_empty()),
         })
     }
 }

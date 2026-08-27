@@ -129,8 +129,10 @@ pub fn entity_from_scope(scope: &str, metadata_json: &str) -> Option<EntityNode>
         metadata_graph_id(metadata_json)
     }?;
     let slug = slugify(&name);
+    // L5: id = ent-{slug}-{fnv1a(name)}: slug 仅显示, hash 保唯一 (与 entity_extract.rs 同方案)。
+    // 避免 slug("C")=="c"==slug("C++")==slug("C#") 三实体共享 ent-c 碰撞, 污染图谱对齐。
     Some(EntityNode {
-        id: format!("ent-{slug}"),
+        id: format!("ent-{slug}-{:016x}", fnv1a_64(name.as_bytes())),
         name,
         aliases: Vec::new(),
         entity_type: EntityType::Project,
@@ -160,6 +162,16 @@ fn slugify(s: &str) -> String {
         .collect::<String>()
         .trim_matches('-')
         .to_string()
+}
+
+/// FNV-1a 64bit。确定性 hash, 保实体 id 稳定 (同名同 id, 异名异 id)。与 entity_extract.rs 同实现。
+fn fnv1a_64(data: &[u8]) -> u64 {
+    let mut h = 0xcbf29ce484222325u64;
+    for &b in data {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
 }
 
 /// 读源库全部行 (排除 FTS 虚表)。
@@ -408,6 +420,20 @@ mod tests {
     fn entity_from_scope_metadata_graph_id() {
         let e = entity_from_scope("default", r#"{"graph_id":"90bd7634da9445a3"}"#).unwrap();
         assert_eq!(e.name, "90bd7634da9445a3");
+    }
+
+    #[test]
+    fn entity_id_no_slug_collision_l5() {
+        // L5: C / C++ / C# slug 均为 "c" 但 id 必须不同 (fnv1a hash 区分)。
+        let c = entity_from_scope("graph:C", "{}").unwrap();
+        let cpp = entity_from_scope("graph:C++", "{}").unwrap();
+        let csharp = entity_from_scope("graph:C#", "{}").unwrap();
+        assert_ne!(c.id, cpp.id, "C 与 C++ id 必须不同");
+        assert_ne!(c.id, csharp.id, "C 与 C# id 必须不同");
+        assert_ne!(cpp.id, csharp.id, "C++ 与 C# id 必须不同");
+        // 同名确定性: 同名同 id。
+        let c2 = entity_from_scope("graph:C", "{}").unwrap();
+        assert_eq!(c.id, c2.id, "同名实体 id 应确定一致");
     }
 
     #[test]
