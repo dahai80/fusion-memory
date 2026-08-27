@@ -64,25 +64,58 @@ pub async fn replay_one(sink: &dyn ReplaySink, entry: &WopEntry) -> ClusterResul
     }
 }
 
-/// 批量重放一组 wop, 返回 (已落地条数, 跳过条数)。seq 严格升序处理。
-pub async fn replay_wops(
-    sink: &dyn ReplaySink,
-    entries: &[WopEntry],
-) -> ClusterResult<(usize, usize)> {
+/// 重放结果。H2 修正: 携带 last_applied_seq 让 follower 游标推进到本批已落地最大 seq,
+/// 失败条目不计入 → 下轮 since_seq 重拉失败条目, 已落地条目不重复重放 (幂等前提: stub idempotent)。
+/// failed=true 表示本批有条目落地失败 (已 warn + 停批), 非 leader 宕机, 调方不触发 failover。
+#[derive(Debug, Clone, Default)]
+pub struct ReplayOutcome {
+    pub applied: usize,
+    pub skipped: usize,
+    /// 本批已落地/已跳过条目的最大 seq。失败条目不含 → 游标卡在失败条目前, 下轮重拉。
+    pub last_applied_seq: i64,
+    pub failed: bool,
+}
+
+/// 批量重放一组 wop, seq 严格升序处理。返回 ReplayOutcome (不抛 Err):
+/// - 单条落地失败 (mlx 429/payload 损坏/本地 sink 错) → warn + 停批 + failed=true, 已落地条目仍计入。
+///   调方 (sync_once) 据此推进游标到 last_applied_seq, 失败条目下轮重拉, 不触发 failover (非 leader 宕机)。
+/// - skipped op (summarize/未知) 推进游标 (不重拉), 本地 consolidate 各节点独立。
+pub async fn replay_wops(sink: &dyn ReplaySink, entries: &[WopEntry]) -> ReplayOutcome {
     let mut applied = 0usize;
     let mut skipped = 0usize;
+    let mut last_applied_seq = 0i64;
+    let mut failed = false;
     for entry in entries {
         match replay_one(sink, entry).await {
-            Ok(true) => applied += 1,
-            Ok(false) => skipped += 1,
+            Ok(true) => {
+                applied += 1;
+                last_applied_seq = last_applied_seq.max(entry.seq);
+            }
+            Ok(false) => {
+                skipped += 1;
+                last_applied_seq = last_applied_seq.max(entry.seq);
+            }
             Err(e) => {
-                warn!(seq = entry.seq, error = %e, "wop replay failed, stopping batch");
-                return Err(e);
+                warn!(
+                    seq = entry.seq,
+                    error = %e,
+                    "wop replay failed, stop batch; cursor stays before this seq, retry next round"
+                );
+                failed = true;
+                break;
             }
         }
     }
-    info!(applied, skipped, "wop batch replayed");
-    Ok((applied, skipped))
+    info!(
+        applied,
+        skipped, failed, last_applied_seq, "wop batch replayed"
+    );
+    ReplayOutcome {
+        applied,
+        skipped,
+        last_applied_seq,
+        failed,
+    }
 }
 
 #[cfg(test)]
@@ -160,9 +193,11 @@ mod tests {
                 at: 200,
             },
         ];
-        let (applied, skipped) = replay_wops(&sink, &entries).await.unwrap();
-        assert_eq!(applied, 2);
-        assert_eq!(skipped, 0);
+        let out = replay_wops(&sink, &entries).await;
+        assert_eq!(out.applied, 2);
+        assert_eq!(out.skipped, 0);
+        assert!(!out.failed);
+        assert_eq!(out.last_applied_seq, 2);
         assert_eq!(sink.puts.lock().unwrap().len(), 1);
         assert_eq!(sink.vectors.lock().unwrap()[0].0, 42);
         let tombs: Vec<String> = sink.tombstones.lock().unwrap().clone();
@@ -178,9 +213,12 @@ mod tests {
             payload: "id".into(),
             at: 100,
         }];
-        let (applied, skipped) = replay_wops(&sink, &entries).await.unwrap();
-        assert_eq!(applied, 0);
-        assert_eq!(skipped, 1);
+        let out = replay_wops(&sink, &entries).await;
+        assert_eq!(out.applied, 0);
+        assert_eq!(out.skipped, 1);
+        assert!(!out.failed);
+        // skipped op 推进游标 (不重拉)
+        assert_eq!(out.last_applied_seq, 1);
         assert!(sink.puts.lock().unwrap().is_empty());
     }
 
@@ -193,15 +231,72 @@ mod tests {
             payload: "not json".into(),
             at: 100,
         }];
-        let err = replay_wops(&sink, &entries).await;
-        assert!(err.is_err());
+        let out = replay_wops(&sink, &entries).await;
+        // H2: 单条落地失败 → failed=true, applied=0, last_applied_seq 卡在失败条目前 (0)
+        assert!(out.failed);
+        assert_eq!(out.applied, 0);
+        assert_eq!(out.last_applied_seq, 0, "cursor stays before failed seq");
     }
 
     #[tokio::test]
     async fn replay_empty_batch() {
         let sink = FakeSink::new();
-        let (applied, skipped) = replay_wops(&sink, &[]).await.unwrap();
-        assert_eq!(applied, 0);
-        assert_eq!(skipped, 0);
+        let out = replay_wops(&sink, &[]).await;
+        assert_eq!(out.applied, 0);
+        assert_eq!(out.skipped, 0);
+        assert!(!out.failed);
+        assert_eq!(out.last_applied_seq, 0);
+    }
+
+    #[tokio::test]
+    async fn replay_partial_batch_cursor_advances_past_applied() {
+        // H2: seq=1 ok, seq=2 fail, seq=3 未处理。
+        // applied=1, failed=true, last_applied_seq=1 (推进过已落地, 未越过失败条目)。
+        struct FailOnSecond;
+        #[async_trait]
+        impl ReplaySink for FailOnSecond {
+            async fn embed(&self, _c: &str) -> ClusterResult<Vec<f32>> {
+                Ok(vec![0.5; 4])
+            }
+            async fn put_item(&self, _i: &MemoryItem) -> ClusterResult<()> {
+                Ok(())
+            }
+            async fn insert_vector(&self, _id: u64, _v: &[f32]) -> ClusterResult<()> {
+                Err(ClusterError::Replay("simulated sink fail".into()))
+            }
+            async fn tombstone(&self, _id: &str) -> ClusterResult<()> {
+                Ok(())
+            }
+        }
+        let sink = FailOnSecond;
+        let item = sample_item();
+        let payload = serde_json::to_string(&item).unwrap();
+        let entries = vec![
+            WopEntry {
+                seq: 1,
+                op: "delete".into(),
+                payload: "a".into(),
+                at: 100,
+            },
+            WopEntry {
+                seq: 2,
+                op: "commit".into(),
+                payload,
+                at: 200,
+            },
+            WopEntry {
+                seq: 3,
+                op: "delete".into(),
+                payload: "b".into(),
+                at: 300,
+            },
+        ];
+        let out = replay_wops(&sink, &entries).await;
+        assert!(out.failed);
+        assert_eq!(out.applied, 1, "seq=1 delete ok");
+        assert_eq!(
+            out.last_applied_seq, 1,
+            "cursor at seq=1, not past failed seq=2"
+        );
     }
 }

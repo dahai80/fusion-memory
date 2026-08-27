@@ -20,9 +20,10 @@ pub fn spawn_cluster(
     info!(role = %role, "cluster role detected");
     match role {
         NodeRole::Leader => {
-            let port = ClusterConfig::default().sync_port;
+            let cfg = ClusterConfig::default();
+            let port = cfg.sync_port;
             let source: Arc<dyn WopSource> = engine.persist().clone();
-            let leader = Arc::new(Leader::new(source, port));
+            let leader = Arc::new(Leader::new(source, port).with_token(cfg.cluster_token));
             set.spawn(async move {
                 leader
                     .serve()

@@ -102,12 +102,71 @@ impl StoreStub {
         Ok(exists)
     }
 
+    // P4: 一次性加载全部 tombstone id 入 HashSet, 供 search_knn 批量过滤。
+    // 旧版对每个邻居/每个 fallback 向量逐个 is_tombstoned 单点查 sled → N 次 I/O/搜索。
+    /// 单次 tree.iter 扫描替代 N 次点查; tomb 集合通常远小于全量, 内存可控。
+    fn tombstone_set(&self) -> StoreResult<std::collections::HashSet<u64>> {
+        let tomb = self.tomb_tree()?;
+        let mut out = std::collections::HashSet::new();
+        for item in tomb.iter() {
+            let (k, _v) = item.map_err(|e| StoreError::Sled(e.to_string()))?;
+            if k.len() != 8 {
+                continue;
+            }
+            let arr: [u8; 8] = k.as_ref().try_into().expect("len==8 checked");
+            out.insert(u64::from_be_bytes(arr));
+        }
+        Ok(out)
+    }
+
+    /// 枚举所有非 tombstone 向量 id (L3 反向对账: store→SQLite 孤儿扫描)。
+    /// 跳过 tomb tree 标记的软删向量。用于 reconcile 检测 store 有向量但 SQLite 无元数据的孤儿。
+    pub fn list_vector_ids(&self) -> StoreResult<Vec<u64>> {
+        let tree = self.vec_tree()?;
+        let tomb = self.tomb_tree()?;
+        let mut out = Vec::new();
+        for item in tree.iter() {
+            let (key, _val) = item.map_err(|e| StoreError::Sled(e.to_string()))?;
+            if key.len() != 8 {
+                continue;
+            }
+            let arr: [u8; 8] = key.as_ref().try_into().expect("len==8 checked");
+            let id = u64::from_be_bytes(arr);
+            if tomb
+                .contains_key(&key)
+                .map_err(|e| StoreError::Sled(e.to_string()))?
+            {
+                continue;
+            }
+            out.push(id);
+        }
+        Ok(out)
+    }
+
+    /// 向量序列化: 紧凑 LE f32 原始字节 (P2 修正, 替 serde_json 文本编码)。
+    /// serde_json 编码 `[1.0,0.0,...]` 约 7-12B/float; 原始字节 4B/float, ~3x 省 + 解析零分配。
+    /// 无版本前缀: dim 在调用点校验, 长度 / 4 = 元素数, 自描述。
     fn serialize_vec(vec: &[f32]) -> StoreResult<Vec<u8>> {
-        serde_json::to_vec(vec).map_err(StoreError::Serde)
+        let mut bytes = Vec::with_capacity(vec.len() * 4);
+        for &f in vec {
+            bytes.extend_from_slice(&f.to_le_bytes());
+        }
+        Ok(bytes)
     }
 
     fn deserialize_vec(bytes: &[u8]) -> StoreResult<Vec<f32>> {
-        serde_json::from_slice(bytes).map_err(StoreError::Serde)
+        if !bytes.len().is_multiple_of(4) {
+            return Err(StoreError::Sled(format!(
+                "vec bytes len {} not multiple of 4 (corrupt or legacy json format)",
+                bytes.len()
+            )));
+        }
+        let mut out = Vec::with_capacity(bytes.len() / 4);
+        for chunk in bytes.chunks_exact(4) {
+            let arr: [u8; 4] = chunk.try_into().expect("chunks_exact(4) → [u8;4]");
+            out.push(f32::from_le_bytes(arr));
+        }
+        Ok(out)
     }
 
     /// 从 sled vec tree 重放重建 hnsw 索引（崩溃恢复 / 启动加载）。
@@ -195,13 +254,26 @@ impl FusionStoreEngine for StoreStub {
                 got: vec.len(),
             }));
         }
+        let tree = self.vec_tree().map_err(StoreError::to_memory)?;
+        // H2 幂等: 同 id 已落盘且未 tombstone → 视为已存在, 跳过 hnsw.insert。
+        // replay 重放同一条目 (leader 重发/follower 重启) 不重复入索引, 避免 hnsw 重复点。
+        // tombstone 状态 → 清 tomb 后照常重插入 (复活路径)。
+        let already_present = tree
+            .contains_key(id.to_be_bytes())
+            .map_err(|e| StoreError::to_memory(StoreError::Sled(e.to_string())))?;
+        if already_present && !self.is_tombstoned(id).map_err(StoreError::to_memory)? {
+            debug!(
+                id,
+                "insert_vector: id already present, skip hnsw insert (idempotent)"
+            );
+            return Ok(());
+        }
         if self.is_tombstoned(id).map_err(StoreError::to_memory)? {
             warn!(id, "insert_vector: id tombstoned, clearing tombstone");
             let tomb = self.tomb_tree().map_err(StoreError::to_memory)?;
             tomb.remove(id.to_be_bytes())
                 .map_err(|e| StoreError::to_memory(StoreError::Sled(e.to_string())))?;
         }
-        let tree = self.vec_tree().map_err(StoreError::to_memory)?;
         let bytes = Self::serialize_vec(vec).map_err(StoreError::to_memory)?;
         tree.insert(id.to_be_bytes(), bytes)
             .map_err(|e| StoreError::to_memory(StoreError::Sled(e.to_string())))?;
@@ -223,11 +295,13 @@ impl FusionStoreEngine for StoreStub {
             StoreError::to_memory(StoreError::Hnsw(format!("hnsw lock poisoned: {e}")))
         })?;
         let neighbours = hnsw.search(query, top_k, SEARCH_EF);
+        // P4: tombstone 批量加载一次, 替代每邻居/每 fallback 向量单点 sled 查。
+        let tombs = self.tombstone_set().map_err(StoreError::to_memory)?;
         let mut out = Vec::with_capacity(neighbours.len());
         let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
         for nb in neighbours {
             let id = nb.d_id as u64;
-            if self.is_tombstoned(id).map_err(StoreError::to_memory)? {
+            if tombs.contains(&id) {
                 continue;
             }
             // DistCosine.eval 返回 1 - cos_sim; similarity = 1 - distance
@@ -244,7 +318,7 @@ impl FusionStoreEngine for StoreStub {
                 let (k, v) =
                     item.map_err(|e| StoreError::to_memory(StoreError::Sled(e.to_string())))?;
                 let id = u64::from_be_bytes(k.as_ref().try_into().unwrap_or([0u8; 8]));
-                if seen.contains(&id) || self.is_tombstoned(id).map_err(StoreError::to_memory)? {
+                if seen.contains(&id) || tombs.contains(&id) {
                     continue;
                 }
                 let vec = Self::deserialize_vec(&v).map_err(StoreError::to_memory)?;
