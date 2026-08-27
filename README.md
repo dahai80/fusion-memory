@@ -18,7 +18,7 @@ Fusion 生态（"一核九端"）系统级长/短期记忆与认知图谱中枢�
 
 **M6 已完成**：集群同步 leader-follower（PRD §16 内网离线集群，非公网云）。新 crate `fm-cluster`：角色注入（standalone/leader/follower，env `FUSION_MEMORY_ROLE` > home/role 文件 > standalone）+ wop_log 复制（leader 单写点 + append_wop，follower 拉 SyncRequest → 本地重放 commit/delete，summarize 审计跳过）+ TCP 传输（4B 长度前缀 + JSON 线帧，Hello/SyncRequest/SyncResponse/Ping/Pong，内网端口 11436）+ 心跳（5s ping，连续 3 失败 = LeaderDown）+ 手动 failover（`fm cluster promote` 写 home/role=leader，需重启 fm-server 生效，自动选举延期）。fm-server `spawn_cluster(engine, role, set)` 角色注入消除 env 竞争。fm-cli `cluster status/promote`。验收：3 e2e 场景全绿（commit→catchup read-local 一致 / 增量同步 seq 推进 / leader 宕机→LeaderDown→promote→新 leader 续写）+ ReplaySink 覆盖测试 + fm-cluster 各文件离线 regions 91-100%。285 离线测试全绿，clippy/fmt clean。**离线总 regions 87.65%**（较 M4 90.63% 降，因新 fm-cluster crate + engine 集成扩 regions 分母，而 mlx-gated summarize/consolidate saga + engine_builder !stub 分支离线不可达；live 口径仍覆盖这些分支，PRD 验收以 live 为准，M6 未触 mlx 代码故 live regions 不变）。
 
-**M5 部分完成**（降级定位，非阻塞主线）：PRD §14 三部分 — (a) store-fusion 可选切换、(b) `audit_memory_access` → fusion-guard DLP gate、(c) perf 基线 p99<50ms + 并发。**(c) 已落地**：轻量手写 bench（`crates/fm-engine/benches/retrieve_bench.rs`，无 criterion 重依赖），store-stub 10k 条记忆 + StubEmbedder dim=64，单条 retrieve p99=14.3ms（<50ms ✅）、10 并发 p99=140ms（<200ms ✅）。基线 JSON 落 `benches/baseline-2026-08-27.json`。**(a)(b) 降级**：见 M5 PRD 偏离记录。**(c) 之外的 R8/§10.4 PII 正则脱敏已落地**（此前零脱敏的真空补齐）：`fm-engine/src/redact.rs` 五类 PII 正则（phone/email/idcard/bankcard/ipv4，regex crate 无 lookaround，顺序敏感替换避误吞），占位符 `[REDACTED:type]`，幂等。commit/import 写入路径在 embed+persist 前脱敏，故向量/图谱/检索全用脱敏后内容。env `FUSION_MEMORY_REDACT_PII=1` 开启（`MemoryEngine::with_redact()` + fm-server/fm-cli 导入路径同源 env）。13 脱敏测试绿。验收：perf bench 两 gate pass + 13 脱敏测试绿 + 285 离线测试全绿 + clippy/fmt clean。
+**M5 部分完成**（降级定位，非阻塞主线）：PRD §14 三部分 — (a) store-fusion 可选切换、(b) `audit_memory_access` → fusion-guard DLP gate、(c) perf 基线 p99<50ms + 并发。**(c) 已落地**：轻量手写 bench（`crates/fm-engine/benches/retrieve_bench.rs`，无 criterion 重依赖），store-stub 10k 条记忆 + StubEmbedder dim=64，单条 retrieve p99=14.3ms（<50ms ✅）、10 并发 p99=140ms（<200ms ✅）。基线 JSON 落 `benches/baseline-2026-08-27.json`。**(a)(b) 降级**：见 M5 PRD 偏离记录。**(c) 之外的 R8/§10.4 PII 正则脱敏已落地**（此前零脱敏的真空补齐）：`fm-engine/src/redact.rs` 五类 PII 正则（phone/email/idcard/bankcard/ipv4，regex crate 无 lookaround，顺序敏感替换避误吞），占位符 `[REDACTED:type]`，幂等。commit/import 写入路径在 embed+persist 前脱敏，故向量/图谱/检索全用脱敏后内容。env `FUSION_MEMORY_REDACT_PII=1` 开启（`MemoryEngine::with_redact()` + fm-server/fm-cli 导入路径同源 env）。13 脱敏测试绿。验收：perf bench 两 gate pass + 13 脱敏测试绿 + 301 离线测试全绿 + live 测试全绿（bge-m3 + Qwen3.8-27B-4bit，实体抽取 JSON 100%）+ 离线 regions 90.82% / live regions 92.47%（均 ≥90%）+ clippy/fmt clean。
 
 | 里程碑 | 内容 | 状态 |
 |--------|------|------|
@@ -70,7 +70,7 @@ PRD §14 M5 三部分，(a) store-fusion 可选切换、(b) fusion-guard DLP gat
 
 ```bash
 cargo check --workspace        # 编译检查
-cargo test --workspace         # 全离线测试 (285 用例, 排除 fm-py cdylib)
+cargo test --workspace         # 全离线测试 (301 用例, 排除 fm-py cdylib)
 cargo clippy --workspace --all-targets -- -D warnings   # lint
 cargo fmt --all --check        # 格式检查
 
@@ -78,20 +78,23 @@ cargo fmt --all --check        # 格式检查
 #   cargo bench -p fm-engine --bench retrieve_bench
 #   单条 retrieve p99<50ms + 10 并发 p99<200ms, 结果落 /tmp/fm-perf-baseline-*.json
 
-# 真实模型集成测试 (需起 fusion-mlx 加载 bge-m3 + Qwen3.5-9B-4bit, 串行避 429):
+# 真实模型集成测试 (需起 fusion-mlx 加载 bge-m3 + Qwen 聊天模型, 串行避 429):
 #   ~/claude-home/fusion-mlx/start.sh start
-#   scripts/live-test.sh            # 全 workspace live (186 用例)
+#   scripts/live-test.sh            # 全 workspace live (串行)
 #   scripts/live-test.sh fm-engine  # 单 crate
+#   聊天模型默认 Qwen3.5-9B-4bit; 若未缓存可用 env 覆盖:
+#   FUSION_MEMORY_CHAT_MODEL=Qwen3.8-27B-4bit scripts/live-test.sh   # 已验证可用
+#   (Qwen3-0.6B 实体抽取太弱返空实体, 不推荐做 extract)
 ```
 
 覆盖率（需 llvm-tools，系统 llvm 或 rustup 组件）：
 
 ```bash
 # 离线默认（CI 口径）：排除 fm-py（PyO3 cdylib 绑定层，验收走 PyO3 往返，不走单测覆盖率）。
-# regions 87.65%。285 用例全绿。
-# 注：离线总 regions 较 M4 (90.63%) 降，因 M6 新增 fm-cluster crate + engine 集成扩 regions 分母，
-# 而 engine.rs summarize/consolidate saga + engine_builder.rs !stub 分支离线不可达（走真 mlx LLM/embedding）。
-# PRD 验收口径 = live（覆盖这些分支），M6 未触 mlx 代码故 live regions 不变（92% 段）。
+# regions 90.82%。301 用例全绿。
+# 注：跑覆盖率前先 `cargo llvm-cov clean`，旧 profraw（含未触发的 bench 插桩二进制）会稀释 regions。
+# engine.rs summarize/consolidate saga + engine_builder.rs !stub 分支离线不可达（走真 mlx LLM/embedding），
+# PRD 验收口径 = live（覆盖这些分支）。
 LLVM_COV=/opt/homebrew/opt/llvm/bin/llvm-cov \
 LLVM_PROFDATA=/opt/homebrew/opt/llvm/bin/llvm-profdata \
 cargo llvm-cov --workspace --summary-only --exclude-from-report fm-py --ignore-filename-regex "src/main\.rs"
@@ -103,7 +106,7 @@ LLVM_PROFDATA=/opt/homebrew/opt/llvm/bin/llvm-profdata \
 cargo llvm-cov --workspace \
   --features fm-embed/mlx-live --features fm-engine/mlx-live --features fm-server/mlx-live \
   --summary-only --exclude-from-report fm-py -- --include-ignored --test-threads=1
-# live regions 覆盖 !stub 真 mlx 分支（summarize/consolidate saga + engine_builder）。PRD 验收以此为准。
+# live regions 92.47%（覆盖 !stub 真 mlx 分支 summarize/consolidate saga + engine_builder）。PRD 验收以此为准。
 ```
 
 > **覆盖率口径**：以 regions 为准（业界标准 + PRD 无 functions 硬指标）。
