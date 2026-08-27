@@ -90,11 +90,12 @@ async fn e2e_leader_commit_follower_catchup() {
             heartbeat_secs: 1,
             heartbeat_fails: 3,
             fetch_limit: 64,
+            cluster_token: None,
         },
         sink.clone(),
         0,
     );
-    let (seq, applied) = follower.sync_once().await.unwrap();
+    let (seq, applied, _failed) = follower.sync_once().await.unwrap();
     assert_eq!(seq, 1);
     assert_eq!(applied, 1);
     assert_eq!(sink.puts.lock().unwrap().clone(), vec!["m-1".to_string()]);
@@ -117,12 +118,13 @@ async fn e2e_incremental_sync_advances_seq() {
             heartbeat_secs: 1,
             heartbeat_fails: 3,
             fetch_limit: 64,
+            cluster_token: None,
         },
         sink.clone(),
         0,
     );
     // 第一轮: 取 a
-    let (seq1, app1) = follower.sync_once().await.unwrap();
+    let (seq1, app1, _f1) = follower.sync_once().await.unwrap();
     assert_eq!((seq1, app1), (1, 1));
 
     // leader 追加第二条 (delete) + 第三条 (commit b)
@@ -130,7 +132,7 @@ async fn e2e_incremental_sync_advances_seq() {
     append_commit(&source, "b", 2);
 
     // 第二轮: 增量取 seq 2,3 (delete a + commit b)
-    let (seq2, app2) = follower.sync_once().await.unwrap();
+    let (seq2, app2, _f2) = follower.sync_once().await.unwrap();
     assert_eq!(seq2, 3);
     assert_eq!(app2, 2);
     let tombs = sink.tombs.lock().unwrap().clone();
@@ -158,6 +160,7 @@ async fn e2e_leader_down_then_promote_new_leader() {
             heartbeat_secs: 0,
             heartbeat_fails: 2,
             fetch_limit: 64,
+            cluster_token: None,
         },
         sink.clone(),
         0,
@@ -193,11 +196,12 @@ async fn e2e_leader_down_then_promote_new_leader() {
             heartbeat_secs: 1,
             heartbeat_fails: 3,
             fetch_limit: 64,
+            cluster_token: None,
         },
         sink2.clone(),
         0,
     );
-    let (seq_new, app_new) = follower2.sync_once().await.unwrap();
+    let (seq_new, app_new, _fnew) = follower2.sync_once().await.unwrap();
     assert_eq!(seq_new, 1);
     assert_eq!(app_new, 1);
     assert_eq!(

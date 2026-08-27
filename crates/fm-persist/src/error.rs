@@ -14,6 +14,10 @@ pub enum PersistError {
 
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+
+    // P1: Mutex poison — 持锁线程 panic 后续不再 panic 放大, 上抛 Err 让调用方决策。
+    #[error("persist conn lock poisoned (prior panic in critical section)")]
+    Poisoned,
 }
 
 impl PersistError {
@@ -22,6 +26,9 @@ impl PersistError {
             PersistError::Serde(e) => fm_core::MemoryError::Serde(e),
             PersistError::Io(e) => fm_core::MemoryError::Io(e),
             PersistError::Sqlite(e) => fm_core::MemoryError::Sqlite(e.to_string()),
+            PersistError::Poisoned => {
+                fm_core::MemoryError::Sqlite("persist conn lock poisoned".into())
+            }
         }
     }
 }

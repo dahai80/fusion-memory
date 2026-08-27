@@ -4,14 +4,14 @@
 //! 占位符 [REDACTED:type], 不含原文。已脱敏内容不重复处理 (幂等)。
 //! 默认关, env FUSION_MEMORY_REDACT_PII=1 开启 (MemoryEngine::redact 字段控制)。
 
-use regex::RegexSet;
+use regex::Regex;
 use std::sync::OnceLock;
 
 // PII 模式 (中文语境优先, regex crate 无 lookaround, 靠顺序敏感避免误吞):
 // 0 手机号: 1[3-9] 开头 11 位
 // 1 邮箱
 // 2 身份证: 18 位 (末位 X), 前 17 数字
-// 3 银行卡: 13-19 位连续数字 (宽松, 覆盖主流卡号)
+// 3 银行卡: 13-19 位连续数字 (配 Luhn 校验, 避免误吞订单号/时间戳等长数字串)
 // 4 IPv4
 static PATTERNS: &[&str] = &[
     r"1[3-9]\d{9}",
@@ -24,41 +24,83 @@ static PATTERNS: &[&str] = &[
 // 占位符标签 (与 PATTERNS 下标对应)
 const TAGS: &[&str] = &["phone", "email", "idcard", "bankcard", "ip"];
 
-static REDACT_SET: OnceLock<RegexSet> = OnceLock::new();
+static REDACT_REGEXES: OnceLock<Vec<Regex>> = OnceLock::new();
 
-fn redact_set() -> &'static RegexSet {
-    REDACT_SET.get_or_init(|| {
-        RegexSet::new(PATTERNS).expect("PII regex set compile (const patterns, infallible)")
+fn redact_regexes() -> &'static [Regex] {
+    REDACT_REGEXES.get_or_init(|| {
+        PATTERNS
+            .iter()
+            .map(|p| Regex::new(p).expect("PII regex compile (const patterns, infallible)"))
+            .collect()
     })
+}
+
+/// Luhn 校验 (银行卡号校验算法)。合法返回 true。
+fn luhn_valid(digits: &str) -> bool {
+    let mut sum = 0u32;
+    let mut odd = true;
+    for ch in digits.chars().rev() {
+        let d = match ch.to_digit(10) {
+            Some(d) => d,
+            None => return false,
+        };
+        if odd {
+            sum += d;
+        } else {
+            let dd = d * 2;
+            sum += if dd > 9 { dd - 9 } else { dd };
+        }
+        odd = !odd;
+    }
+    sum.is_multiple_of(10)
 }
 
 /// 脱敏单段文本。逐 pattern 命中段替换为 [REDACTED:tag]。
 /// 顺序敏感: 身份证(18位)/银行卡(13-19位) 先于手机(11位), 长串先替换为无数字占位,
 /// 短模式不再匹配已占位段, 避免手机吞银行卡前 11 位。
+/// 银行卡模式额外做 Luhn 校验, 不合法的长数字串 (订单号/时间戳) 不脱敏, 避免污染内容。
 pub fn redact_text(input: &str) -> String {
-    let set = redact_set();
-    // 无任何命中 → 原样返回 (零拷贝路径, 常见 case)
-    if !set.is_match(input) {
+    let regexes = redact_regexes();
+    // 零拷贝快速路径: 任一未命中 → 原样返回 (常见 case)
+    if !regexes.iter().any(|re| re.is_match(input)) {
         return input.to_string();
     }
     let mut out = input.to_string();
     // 顺序: 身份证(2) > 银行卡(3) > 手机(0) > 邮箱(1) > IP(4)
     let order = [2usize, 3, 0, 1, 4];
-    let pats = set.patterns();
     for idx in order {
-        let pat = &pats[idx];
-        let re = regex::Regex::new(pat).expect("PII pattern recompile (same const set)");
-        out = re
-            .replace_all(&out, format!("[REDACTED:{}]", TAGS[idx]))
-            .into_owned();
+        let re = &regexes[idx];
+        if idx == 3 {
+            // 银行卡: Luhn 校验, 不合法保留原文 (避误吞订单号/时间戳)
+            out = re
+                .replace_all(&out, |c: &regex::Captures| {
+                    let digits: &str = c.get(0).map(|m| m.as_str()).unwrap_or("");
+                    if luhn_valid(digits) {
+                        format!("[REDACTED:{}]", TAGS[idx])
+                    } else {
+                        digits.to_string()
+                    }
+                })
+                .into_owned();
+        } else {
+            out = re
+                .replace_all(&out, format!("[REDACTED:{}]", TAGS[idx]))
+                .into_owned();
+        }
     }
     out
 }
 
-/// 是否开启脱敏。读 env 一次 (启动期), 运行期不重读避免竞争。
+/// 解析 env bool 值 (纯函数, 便于单测, 避免测试里 set_var 全局竞争)。
+fn parse_env_bool(v: &str) -> bool {
+    v == "1" || v.eq_ignore_ascii_case("true")
+}
+
+/// 是否开启脱敏。每次调用读 env (并发读安全; 引擎层 redact 字段已缓存 builder 期结果,
+/// 此 fn 仅在 engine_builder/import 路径调用, 非热路径)。
 pub fn redact_enabled_env() -> bool {
     std::env::var("FUSION_MEMORY_REDACT_PII")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .map(|v| parse_env_bool(&v))
         .unwrap_or(false)
 }
 
@@ -99,9 +141,10 @@ mod tests {
 
     #[test]
     fn bankcard_redacted() {
-        // 16 位卡号
-        let out = redact_text("卡号 6222021234567890123 已绑定");
+        // 4242 4242 4242 4242 (Visa 测试卡, Luhn 合法)
+        let out = redact_text("卡号 4242424242424242 已绑定");
         assert!(out.contains("[REDACTED:bankcard]"));
+        assert!(!out.contains("4242424242424242"));
     }
 
     #[test]
@@ -128,8 +171,8 @@ mod tests {
 
     #[test]
     fn phone_not_eaten_by_long_digit() {
-        // 11 位手机不应被银行卡(13-19) 吞, 也不应吞入更长数字串
-        let out = redact_text("手机 13912345678 和卡号 6222021234567890123");
+        // 11 位手机不被银行卡吞, Luhn 合法卡号独立脱敏
+        let out = redact_text("手机 13912345678 和卡号 4242424242424242");
         assert!(out.contains("[REDACTED:phone]"));
         assert!(out.contains("[REDACTED:bankcard]"));
     }
@@ -141,16 +184,24 @@ mod tests {
     }
 
     #[test]
-    fn env_flag_parse() {
-        // env 全局, 仅读不写 (不串扰其他 env 测试)
-        std::env::remove_var("FUSION_MEMORY_REDACT_PII");
-        assert!(!redact_enabled_env());
-        std::env::set_var("FUSION_MEMORY_REDACT_PII", "1");
-        assert!(redact_enabled_env());
-        std::env::set_var("FUSION_MEMORY_REDACT_PII", "true");
-        assert!(redact_enabled_env());
-        std::env::set_var("FUSION_MEMORY_REDACT_PII", "0");
-        assert!(!redact_enabled_env());
-        std::env::remove_var("FUSION_MEMORY_REDACT_PII");
+    fn long_non_luhn_not_redacted() {
+        // 18 位非 Luhn 数字串 (订单号/时间戳样) 不应被银行卡脱敏, 避免污染内容
+        let out = redact_text("order 999999999999999999 timestamp");
+        assert!(
+            !out.contains("[REDACTED:bankcard]"),
+            "非 Luhn 长数字不应脱敏"
+        );
+        assert!(out.contains("999999999999999999"));
+    }
+
+    #[test]
+    fn parse_env_bool_pure() {
+        // 纯函数测试, 不触碰全局 env (避 set_var 并发竞争)
+        assert!(parse_env_bool("1"));
+        assert!(parse_env_bool("true"));
+        assert!(parse_env_bool("TRUE"));
+        assert!(!parse_env_bool("0"));
+        assert!(!parse_env_bool(""));
+        assert!(!parse_env_bool("yes"));
     }
 }

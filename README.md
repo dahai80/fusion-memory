@@ -4,7 +4,7 @@ Fusion 生态（"一核九端"）系统级长/短期记忆与认知图谱中枢�
 
 - 权威 PRD：`architecture/fusion-memory-prd-0825.md`
 - 落地架构：`~/fusion/fusion-memory-prd-plan-0826.md`
-- 审计报告：`~/fusion/audit/fusion-memory-audit-0826.md`
+- 审计报告：`~/fusion/audit/fusion-memory-audit-0827.md`
 
 ## 状态
 
@@ -31,6 +31,44 @@ Fusion 生态（"一核九端"）系统级长/短期记忆与认知图谱中枢�
 | M6 | 集群同步 leader-follower | ✅ |
 
 > **里程碑全集 M0–M6（终态）**：落地架构 `~/fusion/fusion-memory-prd-plan-0826.md` §14 仅定义 M0–M6，M6 为最终里程碑，**无 M7+**。§15 未决项 6 项全部 ✅ 已裁定；§17 审计修正 E1（8 项）/E2（10 项）/E3（3 项）全部已落地或已决策，审计闭环无遗留。后续工作仅两类：(1) M5(b) 待上游 `fusion-guard#2` 补 PII 类后接正式 DLP gate；(2) PRD 外的运维/性能/消费方演进。
+
+### 审计 P0–P3 修复记录（2026-08-27，全闭环）
+
+`audit/fusion-memory-audit-0827.md` §8 的 16 项缺陷全部修复，按文件簇分 9 批落地，每批 `cargo test` checkpoint，315 离线测试全绿（基线 301 → +14 新增回归测试），clippy `-D warnings` + fmt clean。
+
+**P0 阻断商用（5 项）**
+- **H1 跨存储写无事务原子性**：`put_memory` 包进 `conn.transaction()`（memory_item + entity + memory_entity 三类 INSERT 同事务，失败 rollback 不留半截实体行）；`commit_episodic_memory` 在 `put_memory` 失败时反向 `delete_vector` 清已写 sled 向量。`fm-persist/src/store.rs`、`fm-engine/src/engine.rs`。
+- **H2 集群重放非幂等 + LeaderDown 误判**：`insert_vector` 幂等化（已落盘且未 tombstone → 跳过 `hnsw.insert`，replay 重发不重复入索引；tombstone 状态清 tomb 后照常重插=复活路径）；重放错误分类（瞬时网络/解析失败 retry，永久 sink 失败上抛）。`fm-store/src/stub.rs`、`fm-cluster/src/replay.rs`。
+- **H3 集群 TCP 无鉴权 + 帧 4GB OOM + 明文**：`read_frame` 加 `MAX_FRAME_LEN`（16MB）上限防 OOM；`handle_conn` 校验 cluster_token（Hello 握手期比对，空 token 内网放行）；明文风险文档化（内网离线边界，非公网，PRD §16 已界定）。`fm-cluster/src/protocol.rs`、`fm-cluster/src/transport.rs`。
+- **H4 consolidate TOCTOU + 丢失更新**：引擎级 `tokio::sync::Mutex<()>`（`consolidate_lock`）串行 `consolidate_memories` 与 retrieve 的 touch_access 写（snapshot→决策→写原子）；`touch_access_batch` 去重 + 单次批量 `UPDATE ... WHERE id IN (...)`，相对 `access_count=access_count+1` 防丢失更新。`fm-engine/src/engine.rs`、`fm-persist/src/store.rs`。
+- **H5 PII 脱敏非企业级 + 撒谎注释**：bankcard 加 Luhn 校验 + 上下文边界（避误吞订单号/时间戳）；扩 PII 类（phone/email/idcard/bankcard/ipv4，顺序敏感替换避手机吞银行卡前 11 位）；`redact.rs:58` env 注释改正（每次调用读 env，非启动期，且仅在 builder/import 非热路径）。`fm-engine/src/redact.rs`。
+
+**P1 必修（5 项）**
+- **L1 graph_affinity 恒 0**：`retrieve_context` 在 extractor 在场时对 query 文本抽实体 → 传 `query_entity_ids` 给 `score_candidate`，graph_affinity 接通（直命中 1.0 / N-hop 0.5^h）。`fm-engine/src/engine.rs`。
+- **L2 touch_access 多次累加**：见 H4 `touch_access_batch`（同 id 多 turn 命中只 +1，"检索会话"计次）。
+- **L3 reconcile 单向**：增 store→SQLite 反向孤儿扫描（`StoreStub::list_vector_ids()` 枚举非 tombstone 向量 id，不在 SQLite `vector_ref` 集合 → 孤儿，落 report + `delete_vector`）；`physical_delete` 显式级联 `memory_entity`（不靠 FK pragma 跨连接保证）。`fm-store/src/stub.rs`、`fm-persist/src/store.rs`、`fm-engine/src/engine.rs`。
+- **L4 delete 静默跳过**：坏 `vector_ref`（非数字/污染）不 `unwrap_or(true)` 静默物理删（会留幽灵向量），改 warn + `append_reconcile("bad-vector-ref")` + 跳过物理删（reconcile 兜底清）。`fm-engine/src/engine.rs`。
+- **L5 slug 碰撞**：entity id = `ent-{slug}-{fnv1a_64(name)}`（FNV-1a full-name hash 保唯一，slug 仅显示）。C/C++/C# 等 slug 同名异实体 id 全异。`fm-engine/src/entity_extract.rs`、`fm-cli/src/import_studio.rs`。
+
+**P2 性能（4 项）**
+- **P1 单 Mutex 全串行 + poison panic 放大**：保留单 `Mutex<Connection>`（SQLite WAL 单写者，连接池 r2d2 对 Rule 2 过度设计），24 处 `.expect("poisoned")` → `conn()`/`conn_mut()` helper 返 `PersistError::Poisoned` 上抛，不再 panic 放大单点故障到全局。`fm-persist/src/store.rs`、`fm-persist/src/error.rs`。
+- **P2 向量 serde_json 文本存 sled（~3.7x 浪费）**：改 LE f32 原始字节（4B/float，serde_json 文本 7-12B/float），反序列化零分配。`fm-store/src/stub.rs`。
+- **P3 consolidate_merge O(S×KNN×N) 灾变**：KNN 内层循环 `list_all()` 全表扫 + 字符串反查 → 循环外一次性建 `vector_id → &MemoryItem` 索引，内层 O(1) 查。`fm-engine/src/engine.rs`。
+- **P4 CTE 指数扇出 + 每搜索单点查 tombstone**：递归 CTE 加 `LIMIT 256` 早终止（graph_affinity 远端节点 0.5^h 指数衰减，截断无损精度）；`search_knn` tombstone 检查改 `tombstone_set()` 单次批量加载入 HashSet，替代每邻居/每 fallback 向量 N 次 sled 点查。`fm-persist/src/store.rs`、`fm-store/src/stub.rs`。
+
+**P3 维护（3 项）**
+- **M1 撒谎注释**：physical_delete 级联注释（已显式 DELETE memory_entity，注释与实现一致）+ redact.rs env 注释（见 H5）。`fm-persist/src/store.rs`、`fm-engine/src/redact.rs`。
+- **M2 extract_and_attach 吞 DB 错**：`get_memory().unwrap_or(None)` 把 SQLite 错误吞成"无此记忆"（DB 故障伪装成数据缺失）→ 显式 match，DB 错误 warn + return（pending 保持 true 待重抽），不伪装。`fm-engine/src/engine.rs`。
+- **M3 Runtime::new per Engine 线程爆炸**：fm-py 每 Python `Engine` 各建 tokio runtime（N×worker 线程）→ 进程级 `OnceLock<Runtime>` 共享单 runtime（2 worker），所有 PyEngine 复用。`fm-py/src/lib.rs`。
+
+### v0.1.1 补丁（2026-08-27，issue #1/#2/#4）
+
+修复 3 个开放 GitHub issue，新增 2 个 RPC + 1 个 UDS method：
+
+- **issue #2 — scope 级删除/计数**：新增 `delete_scope`（按 session_id 批量 tombstone，含 `confirm` 守卫，复用 delete 的向量清理+`append_wop` 审计）与 `count`（全量或按 session 计数）。后端 `fm-persist` 加 `delete_by_session`/`list_by_session`/`count_by_session`，引擎 `MemoryEngine::delete_scope`/`count`，trait 加默认 `Unsupported` impl（测试 stub 免改）。HTTP `POST /v1/memory/{delete_scope,count}` + UDS method `delete_scope`/`count`。
+- **issue #1/#4 — `memory.retrieve_context` 契约**：fusion-event 需要 `{trigger_id, query, top_k, node_id}` → `{context, memory_ids, cache_hit}`。新增 UDS method `memory.retrieve_context` 适配已有 `RetrieveQuery`，把 `FormattedContext.blocks` 融合成契约形态（context = turns 以 `\n---\n` 拼，memory_ids = interaction_id 去重，cache_hit=false）。
+
+验收：325 离线测试全绿（基线 301 → +24 新增，persist 3 + dispatch 5 + http 4 + trait/引擎 12），clippy `-D warnings` + fmt clean，`cargo check --workspace` clean。CI 受 GitHub 账户计费阻断（`recent account payments have failed`，非代码问题，本地 fmt/clippy/check/test gate 为代理口径）。
 
 ### M2 PRD 偏离记录（Rule 7）
 
@@ -211,7 +249,7 @@ cargo build --release -p fm-server   # 产出 target/release/fm-server
 #   FUSION_MEMORY_STUB=1 (StubEmbedder 离线, 不连 mlx)
 ```
 
-UDS JSON-RPC（sock 0600，B6）+ HTTP（axum 强制 Bearer，B5，端口 11435）并发。未配 `FUSION_MEMORY_API_KEY` 但 HTTP 端口开 → 拒启 HTTP（仅 UDS）。路由：`POST /v1/memory/{commit,retrieve,consolidate,audit,delete}`、`GET /v1/memory/{id}`、`GET /healthz`（公开）；`delete` 需 `params.confirm=true`。
+UDS JSON-RPC（sock 0600，B6）+ HTTP（axum 强制 Bearer，B5，端口 11435）并发。未配 `FUSION_MEMORY_API_KEY` 但 HTTP 端口开 → 拒启 HTTP（仅 UDS）。路由：`POST /v1/memory/{commit,retrieve,consolidate,audit,delete,delete_scope,count}`、`GET /v1/memory/{id}`、`GET /healthz`（公开）；`delete`/`delete_scope` 需 `params.confirm=true`。UDS method `memory.retrieve_context`（issue #1/#4 契约，`{trigger_id,query,top_k,node_id}` → `{context,memory_ids,cache_hit}`，复用 retrieve 引擎链）。
 
 ## 约定
 

@@ -2,9 +2,10 @@
 //!
 //! 路由（与 UDS 同语义）：
 //! POST /v1/memory/commit | retrieve | consolidate | audit | delete
+//! POST /v1/memory/delete_scope | count          (issue #2)
 //! GET  /v1/memory/{id}
 //! GET  /healthz (公开)
-//! 所有 /v1/* 强制 Bearer（B5）。delete 需 body.confirm=true。
+//! 所有 /v1/* 强制 Bearer（B5）。delete/delete_scope 需 body.confirm=true。
 
 use std::sync::Arc;
 
@@ -37,6 +38,8 @@ pub fn app(state: HttpState) -> axum::Router {
         .route("/v1/memory/consolidate", post(consolidate))
         .route("/v1/memory/audit", post(audit))
         .route("/v1/memory/delete", post(delete))
+        .route("/v1/memory/delete_scope", post(delete_scope))
+        .route("/v1/memory/count", post(count))
         .route("/v1/memory/:id", get(get_memory))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
@@ -82,6 +85,12 @@ async fn audit(st: State<HttpState>, h: HeaderMap, j: Json<Value>) -> Response {
     handle_rpc(st, h, j).await
 }
 async fn delete(st: State<HttpState>, h: HeaderMap, j: Json<Value>) -> Response {
+    handle_rpc(st, h, j).await
+}
+async fn delete_scope(st: State<HttpState>, h: HeaderMap, j: Json<Value>) -> Response {
+    handle_rpc(st, h, j).await
+}
+async fn count(st: State<HttpState>, h: HeaderMap, j: Json<Value>) -> Response {
     handle_rpc(st, h, j).await
 }
 
@@ -165,6 +174,12 @@ mod tests {
         }
         async fn delete_memory(&self, _id: &str) -> fm_core::MemoryResult<()> {
             Ok(())
+        }
+        async fn delete_scope(&self, _scope: &str) -> fm_core::MemoryResult<u64> {
+            Ok(2)
+        }
+        async fn count(&self, _scope: Option<&str>) -> fm_core::MemoryResult<u64> {
+            Ok(7)
         }
         async fn audit_memory_access(
             &self,
@@ -302,6 +317,46 @@ mod tests {
         let body = r#"{"jsonrpc":"2.0","method":"consolidate","params":{},"id":1}"#;
         let (code, _) = req(&app, "/v1/memory/consolidate", body, Some("Bearer sekret")).await;
         assert_eq!(code, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn delete_scope_route_with_confirm() {
+        let (st, _) = test_state("sekret");
+        let app = app(st);
+        let body = r#"{"jsonrpc":"2.0","method":"delete_scope","params":{"scope":"sess-A","confirm":true},"id":1}"#;
+        let (code, body) = req(&app, "/v1/memory/delete_scope", body, Some("Bearer sekret")).await;
+        assert_eq!(code, StatusCode::OK, "{body}");
+        assert!(body.contains("deleted_count"), "body={body}");
+    }
+
+    #[tokio::test]
+    async fn delete_scope_route_without_confirm_rejected() {
+        let (st, _) = test_state("sekret");
+        let app = app(st);
+        let body =
+            r#"{"jsonrpc":"2.0","method":"delete_scope","params":{"scope":"sess-A"},"id":1}"#;
+        let (code, body) = req(&app, "/v1/memory/delete_scope", body, Some("Bearer sekret")).await;
+        assert_eq!(code, StatusCode::OK);
+        assert!(body.contains("-32602"), "body={body}");
+    }
+
+    #[tokio::test]
+    async fn count_route() {
+        let (st, _) = test_state("sekret");
+        let app = app(st);
+        let body = r#"{"jsonrpc":"2.0","method":"count","params":{},"id":1}"#;
+        let (code, body) = req(&app, "/v1/memory/count", body, Some("Bearer sekret")).await;
+        assert_eq!(code, StatusCode::OK, "{body}");
+        assert!(body.contains("count"), "body={body}");
+    }
+
+    #[tokio::test]
+    async fn count_route_without_token_rejected() {
+        let (st, _) = test_state("sekret");
+        let app = app(st);
+        let body = r#"{"jsonrpc":"2.0","method":"count","params":{},"id":1}"#;
+        let (code, _) = req(&app, "/v1/memory/count", body, None).await;
+        assert_eq!(code, StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]

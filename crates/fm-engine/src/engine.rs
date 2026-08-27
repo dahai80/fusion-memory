@@ -33,6 +33,10 @@ pub struct MemoryEngine {
     extract_config: Option<ExtractConfig>,
     /// PII 脱敏开关 (R8/§10.4)。true 时 commit 路径 embed+persist 前脱敏。默认 false。
     redact: bool,
+    /// H4: consolidate 串行锁。consolidate_memories 持锁期间与 retrieve 的 touch_access
+    /// 写互斥, 使"读快照→决策→写"原子化, 防并发 touch 把 access_count/last_accessed 回退
+    /// (lost update) 或刚被访问的记忆被回收 (TOCTOU)。consolidate 罕见 (定时/手动), touch 短临界区。
+    consolidate_lock: tokio::sync::Mutex<()>,
 }
 
 impl MemoryEngine {
@@ -44,6 +48,7 @@ impl MemoryEngine {
             extractor: None,
             extract_config: None,
             redact: false,
+            consolidate_lock: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -124,23 +129,37 @@ impl MemoryEngine {
             return;
         };
         let ExtractResult { entities, success } = extractor.extract(content).await;
-        if let Some(mut item) = self.persist.get_memory(memory_id).unwrap_or(None) {
-            item.entities = entities.clone();
-            // 成功抽出 (即使空数组) → pending=false; 失败 → pending=true 待重抽
-            item.entities_pending = !success;
-            if let Err(e) = self.persist.put_memory(&item) {
-                warn!(id = memory_id, error = %e, "回写 entities 失败");
+        // M2: 旧版 get_memory().unwrap_or(None) 把 SQLite 错误吞成"无此记忆" (DB 故障伪装成数据缺失)。
+        // 改: 显式 match — DB 错误 warn + return (不伪装, pending 保持 true 待重抽); 无此记忆也 return。
+        let item_opt = match self.persist.get_memory(memory_id) {
+            Ok(o) => o,
+            Err(e) => {
+                warn!(id = memory_id, error = %e, "extract_and_attach: get_memory 失败, entities_pending 保持 true 待重抽");
                 return;
             }
-            // 抽出的实体写 entity 表 + memory_entity (put_memory 已处理 entity 表)
-            // 同名异 type 对齐: rule-priority (fm-graph)。M2 简版: 直接用抽取的 id。
-            debug!(
+        };
+        let Some(mut item) = item_opt else {
+            warn!(
                 id = memory_id,
-                n = entities.len(),
-                success,
-                "entities attached"
+                "extract_and_attach: memory 不存在 (可能已删), 跳过回写"
             );
+            return;
+        };
+        item.entities = entities.clone();
+        // 成功抽出 (即使空数组) → pending=false; 失败 → pending=true 待重抽
+        item.entities_pending = !success;
+        if let Err(e) = self.persist.put_memory(&item) {
+            warn!(id = memory_id, error = %e, "回写 entities 失败");
+            return;
         }
+        // 抽出的实体写 entity 表 + memory_entity (put_memory 已处理 entity 表)
+        // 同名异 type 对齐: rule-priority (fm-graph)。M2 简版: 直接用抽取的 id。
+        debug!(
+            id = memory_id,
+            n = entities.len(),
+            success,
+            "entities attached"
+        );
     }
 
     // ---- M3 consolidate saga 子步骤 ----
@@ -157,6 +176,13 @@ impl MemoryEngine {
             .iter()
             .filter(|m| m.memory_type == MemoryType::Semantic && !m.tombstone)
             .collect();
+        // P3: 旧版在 KNN 内层循环对每个候选 vector_id 都 list_all 全表扫 + 字符串反查 → O(S×KNN×N)。
+        // 改: 循环外一次性建 vector_id → MemoryItem 索引, 内层 O(1) 查。
+        let all = self.persist.list_all().map_err(|e| e.to_memory())?;
+        let by_vec_ref: std::collections::HashMap<u64, &MemoryItem> = all
+            .iter()
+            .filter_map(|m| m.vector_ref.parse::<u64>().ok().map(|vr| (vr, m)))
+            .collect();
         for src in semantic {
             if src.tombstone {
                 continue;
@@ -172,14 +198,13 @@ impl MemoryEngine {
                 if (*sim as f64) < MERGE_SIM_THRESHOLD || (*vid) == vr {
                     continue;
                 }
-                // 找对应 memory (向量 ref → memory)
-                let target = self
-                    .persist
-                    .list_all()
-                    .map_err(|e| e.to_memory())?
-                    .into_iter()
-                    .find(|m| m.vector_ref == vid.to_string() && !m.tombstone);
-                let Some(tgt) = target else { continue };
+                // P3: O(1) 索引查替代 list_all 全表扫 + 字符串反查。
+                let Some(tgt) = by_vec_ref.get(vid).copied() else {
+                    continue;
+                };
+                if tgt.tombstone || tgt.id == src.id {
+                    continue;
+                }
                 if tgt.id == src.id {
                     continue;
                 }
@@ -306,20 +331,51 @@ impl MemoryEngine {
         failures: &mut Vec<ConsolidationFailure>,
     ) -> fm_core::MemoryResult<usize> {
         let sqlite_all = self.persist.list_all().map_err(|e| e.to_memory())?;
-        // store-stub 无枚举 API → 用 SQLite 驱动 get_vector 逐条校验存在性。
+        // 正向: SQLite→store 悬空 (SQLite 有 vector_ref 但 store 无向量)。
         let mut reconciled = 0usize;
+        // SQLite 已知 vector_ref 集合, 供反向孤儿扫描对照。
+        let mut sqlite_vec_refs: std::collections::HashSet<u64> = std::collections::HashSet::new();
         for m in &sqlite_all {
-            let Ok(vr) = m.vector_ref.parse::<u64>() else {
-                continue;
-            };
-            if self.store.get_vector(vr).ok().flatten().is_none() {
-                // SQLite 有向量 ref 但 store 无 → 悬空, 落 report
+            match m.vector_ref.parse::<u64>() {
+                Ok(vr) => {
+                    sqlite_vec_refs.insert(vr);
+                    if self.store.get_vector(vr).ok().flatten().is_none() {
+                        let _ = self.persist.append_reconcile(
+                            at,
+                            &m.id,
+                            "dangling-vector",
+                            "sqlite has ref, store missing",
+                        );
+                    }
+                }
+                Err(_) => {
+                    // L4: 坏 vector_ref (非数字/污染) 不静默跳过, 落 report 留痕。
+                    warn!(id = %m.id, vector_ref = %m.vector_ref, "reconcile: bad vector_ref, skip store check");
+                    let _ = self.persist.append_reconcile(
+                        at,
+                        &m.id,
+                        "bad-vector-ref",
+                        "vector_ref not u64, cannot check store",
+                    );
+                }
+            }
+        }
+        // L3 反向: store→SQLite 孤儿 (store 有向量但 SQLite 无元数据, H1 中途失败产物)。
+        for vid in self.store.list_vector_ids().unwrap_or_default() {
+            if !sqlite_vec_refs.contains(&vid) {
+                warn!(
+                    vector_id = vid,
+                    "reconcile: orphan vector in store (no sqlite metadata), cleaning"
+                );
                 let _ = self.persist.append_reconcile(
                     at,
-                    &m.id,
-                    "dangling-vector",
-                    "sqlite has ref, store missing",
+                    &format!("orphan-vec-{vid}"),
+                    "orphan-vector",
+                    "store has vector, sqlite missing metadata",
                 );
+                if let Err(e) = self.store.delete_vector(vid) {
+                    warn!(vector_id = vid, error = %e, "reconcile: orphan vector delete failed");
+                }
             }
         }
         // tombstone 三库一致 → 物理删 (但跳过 merge_log 中 source, 留待 unmerge 可恢复)
@@ -335,11 +391,21 @@ impl MemoryEngine {
             if merge_sources.contains(&t.id) {
                 continue; // 合并产生 tombstone, 留给 unmerge 可回滚
             }
-            let vr_ok = t
-                .vector_ref
-                .parse::<u64>()
-                .map(|vr| self.store.delete_vector(vr).is_ok())
-                .unwrap_or(true);
+            // L4: 坏 vector_ref → 不 unwrap_or(true) 静默物理删 (会留幽灵向量),
+            // 落 report 跳过本轮物理删, 下轮 reconcile 再修。
+            let vr_ok = match t.vector_ref.parse::<u64>() {
+                Ok(vr) => self.store.delete_vector(vr).is_ok(),
+                Err(_) => {
+                    warn!(id = %t.id, vector_ref = %t.vector_ref, "reconcile: tombstone bad vector_ref, skip physical delete");
+                    let _ = self.persist.append_reconcile(
+                        at,
+                        &t.id,
+                        "bad-vector-ref",
+                        "tombstone vector_ref not u64, ghost vector may remain",
+                    );
+                    false
+                }
+            };
             if vr_ok {
                 if let Err(e) = self.persist.physical_delete(&t.id) {
                     failures.push(ConsolidationFailure {
@@ -393,6 +459,50 @@ impl MemoryEngine {
     /// fm-cli: 列全部 merge_log。
     pub fn list_merges(&self) -> fm_core::MemoryResult<Vec<MergeLogEntry>> {
         self.persist.list_merge_log().map_err(|e| e.to_memory())
+    }
+
+    /// 按 scope (session_id) 批量删除 (issue #2 delete_scope RPC)。
+    /// 返回被删条数。逐条: tombstone 元数据 + 删 store 向量 (与单条 delete_memory 同语义),
+    /// 坏 vector_ref 不阻断 (warn 跳过, reconcile 兜底)。非事务跨库 (H1 边界: 三库无分布式事务),
+    /// 失败逐条记 warn, 已删的不回滚 (软删幂等, 重试安全)。confirm 由 RPC 层校验, 此处不判。
+    pub fn delete_scope(&self, session_id: &str) -> fm_core::MemoryResult<u64> {
+        let items = self
+            .persist
+            .list_by_session(session_id)
+            .map_err(|e| e.to_memory())?;
+        let mut deleted = 0u64;
+        for m in &items {
+            match m.vector_ref.parse::<u64>() {
+                Ok(vec_id) => {
+                    if let Err(e) = self.store.delete_vector(vec_id) {
+                        warn!(id = %m.id, error = %e, "delete_scope: store delete_vector failed, tombstone still proceeds");
+                    }
+                }
+                Err(_) => {
+                    warn!(id = %m.id, vector_ref = %m.vector_ref, "delete_scope: bad vector_ref, ghost vector may remain (reconcile cleans)");
+                }
+            }
+            if let Err(e) = self.persist.tombstone_memory(&m.id) {
+                warn!(id = %m.id, error = %e, "delete_scope: tombstone_memory failed, skip");
+                continue;
+            }
+            deleted += 1;
+        }
+        if deleted > 0 {
+            let now = Self::now_ms();
+            self.persist
+                .append_wop("delete_scope", session_id, now)
+                .map_err(|e| e.to_memory())?;
+        }
+        info!(session = session_id, deleted, "delete_scope done");
+        Ok(deleted)
+    }
+
+    /// 计数 (issue #2 count RPC)。None → 全量, Some(scope) → 按 session_id 过滤。
+    pub fn count(&self, scope: Option<&str>) -> fm_core::MemoryResult<u64> {
+        self.persist
+            .count_by_session(scope)
+            .map_err(|e| e.to_memory())
     }
 }
 
@@ -466,7 +576,13 @@ impl fm_core::FusionMemoryEngine for MemoryEngine {
             item.vector_ref = vec_id.to_string();
             // entities_pending=true: 实体待异步抽 (C5: content+vector 先存)
             item.entities_pending = true;
-            self.persist.put_memory(&item).map_err(|e| e.to_memory())?;
+            if let Err(e) = self.persist.put_memory(&item) {
+                // H1 反向清理: insert_vector 已落 hnsw+sled, put_memory 失败 (磁盘满/SQLite busy)
+                // → 删向量避免幽灵 (索引可见但无元数据, retrieve 拿 id 却 get_memory=None)。
+                warn!(id = %id, error = %e, "put_memory failed, reverse-clean vector");
+                let _ = self.store.delete_vector(vec_id);
+                return Err(e.to_memory());
+            }
             // wop payload = 序列化 MemoryItem（不含向量，follower 本地 re-embed，§6.3 同 content 同向量）。
             let wop_payload = serde_json::to_string(&item)?;
             self.persist
@@ -485,6 +601,23 @@ impl fm_core::FusionMemoryEngine for MemoryEngine {
         query: &RetrieveQuery,
     ) -> fm_core::MemoryResult<FormattedContext> {
         let now = Self::now_ms();
+        // L1: 抽 query 实体 → 传 score_candidate 接通 graph_affinity (γ=0.2, PRD §6.4)。
+        // 有 extractor 则抽, 无则空 (graph_aff=0, 退化为二因子, 落 debug 留痕)。
+        let query_entity_ids: Vec<String> = if let Some(extractor) = &self.extractor {
+            let res = extractor.extract(&query.text).await;
+            if res.success && !res.entities.is_empty() {
+                debug!(
+                    n = res.entities.len(),
+                    "retrieve: query entities extracted for graph_affinity"
+                );
+                res.entities.iter().map(|e| e.id.clone()).collect()
+            } else {
+                Vec::new()
+            }
+        } else {
+            debug!("retrieve: no extractor, graph_affinity disabled (two-factor score)");
+            Vec::new()
+        };
         let qvec = self
             .embedder
             .embed(&query.text)
@@ -517,8 +650,7 @@ impl fm_core::FusionMemoryEngine for MemoryEngine {
                         continue;
                     }
                 }
-                // 融合评分: cosine + W(t) + graph_affinity
-                let query_entity_ids: Vec<String> = Vec::new(); // query 无实体 (M2: 仅文本检索)
+                // 融合评分: cosine + W(t) + graph_affinity (L1: query_entity_ids 已抽)
                 let score =
                     scoring::score_candidate(&self.persist, *sim as f64, m, &query_entity_ids, now)
                         .map_err(|e| fm_core::MemoryError::Store(e.to_string()))?;
@@ -587,9 +719,14 @@ impl fm_core::FusionMemoryEngine for MemoryEngine {
             }
             total_tokens += block_tokens;
             kept.push(block);
-            // 命中即 touch access (召回计数 +1, 供 consolidate 晋升判定)
-            for t in &sorted_groups_turn_ids(&groups, &kept) {
-                let _ = self.persist.touch_access(t, now);
+        }
+        // L2 + H4: 命中项去重后批量 touch (一次 retrieve 一次 access_count +1, 非 N 次单行写),
+        // 并持 consolidate_lock 与 consolidate 写互斥 (防 lost update / TOCTOU)。
+        let touched_ids: Vec<String> = sorted_groups_turn_ids(&groups, &kept);
+        if !touched_ids.is_empty() {
+            let _guard = self.consolidate_lock.lock().await;
+            if let Err(e) = self.persist.touch_access_batch(&touched_ids, now) {
+                warn!(error = %e, "touch_access_batch failed");
             }
         }
         Ok(FormattedContext {
@@ -599,6 +736,9 @@ impl fm_core::FusionMemoryEngine for MemoryEngine {
     }
 
     async fn consolidate_memories(&self) -> fm_core::MemoryResult<ConsolidationReport> {
+        // H4: 持引擎级锁, 与 retrieve 的 touch_access 写互斥。
+        // "读快照→决策→写" 原子化, 防并发 touch 回退 access_count (lost update) 或回收刚访问项 (TOCTOU)。
+        let _guard = self.consolidate_lock.lock().await;
         let start = Self::now_ms();
         let now = start;
         let since = self
@@ -717,8 +857,15 @@ impl fm_core::FusionMemoryEngine for MemoryEngine {
 
     async fn delete_memory(&self, id: &str) -> fm_core::MemoryResult<()> {
         if let Some(item) = self.persist.get_memory(id).map_err(|e| e.to_memory())? {
-            if let Ok(vec_id) = item.vector_ref.parse::<u64>() {
-                self.store.delete_vector(vec_id)?;
+            match item.vector_ref.parse::<u64>() {
+                Ok(vec_id) => {
+                    self.store.delete_vector(vec_id)?;
+                }
+                Err(_) => {
+                    // L4: 坏 vector_ref (非数字/污染) 不静默跳过, 落 warn 留痕。
+                    // 元数据照常 tombstone, 幽灵向量留待 reconcile 反向扫描清理。
+                    warn!(id, vector_ref = %item.vector_ref, "delete_memory: bad vector_ref, vector may remain as ghost (reconcile will clean)");
+                }
             }
         }
         self.persist
@@ -731,6 +878,14 @@ impl fm_core::FusionMemoryEngine for MemoryEngine {
             .map_err(|e| e.to_memory())?;
         info!(id, "memory tombstoned");
         Ok(())
+    }
+
+    async fn delete_scope(&self, scope: &str) -> fm_core::MemoryResult<u64> {
+        MemoryEngine::delete_scope(self, scope)
+    }
+
+    async fn count(&self, scope: Option<&str>) -> fm_core::MemoryResult<u64> {
+        MemoryEngine::count(self, scope)
     }
 
     async fn audit_memory_access(
@@ -1119,6 +1274,103 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reconcile_cleans_orphan_vector_no_sqlite_metadata() {
+        // L3 反向对账: store 有向量但 SQLite 无元数据 (H1 中途失败产物) → 删孤儿向量 + 落 report。
+        let eng = tmp_engine(16);
+        // 直接往 store 插一条无 SQLite 元数据的向量 (模拟 commit 中途失败遗留孤儿)。
+        let orphan_vid: u64 = fm_embed::vector_id_from_ulid("orphan-1");
+        let v = eng.embedder.embed("orphan ghost").await.unwrap();
+        eng.store.insert_vector(orphan_vid, &v).unwrap();
+        // SQLite 无此 vector_ref 记录。
+        assert!(
+            eng.store.get_vector(orphan_vid).unwrap().is_some(),
+            "孤儿向量应存在"
+        );
+        eng.reconcile().unwrap();
+        // 反向扫描应删掉孤儿。
+        assert!(
+            eng.store.get_vector(orphan_vid).unwrap().is_none(),
+            "孤儿向量 (无 SQLite 元数据) 应被 reconcile 清理"
+        );
+    }
+
+    #[tokio::test]
+    async fn l1_graph_affinity_wired_with_extractor() {
+        // L1: 注入 extractor 返回 query 实体 → retrieve 传 score_candidate → graph_affinity 接通。
+        // 候选含同 id 实体 → 直命中 graph_aff=1.0 → score 比无 extractor (graph_aff=0) 高 0.2 (GAMMA)。
+        let mut eng = tmp_engine(16);
+        let m = semantic_item(&eng, "m-l1", "l1 graph affinity content", "ent-shared").await;
+        let query_text = m.content.clone();
+
+        // 无 extractor: graph_aff=0
+        let q = fm_core::RetrieveQuery::new(&query_text, 5, 1000);
+        let ctx0 = eng.retrieve_context(&q).await.unwrap();
+        assert_eq!(ctx0.blocks.len(), 1);
+        let score0 = ctx0.blocks[0].score;
+
+        // 有 extractor 返回 ent-shared: graph_aff=1.0 (直命中)
+        // 注: 两次 retrieve 间 touch_access 会改 access_count → W(t) 略变, 故只断言
+        // 有 extractor 时 score 严格更高 (graph_affinity 接通且为正), 不卡精确 0.2。
+        let ext: Arc<dyn EntityExtractor> = Arc::new(FakeExtractor {
+            entities: vec![fm_core::EntityNode::new(
+                "ent-shared".into(),
+                "Shared".into(),
+                fm_core::EntityType::Tech,
+            )],
+            success: true,
+        });
+        eng = eng.with_extractor(ext);
+        let ctx1 = eng.retrieve_context(&q).await.unwrap();
+        assert_eq!(ctx1.blocks.len(), 1);
+        let score1 = ctx1.blocks[0].score;
+
+        assert!(
+            score1 > score0,
+            "graph_affinity 应接通: 有 extractor 比无 score 高, got score0={score0} score1={score1}"
+        );
+        assert!(
+            ctx1.blocks[0]
+                .source_entities
+                .contains(&"ent-shared".to_string()),
+            "block source_entities 应含 ent-shared"
+        );
+    }
+
+    #[tokio::test]
+    async fn h4_concurrent_retrieve_and_consolidate_no_access_count_regression() {
+        // H4: 并发 retrieve (touch access_count) + consolidate 互斥, access_count 不回退。
+        let eng = tmp_engine(16);
+        let m = semantic_item(&eng, "m-h4", "h4 concurrency content", "ent-h4").await;
+        let eng = Arc::new(eng);
+        // retrieve 多次并发 → access_count 累计; 同时跑一次 consolidate。
+        let mut handles = Vec::new();
+        for _ in 0..5 {
+            let e = eng.clone();
+            handles.push(tokio::spawn(async move {
+                let q = fm_core::RetrieveQuery::new("h4 concurrency content", 5, 1000);
+                let _ = e.retrieve_context(&q).await;
+            }));
+        }
+        let e2 = eng.clone();
+        let cons = tokio::spawn(async move { e2.consolidate_memories().await });
+        for h in handles {
+            h.await.unwrap();
+        }
+        cons.await.unwrap().unwrap();
+        let after = eng.get_memory(&m.id).await.unwrap().unwrap();
+        // 5 次 retrieve 每次 +1 → access_count ≥ 1 (consolidate 不应把它回退到 0)。
+        assert!(
+            after.access_count >= 1,
+            "并发 consolidate 不应回退 access_count (got {})",
+            after.access_count
+        );
+        assert!(
+            !after.tombstone,
+            "被 retrieve 访问的记忆不应被 consolidate 回收"
+        );
+    }
+
+    #[tokio::test]
     async fn consolidate_incremental_skips_unchanged() {
         let eng = tmp_engine(16);
         // 第一轮 consolidate 建基线
@@ -1187,16 +1439,19 @@ mod tests {
 
     #[tokio::test]
     async fn reconcile_deletes_tombstone_with_bad_vector_ref() {
-        // tombstone 的 vector_ref 非数字 → unwrap_or(true) 仍物理删
+        // L4 修正后: tombstone 的 vector_ref 非数字 → 不静默物理删 (会留幽灵向量),
+        // 落 bad-vector-ref report + 跳过本轮物理删, 留待下轮 reconcile 反向扫描修。
         let eng = tmp_engine(16);
         let mut m = semantic_item(&eng, "m-badref", "badref content", "ent-br").await;
-        // 篡改 vector_ref 为非数字 + 置 tombstone (put_memory 会覆盖, 故手动设)
         m.vector_ref = "not-a-number".into();
         m.tombstone = true;
         eng.persist.put_memory(&m).unwrap();
         let n = eng.reconcile().unwrap();
-        assert!(n >= 1, "非数字 vector_ref 的 tombstone 应物理删");
-        assert!(eng.persist.get_memory(&m.id).unwrap().is_none());
+        assert_eq!(n, 0, "坏 vector_ref 的 tombstone 不应物理删 (防幽灵向量)");
+        assert!(
+            eng.persist.get_memory(&m.id).unwrap().is_some(),
+            "元数据保留待下轮 reconcile"
+        );
     }
 
     #[tokio::test]
@@ -1260,9 +1515,11 @@ mod tests {
             },
         ];
         let sink: Arc<dyn ReplaySink> = Arc::new(eng);
-        let (applied, skipped) = replay_wops(sink.as_ref(), &entries).await.unwrap();
-        assert_eq!(applied, 2);
-        assert_eq!(skipped, 0);
+        let out = replay_wops(sink.as_ref(), &entries).await;
+        assert_eq!(out.applied, 2);
+        assert_eq!(out.skipped, 0);
+        assert!(!out.failed);
+        assert_eq!(out.last_applied_seq, 2);
     }
 
     #[tokio::test]
