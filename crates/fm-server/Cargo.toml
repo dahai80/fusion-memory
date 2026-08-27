@@ -5,9 +5,28 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "fusion-memory fm-server crate (M0 stub)"
+description = "fusion-memory 服务: UDS JSON-RPC + HTTP(Bearer), PRD §11.2"
 
 [dependencies]
 fm-core = { workspace = true }
+fm-engine = { workspace = true }
+fm-store = { workspace = true }
+fm-persist = { workspace = true }
+fm-embed = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[features]
+# 真实模型集成测试 (需起 fusion-mlx 加载 bge-m3 + Qwen3.5-9B-4bit)
+# 跑: cargo test -p fm-server --features mlx-live --test mlx_live_engine -- --include-ignored
+mlx-live = []
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -35,6 +35,10 @@ pub async fn run(cli: &Cli) -> Result<(), String> {
         Cmd::Stats => stats(&engine).await,
         Cmd::Delete { id, confirm } => delete(&engine, id, *confirm).await,
         Cmd::Doctor => doctor(&engine).await,
+        Cmd::Consolidate => consolidate(&engine).await,
+        Cmd::Merges => merges(&engine).await,
+        Cmd::Unmerge { id } => unmerge(&engine, *id).await,
+        Cmd::Reconcile => reconcile(&engine).await,
         Cmd::Import { source, stub } => import(&cli.home, source, *stub).await,
     }
 }
@@ -120,6 +124,65 @@ async fn doctor(engine: &MemoryEngine) -> Result<(), String> {
     println!("  persist: ok");
     println!("  memories: {n}");
     info!("doctor done");
+    Ok(())
+}
+
+async fn consolidate(engine: &MemoryEngine) -> Result<(), String> {
+    let report = engine
+        .consolidate_memories()
+        .await
+        .map_err(|e| format!("consolidate: {e}"))?;
+    println!("consolidate done in {} ms:", report.elapsed_ms);
+    println!(
+        "  dropped: {}  promoted: {}  merged: {}  summarized: {}  reextracted: {}  reconciled: {}",
+        report.dropped,
+        report.promoted,
+        report.merged,
+        report.summarized,
+        report.reextracted,
+        report.reconciled
+    );
+    if !report.failures.is_empty() {
+        println!("  failures: {}", report.failures.len());
+        for f in &report.failures {
+            println!("    {} @{}: {}", f.memory_id, f.stage, f.error);
+        }
+    }
+    info!(?report, "consolidate done");
+    Ok(())
+}
+
+async fn merges(engine: &MemoryEngine) -> Result<(), String> {
+    let log = engine
+        .list_merges()
+        .map_err(|e| format!("list merges: {e}"))?;
+    println!("merges: {}", log.len());
+    for m in &log {
+        println!(
+            "  id={}  {} -> {}  reason={}",
+            m.id, m.source_id, m.target_id, m.reason
+        );
+    }
+    Ok(())
+}
+
+async fn unmerge(engine: &MemoryEngine, id: u64) -> Result<(), String> {
+    let ok = engine
+        .unmerge(id)
+        .await
+        .map_err(|e| format!("unmerge: {e}"))?;
+    if ok {
+        println!("unmerged: {id} (source restored)");
+    } else {
+        return Err(format!("unmerge id {id} not found or source missing"));
+    }
+    Ok(())
+}
+
+async fn reconcile(engine: &MemoryEngine) -> Result<(), String> {
+    let n = engine.reconcile().map_err(|e| format!("reconcile: {e}"))?;
+    println!("reconcile: {n} tombstone physically deleted");
+    info!(n, "reconcile done");
     Ok(())
 }
 
@@ -345,5 +408,113 @@ mod tests {
         };
         run(&cli).await.unwrap();
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    // ---- M3 命令测试 ----
+
+    async fn semantic_item_cli(eng: &MemoryEngine, id: &str, content: &str, entity_id: &str) {
+        use fm_core::{MemoryItem, MemoryTier, MemoryType};
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(1_000_000_000);
+        let mut m = MemoryItem::new_turn_skeleton(
+            id.into(),
+            format!("ix-{id}"),
+            0,
+            "sess-1".into(),
+            MemoryType::Semantic,
+            content.into(),
+            now,
+        );
+        m.tier = MemoryTier::Long;
+        m.entities.push(fm_core::EntityNode::new(
+            entity_id.into(),
+            entity_id.into(),
+            fm_core::EntityType::Tech,
+        ));
+        let vec = eng.embedder().embed(content).await.unwrap();
+        let vid = fm_embed::vector_id_from_ulid(id);
+        eng.store().insert_vector(vid, &vec).unwrap();
+        m.vector_ref = vid.to_string();
+        eng.persist().put_memory(&m).unwrap();
+    }
+
+    #[tokio::test]
+    async fn consolidate_runs_on_empty() {
+        let eng = build(16);
+        // 空库 consolidate 不 panic, 报告全 0
+        consolidate(&eng).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn merges_lists_and_unmerge_restores() {
+        let eng = build(16);
+        // 同实体同内容 → 合并
+        semantic_item_cli(&eng, "m-a", "rust cargo error", "ent-rust").await;
+        semantic_item_cli(&eng, "m-b", "rust cargo error", "ent-rust").await;
+        consolidate(&eng).await.unwrap();
+        // merges 列出 ≥1
+        let log = eng.list_merges().unwrap();
+        assert!(!log.is_empty());
+        merges(&eng).await.unwrap();
+        // unmerge 第一条 → source 恢复
+        let mid = log[0].id;
+        unmerge(&eng, mid).await.unwrap();
+        assert!(eng.list_merges().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn unmerge_unknown_id_errors() {
+        let eng = build(16);
+        let err = unmerge(&eng, 99999).await;
+        assert!(err.is_err());
+    }
+
+    #[tokio::test]
+    async fn reconcile_physical_deletes_tombstone() {
+        let eng = build(16);
+        semantic_item_cli(&eng, "m-rd", "unique reconcile content", "ent-x").await;
+        eng.persist().tombstone_memory("m-rd").unwrap();
+        let n = reconcile(&eng).await;
+        // reconcile 触发物理删
+        assert!(eng.persist().get_memory("m-rd").unwrap().is_none());
+        let _ = n;
+    }
+
+    #[tokio::test]
+    async fn run_dispatch_consolidate_and_reconcile() {
+        let home = unique_home();
+        let cli = Cli {
+            home: Some(home.clone()),
+            dim: 16,
+            cmd: Cmd::Consolidate,
+        };
+        run(&cli).await.unwrap();
+        let cli2 = Cli {
+            home: Some(home.clone()),
+            dim: 16,
+            cmd: Cmd::Reconcile,
+        };
+        run(&cli2).await.unwrap();
+        let cli3 = Cli {
+            home: Some(home.clone()),
+            dim: 16,
+            cmd: Cmd::Merges,
+        };
+        run(&cli3).await.unwrap();
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn cli_parses_m3_commands() {
+        assert!(Cli::try_parse_from(["fm", "consolidate"]).is_ok());
+        assert!(Cli::try_parse_from(["fm", "merges"]).is_ok());
+        assert!(Cli::try_parse_from(["fm", "reconcile"]).is_ok());
+        let u = Cli::try_parse_from(["fm", "unmerge", "--id", "42"]).unwrap();
+        match u.cmd {
+            Cmd::Unmerge { id } => assert_eq!(id, 42),
+            _ => panic!("wrong cmd"),
+        }
     }
 }

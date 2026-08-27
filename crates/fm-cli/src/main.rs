@@ -59,6 +59,18 @@ enum Cmd {
     },
     /// 组件健康检查。
     Doctor,
+    /// 触发遗忘/合并/摘要/对账 saga。PRD §5.6, M3。
+    Consolidate,
+    /// 列出 merge_log（供 unmerge 查 id）。M3。
+    Merges,
+    /// 撤销一次合并：source 反 tombstone, 删 merge_log。M3。
+    Unmerge {
+        /// merge_log 行 id（见 `fm merges`）。
+        #[arg(long)]
+        id: u64,
+    },
+    /// 跨库对账：SQLite id ↔ store 向量, 悬空落 report, tombstone 物理删。M3。
+    Reconcile,
     /// 从 fusion-agent-studio memory.db 导入历史记忆。PRD §11.5。
     Import {
         /// 源库路径 (默认 ~/.fusion-agent-studio/memory.db)。

@@ -13,7 +13,8 @@ mod engine;
 
 pub use engine::MemoryEngine;
 pub use entity_extract::{
-    parse_extraction, EntityExtractor, ExtractConfig, ExtractResult, MlxEntityExtractor,
+    chat_completion, parse_extraction, EntityExtractor, ExtractConfig, ExtractResult,
+    MlxEntityExtractor,
 };
 pub use scoring::{
     fuse_score, score_candidate, should_promote, should_recycle, weight_of, ALPHA, BETA, GAMMA,
