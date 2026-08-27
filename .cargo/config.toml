@@ -1,0 +1,13 @@
+# pyo3 extension-module 在 macOS 需 dynamic_lookup 让 cdylib 延迟解析 Python 符号。
+# fm-py 是叶子 cdylib, fm-server/cli 二进制不依赖它且符号全解析, flag 无副作用。
+[target.aarch64-apple-darwin]
+rustflags = [
+    "-C", "link-arg=-undefined",
+    "-C", "link-arg=dynamic_lookup",
+]
+
+[target.x86_64-apple-darwin]
+rustflags = [
+    "-C", "link-arg=-undefined",
+    "-C", "link-arg=dynamic_lookup",
+]

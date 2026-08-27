@@ -144,6 +144,46 @@ impl MlxEntityExtractor {
             .build()?;
         Ok(Self { client, config })
     }
+
+    /// 暴露配置 (summarize 复用同 mlx url/api_key/chat_model)。
+    pub fn config(&self) -> &ExtractConfig {
+        &self.config
+    }
+}
+
+/// 通用 chat completion (实体抽取/摘要共用)。失败返 None (上层落 warn, 不 panic)。
+pub async fn chat_completion(config: &ExtractConfig, system: &str, user: &str) -> Option<String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(config.timeout_secs))
+        .build()
+        .ok()?;
+    let body = serde_json::json!({
+        "model": config.chat_model,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        "temperature": 0.0,
+    });
+    let url = format!("{}/chat/completions", config.mlx_url.trim_end_matches('/'));
+    let req = client.post(&url).json(&body);
+    let req = if config.api_key.is_empty() {
+        req
+    } else {
+        req.bearer_auth(&config.api_key)
+    };
+    let resp = req.send().await.ok()?;
+    if !resp.status().is_success() {
+        warn!(status = %resp.status(), "chat completion non-2xx");
+        return None;
+    }
+    let v: serde_json::Value = resp.json().await.ok()?;
+    Some(
+        v["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap_or("")
+            .to_string(),
+    )
 }
 
 #[async_trait::async_trait]

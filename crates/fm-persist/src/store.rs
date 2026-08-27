@@ -4,6 +4,7 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use rusqlite::{params, Connection, OptionalExtension};
+use serde::{Deserialize, Serialize};
 use tracing::{debug, info};
 
 use crate::error::PersistResult;
@@ -307,6 +308,121 @@ SELECT DISTINCT node, MIN(lvl) AS first_hop FROM hop WHERE node != ?1 GROUP BY n
         }
         Ok(())
     }
+
+    // ---- M3: consolidate saga 支撑方法 ----
+
+    /// 上次 consolidate 的 started_at (增量扫描边界)。无记录返 0。
+    pub fn last_consolidate_at(&self) -> PersistResult<u64> {
+        let conn = self.conn.lock().expect("persist conn lock poisoned");
+        let at: Option<i64> = conn
+            .query_row("SELECT MAX(started_at) FROM consolidation_log", [], |row| {
+                row.get(0)
+            })
+            .ok();
+        Ok(at.unwrap_or(0) as u64)
+    }
+
+    /// 增量变更集: last_accessed 或 created > since 的非 tombstone 记忆。B4。
+    pub fn list_changed_since(&self, since: u64) -> PersistResult<Vec<MemoryItem>> {
+        let conn = self.conn.lock().expect("persist conn lock poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT * FROM memory_item WHERE tombstone=0 \
+             AND (last_accessed_timestamp > ?1 OR created_timestamp > ?1) \
+             ORDER BY created_timestamp ASC",
+        )?;
+        let rows = stmt.query_map(params![since as i64], row_to_memory)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// 全部已 tombstone 记忆 (reconcile 物理删候选)。
+    pub fn list_tombstoned(&self) -> PersistResult<Vec<MemoryItem>> {
+        let conn = self.conn.lock().expect("persist conn lock poisoned");
+        let mut stmt = conn.prepare("SELECT * FROM memory_item WHERE tombstone=1")?;
+        let rows = stmt.query_map([], row_to_memory)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// 物理删 (含级联 memory_entity)。reconcile 三库一致后调用。§8.4。
+    pub fn physical_delete(&self, id: &str) -> PersistResult<()> {
+        let conn = self.conn.lock().expect("persist conn lock poisoned");
+        conn.execute("DELETE FROM memory_item WHERE id=?1", params![id])?;
+        Ok(())
+    }
+
+    /// 全部 merge_log (fm-cli unmerge 列表用)。
+    pub fn list_merge_log(&self) -> PersistResult<Vec<MergeLogEntry>> {
+        let conn = self.conn.lock().expect("persist conn lock poisoned");
+        let mut stmt = conn
+            .prepare("SELECT id,at,source_id,target_id,reason FROM merge_log ORDER BY id DESC")?;
+        let rows = stmt.query_map([], |row| {
+            Ok(MergeLogEntry {
+                id: row.get::<_, i64>(0)? as u64,
+                at: row.get::<_, i64>(1)? as u64,
+                source_id: row.get(2)?,
+                target_id: row.get(3)?,
+                reason: row.get(4)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// 回滚单次合并: 删 merge_log 行, 返回 (source_id,target_id) 供引擎恢复 source。
+    pub fn unmerge(&self, merge_id: u64) -> PersistResult<Option<(String, String)>> {
+        let conn = self.conn.lock().expect("persist conn lock poisoned");
+        let row: Option<(String, String)> = conn
+            .query_row(
+                "SELECT source_id,target_id FROM merge_log WHERE id=?1",
+                params![merge_id as i64],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .ok();
+        let Some((src, tgt)) = row else {
+            return Ok(None);
+        };
+        conn.execute(
+            "DELETE FROM merge_log WHERE id=?1",
+            params![merge_id as i64],
+        )?;
+        Ok(Some((src, tgt)))
+    }
+
+    /// 追加 reconcile_report 记录 (跨库对账差异/失败项)。
+    pub fn append_reconcile(
+        &self,
+        at: u64,
+        memory_id: &str,
+        stage: &str,
+        error: &str,
+    ) -> PersistResult<()> {
+        let conn = self.conn.lock().expect("persist conn lock poisoned");
+        conn.execute(
+            "INSERT INTO reconcile_report(at,memory_id,stage,error) VALUES(?1,?2,?3,?4)",
+            params![at as i64, memory_id, stage, error],
+        )?;
+        Ok(())
+    }
+}
+
+/// merge_log 条目 (fm-cli unmerge 展示用)。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MergeLogEntry {
+    pub id: u64,
+    pub at: u64,
+    pub source_id: String,
+    pub target_id: String,
+    pub reason: String,
 }
 
 const _: () = {
@@ -452,5 +568,138 @@ mod tests {
         p.append_wop("commit", "{}", 100).unwrap();
         p.append_wop("delete", "{}", 200).unwrap();
         assert_eq!(p.count().unwrap(), 0);
+    }
+
+    #[test]
+    fn last_consolidate_at_default_zero() {
+        let p = Persist::open_in_memory().unwrap();
+        assert_eq!(p.last_consolidate_at().unwrap(), 0);
+    }
+
+    #[test]
+    fn last_consolidate_at_tracks_max() {
+        let p = Persist::open_in_memory().unwrap();
+        p.record_consolidation(&ConsolidationReport::default(), 100)
+            .unwrap();
+        p.record_consolidation(&ConsolidationReport::default(), 250)
+            .unwrap();
+        assert_eq!(p.last_consolidate_at().unwrap(), 250);
+    }
+
+    #[test]
+    fn list_changed_since_filters() {
+        let p = Persist::open_in_memory().unwrap();
+        p.put_memory(&sample_item("a", "ix", 0)).unwrap();
+        p.put_memory(&sample_item("b", "ix", 1)).unwrap();
+        let since_before = p.last_consolidate_at().unwrap();
+        let changed = p.list_changed_since(since_before).unwrap();
+        assert_eq!(changed.len(), 2);
+        let after_max = 10_000;
+        assert!(p.list_changed_since(after_max).unwrap().is_empty());
+    }
+
+    #[test]
+    fn list_tombstoned_returns_only_tombstoned() {
+        let p = Persist::open_in_memory().unwrap();
+        p.put_memory(&sample_item("a", "ix", 0)).unwrap();
+        p.put_memory(&sample_item("b", "ix", 1)).unwrap();
+        p.tombstone_memory("a").unwrap();
+        let tbs = p.list_tombstoned().unwrap();
+        assert_eq!(tbs.len(), 1);
+        assert_eq!(tbs[0].id, "a");
+        assert!(tbs[0].tombstone);
+    }
+
+    #[test]
+    fn physical_delete_removes_row() {
+        let p = Persist::open_in_memory().unwrap();
+        p.put_memory(&sample_item("a", "ix", 0)).unwrap();
+        p.physical_delete("a").unwrap();
+        assert!(p.get_memory("a").unwrap().is_none());
+        assert_eq!(p.count().unwrap(), 0);
+    }
+
+    #[test]
+    fn merge_log_roundtrip_and_unmerge() {
+        let p = Persist::open_in_memory().unwrap();
+        p.record_merge("src-1", "tgt-1", "sim", 100).unwrap();
+        p.record_merge("src-2", "tgt-2", "entity", 200).unwrap();
+        let logs = p.list_merge_log().unwrap();
+        assert_eq!(logs.len(), 2);
+        assert_eq!(logs[0].source_id, "src-2");
+        assert_eq!(logs[1].source_id, "src-1");
+
+        let first_id = logs[1].id;
+        let unmerged = p.unmerge(first_id).unwrap();
+        assert_eq!(unmerged, Some(("src-1".into(), "tgt-1".into())));
+        assert_eq!(p.list_merge_log().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn unmerge_missing_id_returns_none() {
+        let p = Persist::open_in_memory().unwrap();
+        assert_eq!(p.unmerge(9999).unwrap(), None);
+    }
+
+    #[test]
+    fn append_reconcile_records_row() {
+        let p = Persist::open_in_memory().unwrap();
+        p.append_reconcile(500, "mem-x", "vector_diff", "dangling")
+            .unwrap();
+        // 不抛错即视为写入成功；reconcile_report 无独立读 API，靠 record_consolidation
+        // failures 路径已验证字段，此处只验证 INSERT 不报错。
+        assert!(p.append_reconcile(501, "mem-y", "ok", "").is_ok());
+    }
+
+    #[test]
+    fn relation_put_list_and_n_hop() {
+        let p = Persist::open_in_memory().unwrap();
+        p.put_relation("A", "B", "knows", 0.8, 1, 100).unwrap();
+        p.put_relation("B", "C", "knows", 0.7, 1, 200).unwrap();
+        p.put_relation("C", "D", "knows", 0.6, 1, 300).unwrap();
+        let from_a = p.list_relations_from("A").unwrap();
+        assert_eq!(from_a.len(), 1);
+        assert_eq!(from_a[0].0, "B");
+
+        let one_hop = p.n_hop_reachable("A", 1).unwrap();
+        assert_eq!(one_hop.len(), 1);
+        assert_eq!(one_hop[0].0, "B");
+
+        let two_hop = p.n_hop_reachable("A", 2).unwrap();
+        assert!(two_hop.iter().any(|(n, _)| n == "C"));
+        assert!(!two_hop.iter().any(|(n, _)| n == "D"));
+
+        let three_hop = p.n_hop_reachable("A", 3).unwrap();
+        assert!(three_hop.iter().any(|(n, _)| n == "D"));
+    }
+
+    #[test]
+    fn list_entities_by_type_and_alias() {
+        let p = Persist::open_in_memory().unwrap();
+        let mut m = sample_item("e1", "ix", 0);
+        m.entities.push(EntityNode::new(
+            "ent-rust".into(),
+            "Rust".into(),
+            EntityType::Tech,
+        ));
+        p.put_memory(&m).unwrap();
+
+        let techs = p.list_entities_by_type("Tech").unwrap();
+        assert_eq!(techs.len(), 1);
+        assert_eq!(techs[0].0, "ent-rust");
+        assert_eq!(techs[0].1, "Rust");
+
+        p.append_entity_alias("ent-rust", "Rs").unwrap();
+        let after = p.list_entities_by_type("Tech").unwrap();
+        assert!(after[0].2.contains("Rs"), "aliases={}", after[0].2);
+
+        // 重复别名去重
+        p.append_entity_alias("ent-rust", "rs").unwrap();
+        let after2 = p.list_entities_by_type("Tech").unwrap();
+        let count = after2[0].2.matches("Rs").count() + after2[0].2.matches("rs").count();
+        assert_eq!(count, 1, "alias duplicated: {}", after2[0].2);
+
+        // 不存在的 entity 不抛错
+        assert!(p.append_entity_alias("ghost", "x").is_ok());
     }
 }

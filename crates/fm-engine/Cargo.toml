@@ -7,6 +7,11 @@ license.workspace = true
 authors.workspace = true
 description = "fusion-memory 引擎: commit/retrieve/consolidate + 实体抽取 + 融合评分。PRD §6, §11.1, §11.4"
 
+[features]
+# 真实模型集成测试 (需起 fusion-mlx 加载 Qwen3.5-9B-4bit)
+# 跑: cargo test -p fm-engine --features mlx-live --test mlx_live_extract -- --include-ignored
+mlx-live = []
+
 [dependencies]
 fm-core = { workspace = true }
 fm-store = { workspace = true }

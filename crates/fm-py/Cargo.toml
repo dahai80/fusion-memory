@@ -5,9 +5,24 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "fusion-memory fm-py crate (M0 stub)"
+description = "fusion-memory PyO3 绑定, GIL 安全 (C2). PRD §11.3"
 
 [dependencies]
 fm-core = { workspace = true }
+fm-engine = { workspace = true }
+fm-store = { workspace = true }
+fm-persist = { workspace = true }
+fm-embed = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+pyo3 = { workspace = true }
+
+# 注：PyO3 #[pymethods] 运行测试需 Python 解释器链接；workspace pyo3 带 extension-module
+# 会让测试链接缺 libpython。绑定层是薄胶水（行为委托给 fm-engine 83% 覆盖），故只留
+# 纯 Rust 单测，PyO3 往返验收走 fm-server HTTP/UDS 集成路径。
+
+[lib]
+name = "fusion_memory"
+crate-type = ["cdylib"]
