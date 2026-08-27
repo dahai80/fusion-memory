@@ -1,0 +1,15 @@
+{
+  "_doc": "§13.2 perf baseline (store-stub, 10k memories, StubEmbedder dim=64). M5-B record.",
+  "_run": "cargo bench -p fm-engine --bench retrieve_bench",
+  "_machine": "Apple Silicon, release profile",
+  "concurrency": 10,
+  "concurrent_p50_ms": 121.57941699999999,
+  "concurrent_p99_ms": 139.985667,
+  "concurrent_pass": true,
+  "concurrent_target_p99_ms": 200,
+  "single_p50_ms": 12.453042,
+  "single_p99_ms": 14.327625,
+  "single_pass": true,
+  "single_target_p99_ms": 50,
+  "total_memories": 10000
+}

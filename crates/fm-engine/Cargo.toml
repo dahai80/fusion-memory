@@ -28,8 +28,14 @@ tracing = { workspace = true }
 ulid = { workspace = true }
 thiserror = { workspace = true }
 reqwest = { workspace = true }
+regex = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
 tempfile = { workspace = true }
 fm-embed = { workspace = true }
+
+# §13.2 perf 基线 bench (轻量手写, 无 criterion 重依赖, CI 友好)。
+[[bench]]
+name = "retrieve_bench"
+harness = false

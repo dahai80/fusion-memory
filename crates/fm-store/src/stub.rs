@@ -23,6 +23,24 @@ const HNSW_MAX_LAYER: usize = 6;
 const HNSW_EF_CONSTRUCT: usize = 200;
 const SEARCH_EF: usize = 64;
 
+/// 手写余弦相似度 (search_knn 补齐用, 避免引入 fm-similarity 依赖)。返回 [-1, 1]。
+fn cosine_sim(a: &[f32], b: &[f32]) -> f32 {
+    let mut dot = 0.0f32;
+    let mut na = 0.0f32;
+    let mut nb = 0.0f32;
+    for (x, y) in a.iter().zip(b.iter()) {
+        dot += x * y;
+        na += x * x;
+        nb += y * y;
+    }
+    let denom = na.sqrt() * nb.sqrt();
+    if denom == 0.0 {
+        0.0
+    } else {
+        dot / denom
+    }
+}
+
 pub struct StoreStub {
     db: Db,
     dim: usize,
@@ -206,6 +224,7 @@ impl FusionStoreEngine for StoreStub {
         })?;
         let neighbours = hnsw.search(query, top_k, SEARCH_EF);
         let mut out = Vec::with_capacity(neighbours.len());
+        let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
         for nb in neighbours {
             let id = nb.d_id as u64;
             if self.is_tombstoned(id).map_err(StoreError::to_memory)? {
@@ -214,6 +233,30 @@ impl FusionStoreEngine for StoreStub {
             // DistCosine.eval 返回 1 - cos_sim; similarity = 1 - distance
             let similarity = 1.0 - nb.distance;
             out.push((id, similarity));
+            seen.insert(id);
+        }
+        // hnsw 近似召回在小数据集/边界 ef 下可能返回 < top_k。补齐: 线性扫 vec_tree
+        // 取未命中活向量, 按 cosine 补足 top_k。保正确召回完整性 (Rule 12 不静默少返)。
+        if out.len() < top_k {
+            let tree = self.vec_tree().map_err(StoreError::to_memory)?;
+            let mut candidates: Vec<(u64, f32)> = Vec::new();
+            for item in tree.iter() {
+                let (k, v) =
+                    item.map_err(|e| StoreError::to_memory(StoreError::Sled(e.to_string())))?;
+                let id = u64::from_be_bytes(k.as_ref().try_into().unwrap_or([0u8; 8]));
+                if seen.contains(&id) || self.is_tombstoned(id).map_err(StoreError::to_memory)? {
+                    continue;
+                }
+                let vec = Self::deserialize_vec(&v).map_err(StoreError::to_memory)?;
+                let sim = cosine_sim(query, &vec);
+                candidates.push((id, sim));
+            }
+            candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            for (id, sim) in candidates.into_iter().take(top_k - out.len()) {
+                out.push((id, sim));
+            }
+            // 整体按相似度降序, 补齐后顺序一致
+            out.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         }
         Ok(out)
     }

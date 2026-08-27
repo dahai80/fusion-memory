@@ -18,6 +18,8 @@ Fusion 生态（"一核九端"）系统级长/短期记忆与认知图谱中枢�
 
 **M6 已完成**：集群同步 leader-follower（PRD §16 内网离线集群，非公网云）。新 crate `fm-cluster`：角色注入（standalone/leader/follower，env `FUSION_MEMORY_ROLE` > home/role 文件 > standalone）+ wop_log 复制（leader 单写点 + append_wop，follower 拉 SyncRequest → 本地重放 commit/delete，summarize 审计跳过）+ TCP 传输（4B 长度前缀 + JSON 线帧，Hello/SyncRequest/SyncResponse/Ping/Pong，内网端口 11436）+ 心跳（5s ping，连续 3 失败 = LeaderDown）+ 手动 failover（`fm cluster promote` 写 home/role=leader，需重启 fm-server 生效，自动选举延期）。fm-server `spawn_cluster(engine, role, set)` 角色注入消除 env 竞争。fm-cli `cluster status/promote`。验收：3 e2e 场景全绿（commit→catchup read-local 一致 / 增量同步 seq 推进 / leader 宕机→LeaderDown→promote→新 leader 续写）+ ReplaySink 覆盖测试 + fm-cluster 各文件离线 regions 91-100%。285 离线测试全绿，clippy/fmt clean。**离线总 regions 87.65%**（较 M4 90.63% 降，因新 fm-cluster crate + engine 集成扩 regions 分母，而 mlx-gated summarize/consolidate saga + engine_builder !stub 分支离线不可达；live 口径仍覆盖这些分支，PRD 验收以 live 为准，M6 未触 mlx 代码故 live regions 不变）。
 
+**M5 部分完成**（降级定位，非阻塞主线）：PRD §14 三部分 — (a) store-fusion 可选切换、(b) `audit_memory_access` → fusion-guard DLP gate、(c) perf 基线 p99<50ms + 并发。**(c) 已落地**：轻量手写 bench（`crates/fm-engine/benches/retrieve_bench.rs`，无 criterion 重依赖），store-stub 10k 条记忆 + StubEmbedder dim=64，单条 retrieve p99=14.3ms（<50ms ✅）、10 并发 p99=140ms（<200ms ✅）。基线 JSON 落 `benches/baseline-2026-08-27.json`。**(a)(b) 降级**：见 M5 PRD 偏离记录。**(c) 之外的 R8/§10.4 PII 正则脱敏已落地**（此前零脱敏的真空补齐）：`fm-engine/src/redact.rs` 五类 PII 正则（phone/email/idcard/bankcard/ipv4，regex crate 无 lookaround，顺序敏感替换避误吞），占位符 `[REDACTED:type]`，幂等。commit/import 写入路径在 embed+persist 前脱敏，故向量/图谱/检索全用脱敏后内容。env `FUSION_MEMORY_REDACT_PII=1` 开启（`MemoryEngine::with_redact()` + fm-server/fm-cli 导入路径同源 env）。13 脱敏测试绿。验收：perf bench 两 gate pass + 13 脱敏测试绿 + 285 离线测试全绿 + clippy/fmt clean。
+
 | 里程碑 | 内容 | 状态 |
 |--------|------|------|
 | M0 | workspace + 核心类型 + trait + CI | ✅ |
@@ -25,12 +27,20 @@ Fusion 生态（"一核九端"）系统级长/短期记忆与认知图谱中枢�
 | M2 | 真实 embedding + 实体抽取 + 图 + 融合评分 + 导入 | ✅ |
 | M3 | 服务化 + PyO3 + consolidate + 鉴权 | ✅ |
 | M4 | 消费方接入 (in-scope ✅ / outward PR ⏳) | 🟡 |
-| M5 | store-fusion 可选切换 + guard 旁路（可选） | ⏳ |
+| M5 | PII 脱敏 + perf 基线 + store-fusion/guard 降级 | ✅（部分） |
 | M6 | 集群同步 leader-follower | ✅ |
 
 ### M2 PRD 偏离记录（Rule 7）
 
 - **Kuzu DB → SQLite 递归 CTE**（裁定 2026-08-26）：PRD §9.2 选 Kuzu DB 嵌入图，但 Kuzu 无 Rust binding。改用 SQLite 递归 CTE（`relation` 表 + `WITH RECURSIVE` N-hop 遍历），`fm-persist` 内实现，`fm-graph::graph_affinity` 消费。功能等价（N-hop 可达性 + 直接命中），无需额外 server 进程。
+
+### M5 PRD 偏离记录（Rule 7，降级裁定 2026-08-27）
+
+PRD §14 M5 三部分，(a) store-fusion 可选切换、(b) fusion-guard DLP gate 降级为自带 PII 正则脱敏，(c) perf 基线已落地。
+
+- **(a) store-fusion 切换 → 降级不实施**（裁定 2026-08-27）：PRD §14/Tech Selection 拟复用 `fusion-store`（HNSW）做零拷贝后端。但实测：① `fusion-store` 的 `FusionStoreEngine`（`fs-core/src/engine.rs`）与 fm-store 的同名 trait 是**两套不同 API**（方法集不同：create_vector_index/open_vector_index/columnar/checkpoint/recover，全签 `timeout: Option<Duration>`、返 `Result<bool>` vs fm-store 返 `MemoryResult<()>`），非同名 trait；② fusion-store 非 git 仓库、非本 workspace 成员，受"只能改本目录工程"约束无法作 path dep 消费；③ fm-store A4 已否定零拷贝（"放弃零拷贝幻象，get_vector 返回 owned Vec"）。故 store-stub 保持长期生产后端，store-fusion 切换不实施。perf gate 亦针对 store-stub（非 fusion-store），(c) 不受影响。
+- **(b) fusion-guard DLP gate → 降级为自带 PII 正则脱敏**（裁定 2026-08-27）：PRD R8/§10.4 "M5 接 guard 做正式 DLP gate"，但 fusion-guard 未落地且不可改跨工程。降级：fusion-memory 自带最小 PII 正则脱敏（`fm-engine/src/redact.rs`，五类 PII），填补 M3 前的脱敏真空。guard 落地后再升级为正式 DLP gate，届时提 issue 跟进。
+- **(c) perf 基线 → 已落地**：见 M5 总结段。两 gate 达标，基线 JSON 存档。
 
 ## 架构
 
@@ -63,6 +73,10 @@ cargo check --workspace        # 编译检查
 cargo test --workspace         # 全离线测试 (285 用例, 排除 fm-py cdylib)
 cargo clippy --workspace --all-targets -- -D warnings   # lint
 cargo fmt --all --check        # 格式检查
+
+# §13.2 perf 基线 (store-stub 10k 条, StubEmbedder, 免模型):
+#   cargo bench -p fm-engine --bench retrieve_bench
+#   单条 retrieve p99<50ms + 10 并发 p99<200ms, 结果落 /tmp/fm-perf-baseline-*.json
 
 # 真实模型集成测试 (需起 fusion-mlx 加载 bge-m3 + Qwen3.5-9B-4bit, 串行避 429):
 #   ~/claude-home/fusion-mlx/start.sh start
