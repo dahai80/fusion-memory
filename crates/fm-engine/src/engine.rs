@@ -460,6 +460,50 @@ impl MemoryEngine {
     pub fn list_merges(&self) -> fm_core::MemoryResult<Vec<MergeLogEntry>> {
         self.persist.list_merge_log().map_err(|e| e.to_memory())
     }
+
+    /// 按 scope (session_id) 批量删除 (issue #2 delete_scope RPC)。
+    /// 返回被删条数。逐条: tombstone 元数据 + 删 store 向量 (与单条 delete_memory 同语义),
+    /// 坏 vector_ref 不阻断 (warn 跳过, reconcile 兜底)。非事务跨库 (H1 边界: 三库无分布式事务),
+    /// 失败逐条记 warn, 已删的不回滚 (软删幂等, 重试安全)。confirm 由 RPC 层校验, 此处不判。
+    pub fn delete_scope(&self, session_id: &str) -> fm_core::MemoryResult<u64> {
+        let items = self
+            .persist
+            .list_by_session(session_id)
+            .map_err(|e| e.to_memory())?;
+        let mut deleted = 0u64;
+        for m in &items {
+            match m.vector_ref.parse::<u64>() {
+                Ok(vec_id) => {
+                    if let Err(e) = self.store.delete_vector(vec_id) {
+                        warn!(id = %m.id, error = %e, "delete_scope: store delete_vector failed, tombstone still proceeds");
+                    }
+                }
+                Err(_) => {
+                    warn!(id = %m.id, vector_ref = %m.vector_ref, "delete_scope: bad vector_ref, ghost vector may remain (reconcile cleans)");
+                }
+            }
+            if let Err(e) = self.persist.tombstone_memory(&m.id) {
+                warn!(id = %m.id, error = %e, "delete_scope: tombstone_memory failed, skip");
+                continue;
+            }
+            deleted += 1;
+        }
+        if deleted > 0 {
+            let now = Self::now_ms();
+            self.persist
+                .append_wop("delete_scope", session_id, now)
+                .map_err(|e| e.to_memory())?;
+        }
+        info!(session = session_id, deleted, "delete_scope done");
+        Ok(deleted)
+    }
+
+    /// 计数 (issue #2 count RPC)。None → 全量, Some(scope) → 按 session_id 过滤。
+    pub fn count(&self, scope: Option<&str>) -> fm_core::MemoryResult<u64> {
+        self.persist
+            .count_by_session(scope)
+            .map_err(|e| e.to_memory())
+    }
 }
 
 // M6 集群: MemoryEngine 作 follower 重放落地。PRD §16.4。commit→re-embed+put+insert, delete→tombstone。
@@ -834,6 +878,14 @@ impl fm_core::FusionMemoryEngine for MemoryEngine {
             .map_err(|e| e.to_memory())?;
         info!(id, "memory tombstoned");
         Ok(())
+    }
+
+    async fn delete_scope(&self, scope: &str) -> fm_core::MemoryResult<u64> {
+        MemoryEngine::delete_scope(self, scope)
+    }
+
+    async fn count(&self, scope: Option<&str>) -> fm_core::MemoryResult<u64> {
+        MemoryEngine::count(self, scope)
     }
 
     async fn audit_memory_access(
