@@ -61,6 +61,15 @@ Fusion 生态（"一核九端"）系统级长/短期记忆与认知图谱中枢�
 - **M2 extract_and_attach 吞 DB 错**：`get_memory().unwrap_or(None)` 把 SQLite 错误吞成"无此记忆"（DB 故障伪装成数据缺失）→ 显式 match，DB 错误 warn + return（pending 保持 true 待重抽），不伪装。`fm-engine/src/engine.rs`。
 - **M3 Runtime::new per Engine 线程爆炸**：fm-py 每 Python `Engine` 各建 tokio runtime（N×worker 线程）→ 进程级 `OnceLock<Runtime>` 共享单 runtime（2 worker），所有 PyEngine 复用。`fm-py/src/lib.rs`。
 
+### v0.1.1 补丁（2026-08-27，issue #1/#2/#4）
+
+修复 3 个开放 GitHub issue，新增 2 个 RPC + 1 个 UDS method：
+
+- **issue #2 — scope 级删除/计数**：新增 `delete_scope`（按 session_id 批量 tombstone，含 `confirm` 守卫，复用 delete 的向量清理+`append_wop` 审计）与 `count`（全量或按 session 计数）。后端 `fm-persist` 加 `delete_by_session`/`list_by_session`/`count_by_session`，引擎 `MemoryEngine::delete_scope`/`count`，trait 加默认 `Unsupported` impl（测试 stub 免改）。HTTP `POST /v1/memory/{delete_scope,count}` + UDS method `delete_scope`/`count`。
+- **issue #1/#4 — `memory.retrieve_context` 契约**：fusion-event 需要 `{trigger_id, query, top_k, node_id}` → `{context, memory_ids, cache_hit}`。新增 UDS method `memory.retrieve_context` 适配已有 `RetrieveQuery`，把 `FormattedContext.blocks` 融合成契约形态（context = turns 以 `\n---\n` 拼，memory_ids = interaction_id 去重，cache_hit=false）。
+
+验收：325 离线测试全绿（基线 301 → +24 新增，persist 3 + dispatch 5 + http 4 + trait/引擎 12），clippy `-D warnings` + fmt clean，`cargo check --workspace` clean。CI 受 GitHub 账户计费阻断（`recent account payments have failed`，非代码问题，本地 fmt/clippy/check/test gate 为代理口径）。
+
 ### M2 PRD 偏离记录（Rule 7）
 
 - **Kuzu DB → SQLite 递归 CTE**（裁定 2026-08-26）：PRD §9.2 选 Kuzu DB 嵌入图，但 Kuzu 无 Rust binding。改用 SQLite 递归 CTE（`relation` 表 + `WITH RECURSIVE` N-hop 遍历），`fm-persist` 内实现，`fm-graph::graph_affinity` 消费。功能等价（N-hop 可达性 + 直接命中），无需额外 server 进程。
@@ -240,7 +249,7 @@ cargo build --release -p fm-server   # 产出 target/release/fm-server
 #   FUSION_MEMORY_STUB=1 (StubEmbedder 离线, 不连 mlx)
 ```
 
-UDS JSON-RPC（sock 0600，B6）+ HTTP（axum 强制 Bearer，B5，端口 11435）并发。未配 `FUSION_MEMORY_API_KEY` 但 HTTP 端口开 → 拒启 HTTP（仅 UDS）。路由：`POST /v1/memory/{commit,retrieve,consolidate,audit,delete}`、`GET /v1/memory/{id}`、`GET /healthz`（公开）；`delete` 需 `params.confirm=true`。
+UDS JSON-RPC（sock 0600，B6）+ HTTP（axum 强制 Bearer，B5，端口 11435）并发。未配 `FUSION_MEMORY_API_KEY` 但 HTTP 端口开 → 拒启 HTTP（仅 UDS）。路由：`POST /v1/memory/{commit,retrieve,consolidate,audit,delete,delete_scope,count}`、`GET /v1/memory/{id}`、`GET /healthz`（公开）；`delete`/`delete_scope` 需 `params.confirm=true`。UDS method `memory.retrieve_context`（issue #1/#4 契约，`{trigger_id,query,top_k,node_id}` → `{context,memory_ids,cache_hit}`，复用 retrieve 引擎链）。
 
 ## 约定
 

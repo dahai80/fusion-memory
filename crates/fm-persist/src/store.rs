@@ -156,6 +156,50 @@ impl Persist {
         Ok(())
     }
 
+    /// 按 session_id 批量软删 (issue #2 delete_scope)。返被 tombstone 行数。
+    /// scope 在 engine 层即 session_id (MemoryItem.session_id 字段), 故此处按 session_id 过滤。
+    /// 不删向量 (向量由 reconcile/compact 回收), 仅 tombstone 元数据, 与单条 delete_memory 一致语义。
+    pub fn delete_by_session(&self, session_id: &str) -> PersistResult<u64> {
+        let conn = self.conn()?;
+        let n = conn.execute(
+            "UPDATE memory_item SET tombstone=1 WHERE session_id=?1 AND tombstone=0",
+            params![session_id],
+        )?;
+        Ok(n as u64)
+    }
+
+    /// 取某 session 下所有非 tombstone 记忆 (issue #2: delete_scope 需清对应向量 + list-ids)。
+    pub fn list_by_session(&self, session_id: &str) -> PersistResult<Vec<MemoryItem>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT * FROM memory_item WHERE session_id=?1 AND tombstone=0 ORDER BY turn_idx ASC",
+        )?;
+        let rows = stmt.query_map(params![session_id], row_to_memory)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// 按 session_id 计数 (issue #2 count 带 scope 过滤)。空 session_id → 全量 (走 count())。
+    pub fn count_by_session(&self, session_id: Option<&str>) -> PersistResult<u64> {
+        let conn = self.conn()?;
+        let n: i64 = match session_id {
+            Some(s) => conn.query_row(
+                "SELECT COUNT(*) FROM memory_item WHERE tombstone=0 AND session_id=?1",
+                params![s],
+                |row| row.get(0),
+            )?,
+            None => conn.query_row(
+                "SELECT COUNT(*) FROM memory_item WHERE tombstone=0",
+                [],
+                |row| row.get(0),
+            )?,
+        };
+        Ok(n as u64)
+    }
+
     pub fn touch_access(&self, id: &str, now_ts: u64) -> PersistResult<()> {
         let conn = self.conn()?;
         conn.execute(
@@ -705,6 +749,48 @@ mod tests {
         let got = p.get_memory("a").unwrap().unwrap();
         assert_eq!(got.access_count, 1);
         assert_eq!(got.last_accessed_timestamp, 9999);
+    }
+
+    fn sample_item_session(id: &str, ix: &str, turn: u32, session: &str) -> MemoryItem {
+        let mut m = MemoryItem::new_turn_skeleton(
+            id.into(),
+            ix.into(),
+            turn,
+            session.into(),
+            MemoryType::Semantic,
+            format!("content-{turn}"),
+            1_000 + turn as u64,
+        );
+        m.tier = MemoryTier::Short;
+        m
+    }
+
+    #[test]
+    fn list_count_delete_by_session() {
+        let p = Persist::open_in_memory().unwrap();
+        p.put_memory(&sample_item_session("a", "ix1", 0, "sess-A"))
+            .unwrap();
+        p.put_memory(&sample_item_session("b", "ix1", 1, "sess-A"))
+            .unwrap();
+        p.put_memory(&sample_item_session("c", "ix2", 0, "sess-B"))
+            .unwrap();
+        // list_by_session
+        let a = p.list_by_session("sess-A").unwrap();
+        assert_eq!(a.len(), 2);
+        assert!(a.iter().all(|m| m.session_id == "sess-A"));
+        // count_by_session: 全量 vs 按 session
+        assert_eq!(p.count_by_session(None).unwrap(), 3);
+        assert_eq!(p.count_by_session(Some("sess-A")).unwrap(), 2);
+        assert_eq!(p.count_by_session(Some("sess-B")).unwrap(), 1);
+        assert_eq!(p.count_by_session(Some("sess-Z")).unwrap(), 0);
+        // delete_by_session: tombstone sess-A 2 条, sess-B 不动
+        let n = p.delete_by_session("sess-A").unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(p.count_by_session(Some("sess-A")).unwrap(), 0);
+        assert_eq!(p.count_by_session(Some("sess-B")).unwrap(), 1);
+        assert_eq!(p.count().unwrap(), 1);
+        // 幂等: 再删 sess-A 已无活记忆, 返 0
+        assert_eq!(p.delete_by_session("sess-A").unwrap(), 0);
     }
 
     #[test]
