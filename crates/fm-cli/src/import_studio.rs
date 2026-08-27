@@ -222,6 +222,17 @@ pub async fn run_import(engine: &MemoryEngine, source_db: &str) -> Result<Import
             report.skipped_empty += 1;
             continue;
         }
+        // R8/§10.4: 导入路径 PII 脱敏 (与 commit 共用 env FUSION_MEMORY_REDACT_PII)。
+        let content = if import_redact_on() {
+            let r = fm_engine::redact_text(content);
+            if r != content {
+                info!(id = %row.id, "PII redacted on import");
+            }
+            r
+        } else {
+            content.to_string()
+        };
+        let content = content.as_str();
         // memory_type: 源库已有字段; 空或无效 → 按内容重新归类 (C16)。
         let src_type = if VALID_STUDIO_TYPES.contains(&row.memory_type.as_str()) {
             row.memory_type.as_str()
@@ -308,7 +319,16 @@ pub fn build_import_engine(home: &Option<String>, stub: bool) -> Result<MemoryEn
         let mlx = MlxEmbedder::new(cfg).map_err(|e| format!("mlx embedder: {e}"))?;
         Arc::new(mlx)
     };
-    Ok(MemoryEngine::new(store, persist, embedder))
+    let mut engine = MemoryEngine::new(store, persist, embedder);
+    if import_redact_on() {
+        engine = engine.with_redact();
+    }
+    Ok(engine)
+}
+
+/// R8: 导入路径是否脱敏。与 commit 路径共用 env FUSION_MEMORY_REDACT_PII, 保持一致语义。
+fn import_redact_on() -> bool {
+    fm_engine::redact_enabled_env()
 }
 
 #[cfg(test)]

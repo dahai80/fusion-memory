@@ -41,6 +41,12 @@ pub fn build_server_engine(cfg: &ServerConfig, stub: bool) -> Result<ServerEngin
 
     let mut engine = MemoryEngine::new(store, persist, embedder);
 
+    // R8/§10.4 PII 脱敏: env FUSION_MEMORY_REDACT_PII=1 开启 (guard 未落地前自带兜底)。
+    if fm_engine::redact_enabled_env() {
+        engine = engine.with_redact();
+        info!("PII redaction enabled (R8)");
+    }
+
     if !stub {
         let xcfg = ExtractConfig {
             mlx_url: std::env::var("FUSION_MLX_URL")

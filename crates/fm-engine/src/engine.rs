@@ -31,6 +31,8 @@ pub struct MemoryEngine {
     embedder: Arc<dyn Embedder>,
     extractor: Option<Arc<dyn EntityExtractor>>,
     extract_config: Option<ExtractConfig>,
+    /// PII 脱敏开关 (R8/§10.4)。true 时 commit 路径 embed+persist 前脱敏。默认 false。
+    redact: bool,
 }
 
 impl MemoryEngine {
@@ -41,12 +43,19 @@ impl MemoryEngine {
             embedder,
             extractor: None,
             extract_config: None,
+            redact: false,
         }
     }
 
     /// 注入实体抽取器 (生产用 MlxEntityExtractor)。不注入则 entities 永远 pending。
     pub fn with_extractor(mut self, extractor: Arc<dyn EntityExtractor>) -> Self {
         self.extractor = Some(extractor);
+        self
+    }
+
+    /// 开启 PII 脱敏 (R8)。commit 路径 turn_content 后脱敏, 向量/persist/wop/extract 全用脱敏内容。
+    pub fn with_redact(mut self) -> Self {
+        self.redact = true;
         self
     }
 
@@ -71,6 +80,11 @@ impl MemoryEngine {
 
     pub fn embedder(&self) -> &Arc<dyn Embedder> {
         &self.embedder
+    }
+
+    /// PII 脱敏是否开启 (R8)。import 路径据此脱敏 (不经 commit_episodic_memory)。
+    pub fn redact_enabled(&self) -> bool {
+        self.redact
     }
 
     // M6: follower 重放落地的本地 seq (persist 当前最大 wop seq)。
@@ -422,7 +436,17 @@ impl fm_core::FusionMemoryEngine for MemoryEngine {
         let now = Self::now_ms();
         for turn in &interaction.turns {
             let id = Self::new_ulid();
-            let content = Self::turn_content(turn);
+            let raw = Self::turn_content(turn);
+            // R8/§10.4 PII 脱敏: 开启时 embed+persist+wop+extract 全用脱敏后内容。
+            let content = if self.redact {
+                let r = crate::redact::redact_text(&raw);
+                if r != raw {
+                    info!(id = %id, "PII redacted on commit");
+                }
+                r
+            } else {
+                raw
+            };
             let mut item = MemoryItem::new_turn_skeleton(
                 id.clone(),
                 interaction.id.clone(),
@@ -1239,5 +1263,50 @@ mod tests {
         let (applied, skipped) = replay_wops(sink.as_ref(), &entries).await.unwrap();
         assert_eq!(applied, 2);
         assert_eq!(skipped, 0);
+    }
+
+    #[tokio::test]
+    async fn commit_redacts_pii_when_enabled() {
+        // R8: redact on → persist 内 content 脱敏, 原手机号不残留。
+        let eng = tmp_engine(16).with_redact();
+        let ix = Interaction {
+            id: "ix-pii".into(),
+            session_id: "sess-1".into(),
+            turns: vec![Turn {
+                turn_idx: 0,
+                user_message: "my phone is 13912345678 call me".into(),
+                assistant_message: "ok noted".into(),
+                tool_calls: vec![],
+            }],
+            timestamp: 100,
+            metadata: serde_json::json!({}),
+        };
+        let ids = eng.commit_episodic_memory("sess-1", &ix).await.unwrap();
+        let item = eng.persist().get_memory(&ids[0].0).unwrap().unwrap();
+        assert!(item.content.contains("[REDACTED:phone]"));
+        assert!(!item.content.contains("13912345678"));
+        assert!(eng.redact_enabled());
+    }
+
+    #[tokio::test]
+    async fn commit_keeps_pii_when_redact_off() {
+        // redact off (默认) → content 原样保留 (向后兼容)。
+        let eng = tmp_engine(16);
+        assert!(!eng.redact_enabled());
+        let ix = Interaction {
+            id: "ix-raw".into(),
+            session_id: "sess-1".into(),
+            turns: vec![Turn {
+                turn_idx: 0,
+                user_message: "my phone is 13912345678 call me".into(),
+                assistant_message: "ok".into(),
+                tool_calls: vec![],
+            }],
+            timestamp: 100,
+            metadata: serde_json::json!({}),
+        };
+        let ids = eng.commit_episodic_memory("sess-1", &ix).await.unwrap();
+        let item = eng.persist().get_memory(&ids[0].0).unwrap().unwrap();
+        assert!(item.content.contains("13912345678"));
     }
 }

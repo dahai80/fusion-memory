@@ -7,6 +7,7 @@
 //! - get/delete/audit
 
 pub mod entity_extract;
+pub mod redact;
 pub mod scoring;
 
 mod engine;
@@ -16,6 +17,7 @@ pub use entity_extract::{
     chat_completion, parse_extraction, EntityExtractor, ExtractConfig, ExtractResult,
     MlxEntityExtractor,
 };
+pub use redact::{redact_enabled_env, redact_text};
 pub use scoring::{
     fuse_score, score_candidate, should_promote, should_recycle, weight_of, ALPHA, BETA, GAMMA,
     GRAPH_HOP_LIMIT, THETA_DROP, THETA_PROMOTE,
