@@ -73,6 +73,11 @@ impl MemoryEngine {
         &self.embedder
     }
 
+    // M6: follower 重放落地的本地 seq (persist 当前最大 wop seq)。
+    pub fn last_wop_seq(&self) -> fm_core::MemoryResult<i64> {
+        self.persist.last_wop_seq().map_err(|e| e.to_memory())
+    }
+
     fn now_ms() -> u64 {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -377,6 +382,35 @@ impl MemoryEngine {
     }
 }
 
+// M6 集群: MemoryEngine 作 follower 重放落地。PRD §16.4。commit→re-embed+put+insert, delete→tombstone。
+#[async_trait]
+impl fm_cluster::ReplaySink for MemoryEngine {
+    async fn embed(&self, content: &str) -> fm_cluster::ClusterResult<Vec<f32>> {
+        let v = self
+            .embedder
+            .embed(content)
+            .await
+            .map_err(|e| e.to_memory())?;
+        Ok(v)
+    }
+    async fn put_item(&self, item: &MemoryItem) -> fm_cluster::ClusterResult<()> {
+        self.persist
+            .put_memory(item)
+            .map_err(fm_cluster::ClusterError::from)?;
+        Ok(())
+    }
+    async fn insert_vector(&self, vec_id: u64, vec: &[f32]) -> fm_cluster::ClusterResult<()> {
+        FusionStoreEngine::insert_vector(self.store.as_ref(), vec_id, vec)?;
+        Ok(())
+    }
+    async fn tombstone(&self, id: &str) -> fm_cluster::ClusterResult<()> {
+        self.persist
+            .tombstone_memory(id)
+            .map_err(fm_cluster::ClusterError::from)?;
+        Ok(())
+    }
+}
+
 #[async_trait]
 impl fm_core::FusionMemoryEngine for MemoryEngine {
     async fn commit_episodic_memory(
@@ -409,8 +443,10 @@ impl fm_core::FusionMemoryEngine for MemoryEngine {
             // entities_pending=true: 实体待异步抽 (C5: content+vector 先存)
             item.entities_pending = true;
             self.persist.put_memory(&item).map_err(|e| e.to_memory())?;
+            // wop payload = 序列化 MemoryItem（不含向量，follower 本地 re-embed，§6.3 同 content 同向量）。
+            let wop_payload = serde_json::to_string(&item)?;
             self.persist
-                .append_wop("commit", &id, now)
+                .append_wop("commit", &wop_payload, now)
                 .map_err(|e| e.to_memory())?;
             ids.push(MemoryId(id.clone()));
             // 异步抽实体回写 (不阻塞 commit 返回; 此处同步 await 保证可测)
@@ -663,6 +699,11 @@ impl fm_core::FusionMemoryEngine for MemoryEngine {
         }
         self.persist
             .tombstone_memory(id)
+            .map_err(|e| e.to_memory())?;
+        // delete wop (payload=id): follower tombstone 同步。PRD §16。
+        let now = Self::now_ms();
+        self.persist
+            .append_wop("delete", id, now)
             .map_err(|e| e.to_memory())?;
         info!(id, "memory tombstoned");
         Ok(())
@@ -1156,5 +1197,47 @@ mod tests {
         let mid = eng.list_merges().unwrap()[0].id;
         let ok = eng.unmerge(mid).await.unwrap();
         assert!(!ok, "source 行不存在 → unmerge 返 false");
+    }
+
+    // ---- M6 ReplaySink impl 覆盖 ----
+
+    #[tokio::test]
+    async fn replay_sink_commit_and_delete_via_engine() {
+        // MemoryEngine 作 ReplaySink 落地: commit wop → embed+insert+put, delete wop → tombstone。
+        use fm_cluster::{replay_wops, ReplaySink};
+        use fm_core::{MemoryItem, MemoryType};
+        use fm_persist::WopEntry;
+
+        let eng = tmp_engine(16);
+        let mut item = MemoryItem::new_turn_skeleton(
+            "01H-REPLAY".into(),
+            "ix-rep".into(),
+            0,
+            "sess-rep".into(),
+            MemoryType::Episodic,
+            "replay content".into(),
+            100,
+        );
+        item.vector_ref = "99".into();
+        item.entities_pending = true;
+        let payload = serde_json::to_string(&item).unwrap();
+        let entries = vec![
+            WopEntry {
+                seq: 1,
+                op: "commit".into(),
+                payload,
+                at: 100,
+            },
+            WopEntry {
+                seq: 2,
+                op: "delete".into(),
+                payload: "01H-REPLAY".into(),
+                at: 200,
+            },
+        ];
+        let sink: Arc<dyn ReplaySink> = Arc::new(eng);
+        let (applied, skipped) = replay_wops(sink.as_ref(), &entries).await.unwrap();
+        assert_eq!(applied, 2);
+        assert_eq!(skipped, 0);
     }
 }

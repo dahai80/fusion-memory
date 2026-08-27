@@ -10,7 +10,7 @@ use fm_store::{FusionStoreEngine, StoreStub};
 use tracing::info;
 
 use crate::paths::resolve_home;
-use crate::{Cli, Cmd};
+use crate::{Cli, ClusterCmd, Cmd};
 
 fn build_engine(home: &Option<String>, dim: usize) -> Result<MemoryEngine, String> {
     let dir = resolve_home(home);
@@ -40,6 +40,7 @@ pub async fn run(cli: &Cli) -> Result<(), String> {
         Cmd::Unmerge { id } => unmerge(&engine, *id).await,
         Cmd::Reconcile => reconcile(&engine).await,
         Cmd::Import { source, stub } => import(&cli.home, source, *stub).await,
+        Cmd::Cluster { sub } => cluster(&cli.home, sub).await,
     }
 }
 
@@ -184,6 +185,60 @@ async fn reconcile(engine: &MemoryEngine) -> Result<(), String> {
     println!("reconcile: {n} tombstone physically deleted");
     info!(n, "reconcile done");
     Ok(())
+}
+
+async fn cluster(home: &Option<String>, sub: &ClusterCmd) -> Result<(), String> {
+    let dir = resolve_home(home);
+    match sub {
+        ClusterCmd::Status => {
+            let role = fm_cluster::detect_role_with_home(Some(&dir));
+            let leader = std::env::var("FUSION_MEMORY_LEADER").unwrap_or_default();
+            let sync_port = std::env::var("FUSION_MEMORY_SYNC_PORT")
+                .unwrap_or_else(|_| fm_cluster::ClusterConfig::default().sync_port.to_string());
+            // 打开 persist 读 last_wop_seq (轻量, 仅 SQLite)。
+            let db_path = dir.join("memory.db");
+            let seq = match Persist::open(&db_path) {
+                Ok(p) => p.last_wop_seq().map_err(|e| format!("last_wop_seq: {e}"))?,
+                Err(e) => {
+                    info!(error = %e, "persist open failed for cluster status, seq unknown");
+                    -1
+                }
+            };
+            println!("cluster status:");
+            println!("  role:       {}", role);
+            println!("  wop_seq:    {}", seq);
+            println!(
+                "  leader:     {}",
+                if leader.is_empty() { "(none)" } else { &leader }
+            );
+            println!("  sync_port:  {}", sync_port);
+            info!(%role, seq, "cluster status");
+            Ok(())
+        }
+        ClusterCmd::Promote => {
+            // 手动 failover: 写 home/role=leader, 清 follower leader env 指引重启。
+            std::fs::create_dir_all(&dir).map_err(|e| format!("create home dir: {e}"))?;
+            let path = fm_cluster::write_role_file(&dir, fm_cluster::NodeRole::Leader)
+                .map_err(|e| format!("write role file: {e}"))?;
+            println!("promoted: role=leader written to {}", path.display());
+            println!("next steps:");
+            println!("  1. stop old leader (if any): FUSION_MEMORY_ROLE unset + fm-server stop");
+            println!(
+                "  2. restart this node's fm-server (reads {}/role)",
+                dir.display()
+            );
+            println!(
+                "  3. point followers: FUSION_MEMORY_LEADER=<this-node-addr>:{}",
+                {
+                    std::env::var("FUSION_MEMORY_SYNC_PORT").unwrap_or_else(|_| {
+                        fm_cluster::ClusterConfig::default().sync_port.to_string()
+                    })
+                }
+            );
+            info!(path = %path.display(), "cluster promote done");
+            Ok(())
+        }
+    }
 }
 
 async fn import(home: &Option<String>, source: &Option<String>, stub: bool) -> Result<(), String> {
@@ -516,5 +571,77 @@ mod tests {
             Cmd::Unmerge { id } => assert_eq!(id, 42),
             _ => panic!("wrong cmd"),
         }
+    }
+
+    // ---- M6 cluster 命令测试 ----
+
+    use std::sync::{Mutex, OnceLock};
+    static CLUSTER_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    fn cluster_env_lock() -> std::sync::MutexGuard<'static, ()> {
+        CLUSTER_ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn cluster_status_standalone_no_db() {
+        // env 改写串行化 (同步块, 不跨 await); role 文件固定 standalone 免 env 竞争。
+        {
+            let _g = cluster_env_lock();
+            std::env::remove_var("FUSION_MEMORY_ROLE");
+            std::env::remove_var("FUSION_MEMORY_LEADER");
+        }
+        let home = unique_home();
+        // 无 memory.db → seq -1, role standalone, 不 panic。
+        cluster(&Some(home.clone()), &ClusterCmd::Status)
+            .await
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[tokio::test]
+    async fn cluster_status_with_db_shows_seq() {
+        {
+            let _g = cluster_env_lock();
+            std::env::remove_var("FUSION_MEMORY_ROLE");
+        }
+        let home = unique_home();
+        let eng = build_engine(&Some(home.clone()), 16).unwrap();
+        let ix: Interaction = serde_json::from_str(&interaction_json("ix-cluster")).unwrap();
+        eng.commit_episodic_memory("s", &ix).await.unwrap();
+        // commit → wop_log 至少 1 行, last_wop_seq >= 1
+        let seq = eng.persist().last_wop_seq().unwrap();
+        assert!(seq >= 1);
+        cluster(&Some(home.clone()), &ClusterCmd::Status)
+            .await
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[tokio::test]
+    async fn cluster_promote_writes_role_file() {
+        {
+            let _g = cluster_env_lock();
+            std::env::remove_var("FUSION_MEMORY_ROLE");
+        }
+        let home = unique_home();
+        cluster(&Some(home.clone()), &ClusterCmd::Promote)
+            .await
+            .unwrap();
+        let role = std::fs::read_to_string(std::path::Path::new(&home).join("role")).unwrap();
+        assert_eq!(role, "leader");
+        // 重启后 detect_role_with_home 应解析为 leader
+        assert_eq!(
+            fm_cluster::detect_role_with_home(Some(std::path::Path::new(&home))),
+            fm_cluster::NodeRole::Leader
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn cli_parses_cluster_commands() {
+        assert!(Cli::try_parse_from(["fm", "cluster", "status"]).is_ok());
+        assert!(Cli::try_parse_from(["fm", "cluster", "promote"]).is_ok());
     }
 }

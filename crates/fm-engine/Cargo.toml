@@ -19,9 +19,11 @@ fm-persist = { workspace = true }
 fm-embed = { workspace = true }
 fm-similarity = { workspace = true }
 fm-graph = { workspace = true }
+fm-cluster = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 async-trait = { workspace = true }
+tokio = { workspace = true }
 tracing = { workspace = true }
 ulid = { workspace = true }
 thiserror = { workspace = true }

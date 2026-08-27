@@ -80,6 +80,19 @@ enum Cmd {
         #[arg(long)]
         stub: bool,
     },
+    /// 集群拓扑: 角色/wop seq 查询 + 手动 failover。M6, PRD §16。
+    Cluster {
+        #[command(subcommand)]
+        sub: ClusterCmd,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ClusterCmd {
+    /// 当前节点角色 + wop seq + leader 地址。
+    Status,
+    /// 手动 failover: 本节点提升为 leader (写 home/role 文件, 需重启 fm-server 生效)。
+    Promote,
 }
 
 fn main() {

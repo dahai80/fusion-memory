@@ -13,6 +13,7 @@ fm-engine = { workspace = true }
 fm-store = { workspace = true }
 fm-persist = { workspace = true }
 fm-embed = { workspace = true }
+fm-cluster = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
