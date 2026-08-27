@@ -30,6 +30,8 @@ Fusion 生态（"一核九端"）系统级长/短期记忆与认知图谱中枢�
 | M5 | PII 脱敏 + perf 基线 + store-fusion/guard 降级 | ✅（部分） |
 | M6 | 集群同步 leader-follower | ✅ |
 
+> **里程碑全集 M0–M6（终态）**：落地架构 `~/fusion/fusion-memory-prd-plan-0826.md` §14 仅定义 M0–M6，M6 为最终里程碑，**无 M7+**。§15 未决项 6 项全部 ✅ 已裁定；§17 审计修正 E1（8 项）/E2（10 项）/E3（3 项）全部已落地或已决策，审计闭环无遗留。后续工作仅两类：(1) M5(b) 待上游 `fusion-guard#2` 补 PII 类后接正式 DLP gate；(2) PRD 外的运维/性能/消费方演进。
+
 ### M2 PRD 偏离记录（Rule 7）
 
 - **Kuzu DB → SQLite 递归 CTE**（裁定 2026-08-26）：PRD §9.2 选 Kuzu DB 嵌入图，但 Kuzu 无 Rust binding。改用 SQLite 递归 CTE（`relation` 表 + `WITH RECURSIVE` N-hop 遍历），`fm-persist` 内实现，`fm-graph::graph_affinity` 消费。功能等价（N-hop 可达性 + 直接命中），无需额外 server 进程。
