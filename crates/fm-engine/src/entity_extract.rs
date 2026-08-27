@@ -6,6 +6,7 @@
 
 use fm_core::{EntityNode, EntityType};
 use serde::Deserialize;
+use std::sync::OnceLock;
 use tracing::{debug, info, warn};
 
 /// LLM 返回的单个实体 JSON 项。
@@ -166,12 +167,24 @@ impl MlxEntityExtractor {
     }
 }
 
+/// §3.14: 进程级共享 reqwest::Client (连接池复用)。旧版每调用 chat_completion 新建 client
+/// → 每 summarize 付连接池初始化 + TLS/TCP 握手。OnceLock 懒建一次, reqwest::Client 内部 Arc,
+/// clone 廉价。超时改用 RequestBuilder::timeout (per-request), 不绑 client 构造期。
+static SHARED_CHAT_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+fn shared_chat_client() -> reqwest::Client {
+    SHARED_CHAT_CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new())
+        })
+        .clone()
+}
+
 /// 通用 chat completion (实体抽取/摘要共用)。失败返 None (上层落 warn, 不 panic)。
+/// §3.14: 复用进程级共享 client (连接池), 超时用 per-request .timeout() 不重建 client。
 pub async fn chat_completion(config: &ExtractConfig, system: &str, user: &str) -> Option<String> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(config.timeout_secs))
-        .build()
-        .ok()?;
+    let client = shared_chat_client();
     let body = serde_json::json!({
         "model": config.chat_model,
         "messages": [
@@ -181,7 +194,10 @@ pub async fn chat_completion(config: &ExtractConfig, system: &str, user: &str) -
         "temperature": 0.0,
     });
     let url = format!("{}/chat/completions", config.mlx_url.trim_end_matches('/'));
-    let req = client.post(&url).json(&body);
+    let req = client
+        .post(&url)
+        .json(&body)
+        .timeout(std::time::Duration::from_secs(config.timeout_secs));
     let req = if config.api_key.is_empty() {
         req
     } else {

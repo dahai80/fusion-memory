@@ -1,11 +1,12 @@
 //! SQLite 持久化。WAL 模式 + MemoryItem 全字段 CRUD。PRD §4.3, §8.4。
 
 use std::path::Path;
-use std::sync::Mutex;
 
-use rusqlite::{params, Connection, OptionalExtension};
+use r2d2::Pool;
+use r2d2_sqlite::SqliteConnectionManager;
+use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::error::{PersistError, PersistResult};
 use crate::schema;
@@ -14,48 +15,59 @@ use fm_core::{ConsolidationReport, EntityNode, MemoryItem, MemoryTier, MemoryTyp
 // P4: 递归 CTE 结果集扇出上限 (graph_affinity 远端节点贡献 0.5^h 指数衰减, 截断无损精度)。
 const N_HOP_RESULT_LIMIT: i64 = 256;
 
+// §1.1: r2d2 连接池 (打破单 Mutex<Connection> 串行)。PooledConnection DerefMut → Connection,
+// 调用点 (prepare_cached / transaction) 零改动。WAL 原生 1 写 N 读, 池大小 8 够并发读。
+const POOL_SIZE: u32 = 8;
+
 pub struct Persist {
-    conn: Mutex<Connection>,
+    pool: Pool<SqliteConnectionManager>,
 }
 
 impl Persist {
     pub fn open(path: impl AsRef<Path>) -> PersistResult<Self> {
-        let conn = Connection::open(path)?;
-        Self::init_conn(&conn)?;
-        info!("persist opened (WAL)");
-        Ok(Self {
-            conn: Mutex::new(conn),
-        })
+        let mgr = SqliteConnectionManager::file(path).with_init(|conn| {
+            Self::init_conn(conn).map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
+        });
+        let pool = Pool::builder().max_size(POOL_SIZE).build(mgr)?;
+        info!("persist opened (WAL, pool size {POOL_SIZE})");
+        Ok(Self { pool })
     }
 
     pub fn open_in_memory() -> PersistResult<Self> {
-        let conn = Connection::open_in_memory()?;
-        Self::init_conn(&conn)?;
-        debug!("persist opened (in-memory)");
-        Ok(Self {
-            conn: Mutex::new(conn),
-        })
+        // in-memory 池: 共享空 DB URL (r2d2 每连独立 open_in_memory → 各自私有 DB)。
+        // 单测用, 跨连隔离不影响 (测试均单线程串行)。WAL pragma 在 in-memory 无效但不报错。
+        let mgr = SqliteConnectionManager::memory().with_init(|conn| {
+            Self::init_conn(conn).map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
+        });
+        let pool = Pool::builder().max_size(POOL_SIZE).build(mgr)?;
+        debug!("persist opened (in-memory, pool size {POOL_SIZE})");
+        Ok(Self { pool })
     }
 
-    fn init_conn(conn: &Connection) -> PersistResult<()> {
+    fn init_conn(conn: &mut rusqlite::Connection) -> PersistResult<()> {
         conn.execute_batch(schema::PRAGMA_WAL)?;
         for p in schema::ALL_PRAGMAS {
             conn.execute_batch(p)?;
         }
-        for ddl in schema::ALL_DDL {
-            conn.execute_batch(ddl)?;
-        }
+        // §1.10: 旧版直接遍历 ALL_DDL, 无 user_version → 升级时无法区分"已建"与"需迁移",
+        // 不兼容变更只能赌 IF NOT EXISTS (加列场景失效)。改: schema::migrate 按 user_version 跑增量迁移。
+        schema::migrate(conn)?;
         Ok(())
     }
 
-    // P1: 单点锁取连, poison 不 panic 放大, 统一上抛 Poisoned (调用方按 MemoryError 决策)。
-    fn conn(&self) -> PersistResult<std::sync::MutexGuard<'_, Connection>> {
-        self.conn.lock().map_err(|_| PersistError::Poisoned)
+    // §1.1: 从池租连接 (PooledConnection DerefMut → Connection)。池满时等空连而非串行全部访问。
+    // Poisoned 语义失效 (r2d2 池无 poison, 连接 panic 自动回收), 保留错误枚举兼容上层 match。
+    fn conn(&self) -> PersistResult<r2d2::PooledConnection<SqliteConnectionManager>> {
+        self.pool
+            .get()
+            .map_err(|e| PersistError::Pool(e.to_string()))
     }
 
-    // P1: transaction 路径需 &mut Connection, 取可变 guard。
-    fn conn_mut(&self) -> PersistResult<std::sync::MutexGuard<'_, Connection>> {
-        self.conn.lock().map_err(|_| PersistError::Poisoned)
+    // §1.1: 事务路径用同一池 (WAL 写串行在 DB 层保证, 不需独立写连接)。DerefMut 支持 transaction()。
+    fn conn_mut(&self) -> PersistResult<r2d2::PooledConnection<SqliteConnectionManager>> {
+        self.pool
+            .get()
+            .map_err(|e| PersistError::Pool(e.to_string()))
     }
 
     pub fn put_memory(&self, item: &MemoryItem) -> PersistResult<()> {
@@ -104,9 +116,72 @@ impl Persist {
         Ok(())
     }
 
+    /// §2.4: put_memory + append_wop 单 transaction 原子落库。
+    /// 旧版两步独立 INSERT (put_memory commit 后 append_wop 单独 execute),
+    /// 崩溃窗口小但分叉永久静默: memory_item 行在但 wop_log 无 → follower since_seq 永拉不到。
+    /// 改: 同一 conn.transaction 包 memory_item+entity+memory_entity+wop_log, 中途任一失败全 rollback。
+    /// 返 wop seq (last_insert_rowid)。wop payload 不含向量 (follower 本地 re-embed, §6.3)。
+    pub fn put_memory_with_wop(
+        &self,
+        item: &MemoryItem,
+        wop_op: &str,
+        wop_payload: &str,
+        at: u64,
+    ) -> PersistResult<i64> {
+        let mut conn = self.conn_mut()?;
+        let tx = conn.transaction()?;
+        let entities_json = serde_json::to_string(&item.entities)?;
+        tx.execute(
+            schema::MEMORY_ITEM_DDL_INSERT,
+            params![
+                item.id,
+                item.interaction_id,
+                item.turn_idx as i64,
+                item.session_id,
+                item.memory_type.as_str(),
+                item.tier.as_str(),
+                item.content,
+                item.vector_ref,
+                item.weight,
+                item.access_count as i64,
+                item.last_accessed_timestamp as i64,
+                item.created_timestamp as i64,
+                item.provenance,
+                item.tombstone as i64,
+                item.entities_pending as i64,
+                entities_json,
+            ],
+        )?;
+        for e in &item.entities {
+            tx.execute(
+                "INSERT OR IGNORE INTO entity(id,name,aliases,entity_type) VALUES(?1,?2,?3,?4)",
+                params![
+                    e.id,
+                    e.name,
+                    serde_json::to_string(&e.aliases)?,
+                    e.entity_type.as_str()
+                ],
+            )?;
+            tx.execute(
+                "INSERT OR IGNORE INTO memory_entity(memory_id,entity_id) VALUES(?1,?2)",
+                params![item.id, e.id],
+            )?;
+        }
+        tx.execute(
+            "INSERT INTO wop_log(op,payload,at) VALUES(?1,?2,?3)",
+            params![wop_op, wop_payload, at as i64],
+        )?;
+        let seq = tx.last_insert_rowid();
+        tx.commit()?;
+        debug!(seq, op = wop_op, "put_memory_with_wop atomic");
+        Ok(seq)
+    }
+
     pub fn get_memory(&self, id: &str) -> PersistResult<Option<MemoryItem>> {
         let conn = self.conn()?;
-        let mut stmt = conn.prepare(schema::MEMORY_ITEM_DDL_SELECT_BY_ID)?;
+        // §3.12: 旧版每次 prepare(SELECT * WHERE id=?) → 每请求重新解析 SQL + 建预处理句柄。
+        // 改: prepare_cached 复用 Connection 缓存的预处理句柄 (单 conn 被 Mutex 持久化, 缓存跨调用有效)。
+        let mut stmt = conn.prepare_cached(schema::MEMORY_ITEM_DDL_SELECT_BY_ID)?;
         let row = stmt.query_row(params![id], row_to_memory).optional()?;
         Ok(row)
     }
@@ -137,6 +212,32 @@ impl Persist {
         Ok(out)
     }
 
+    /// §1.3: 按 vector_ref 集合定向查 memory_item。替代 retrieve_context 旧版 list_all 全表扫 +
+    /// HashMap (10k 记忆 ≈ 2MB clone/次, 仅为查 ~10 个 KNN 命中)。走 idx_memory_vector_ref 索引,
+    /// vector_ref 作 TEXT 存 (u64 的字符串形), IN(...) 谓词对 TEXT 索引同样命中。空集返空。
+    pub fn get_by_vector_refs(&self, vec_refs: &[u64]) -> PersistResult<Vec<MemoryItem>> {
+        if vec_refs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn()?;
+        // vector_ref 存 TEXT; 绑定 u64 → rusqlite ToSql 转 TEXT 比较一致 (插入也是 u64.to_string())。
+        let refs_str: Vec<String> = vec_refs.iter().map(|v| v.to_string()).collect();
+        let placeholders = (0..refs_str.len())
+            .map(|i| format!("?{}", i + 1))
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT * FROM memory_item WHERE tombstone=0 AND vector_ref IN ({placeholders})"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(refs_str.iter()), row_to_memory)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
     pub fn count(&self) -> PersistResult<u64> {
         let conn = self.conn()?;
         let n: i64 = conn.query_row(
@@ -145,6 +246,39 @@ impl Persist {
             |row| row.get(0),
         )?;
         Ok(n as u64)
+    }
+
+    /// §1.15: 按实体 id 反查记忆 (替代 audit_memory_access 的 list_all 全表扫)。
+    /// 旧版 list_all() 拉全表 + Rust filter → O(N) 内存扫, N 大时 audit 拖垮服务。
+    /// 改: memory_entity join 走 (memory_id, entity_id) PK 索引, 按 entity_id 子集查, 只返回命中行。
+    /// 用 `?` 占位 + rusqlite params![rusqlite::params_from_iter] 绑定变长 entity_ids。
+    pub fn audit_by_entities(&self, entity_ids: &[String]) -> PersistResult<Vec<MemoryItem>> {
+        if entity_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn()?;
+        // rarray 需扩展; 用手动 IN(?1,?2,...) 占位规避 carray/rarray 依赖, 与现有 params! 风格一致。
+        let placeholders: Vec<String> = (0..entity_ids.len())
+            .map(|i| format!("?{}", i + 1))
+            .collect();
+        let sql = format!(
+            "SELECT m.* FROM memory_item m \
+             JOIN memory_entity me ON me.memory_id = m.id \
+             WHERE me.entity_id IN ({}) AND m.tombstone = 0 \
+             ORDER BY m.created_timestamp ASC",
+            placeholders.join(", ")
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let params: Vec<&dyn rusqlite::ToSql> = entity_ids
+            .iter()
+            .map(|s| s as &dyn rusqlite::ToSql)
+            .collect();
+        let rows = stmt.query_map(params.as_slice(), row_to_memory)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
     }
 
     pub fn tombstone_memory(&self, id: &str) -> PersistResult<()> {
@@ -202,8 +336,12 @@ impl Persist {
 
     pub fn touch_access(&self, id: &str, now_ts: u64) -> PersistResult<()> {
         let conn = self.conn()?;
+        // §3.6: AND tombstone=0 — 不 bump 已软删记忆的 access_count。
+        // 旧版无此守卫: retrieve 快照读到活记忆 X 后, 并发 delete tombstone X, touch 仍 bump 其计数;
+        // 若后续 unmerge 恢复 X, 膨胀计数残留, 污染 should_promote (查 access_count >= 阈值)。
         conn.execute(
-            "UPDATE memory_item SET access_count=access_count+1, last_accessed_timestamp=?1 WHERE id=?2",
+            "UPDATE memory_item SET access_count=access_count+1, last_accessed_timestamp=?1 \
+             WHERE id=?2 AND tombstone=0",
             params![now_ts as i64, id],
         )?;
         Ok(())
@@ -229,7 +367,9 @@ impl Persist {
         // rusqlite 无绑定数组 → 用 IN (?, ?, ...) 拼占位。
         let placeholders: Vec<String> = (0..unique.len()).map(|_| "?".to_string()).collect();
         let sql = format!(
-            "UPDATE memory_item SET access_count=access_count+1, last_accessed_timestamp=?1 WHERE id IN ({})",
+            // §3.6: AND tombstone=0 — 批量 touch 不 bump 已软删记忆 (同 touch_access 守卫)。
+            "UPDATE memory_item SET access_count=access_count+1, last_accessed_timestamp=?1 \
+             WHERE id IN ({}) AND tombstone=0",
             placeholders.join(", ")
         );
         let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::with_capacity(unique.len() + 1);
@@ -311,6 +451,19 @@ impl Persist {
             out.push(r?);
         }
         Ok(out)
+    }
+
+    /// §2.6: 裁剪 seq < before_seq 的 wop 条目, 返回裁剪行数。防死 follower 致 leader wop_log
+    /// 无界增长 → 磁盘填满 → append_wop SQLITE_FULL 全局写中断。
+    /// 仅保留所有 follower 未消费的增量 (before_seq = 各 follower 已确认 seq 的最小值)。
+    /// opt-in: 调方据 FUSION_MEMORY_WOP_RETENTION 决定是否裁剪 (默认不裁, 保守防丢增量)。
+    pub fn prune_wop_before(&self, before_seq: i64) -> PersistResult<usize> {
+        let conn = self.conn()?;
+        let n = conn.execute("DELETE FROM wop_log WHERE seq < ?1", params![before_seq])?;
+        if n > 0 {
+            info!(pruned = n, before_seq, "wop_log pruned (§2.6 retention)");
+        }
+        Ok(n)
     }
 
     pub fn record_merge(
@@ -419,15 +572,29 @@ ORDER BY first_hop ASC LIMIT ?3";
     /// 更新实体别名 (LLM 候选写入, A5: 仅候选不作判定)。
     pub fn append_entity_alias(&self, entity_id: &str, alias: &str) -> PersistResult<()> {
         let conn = self.conn()?;
-        let row: Option<String> = conn
-            .query_row(
-                "SELECT aliases FROM entity WHERE id=?1",
-                params![entity_id],
-                |row| row.get(0),
-            )
-            .ok();
+        // §3.17: 旧版 .ok() 把 SQLITE_BUSY 吞成 None → 别名静默丢失; .unwrap_or_default() 把坏 JSON 吞成空 → 旧别名覆盖丢失。
+        // 改: 区分 QueryReturnedNoRows (实体不存在, 正常 None) vs 真错误 (含 Busy) 上抛; 坏 JSON warn 留痕不静默。
+        let row: Option<String> = match conn.query_row(
+            "SELECT aliases FROM entity WHERE id=?1",
+            params![entity_id],
+            |row| row.get(0),
+        ) {
+            Ok(v) => Some(v),
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(e) => return Err(e.into()),
+        };
         if let Some(aliases_json) = row {
-            let mut aliases: Vec<String> = serde_json::from_str(&aliases_json).unwrap_or_default();
+            let mut aliases: Vec<String> = match serde_json::from_str(&aliases_json) {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!(
+                        entity_id = %entity_id,
+                        error = %e,
+                        "append_entity_alias: aliases JSON corrupt, resetting to empty"
+                    );
+                    Vec::new()
+                }
+            };
             if !aliases.iter().any(|a| a.eq_ignore_ascii_case(alias)) {
                 aliases.push(alias.to_string());
                 let new_json = serde_json::to_string(&aliases)?;
@@ -445,11 +612,17 @@ ORDER BY first_hop ASC LIMIT ?3";
     /// 上次 consolidate 的 started_at (增量扫描边界)。无记录返 0。
     pub fn last_consolidate_at(&self) -> PersistResult<u64> {
         let conn = self.conn()?;
-        let at: Option<i64> = conn
-            .query_row("SELECT MAX(started_at) FROM consolidation_log", [], |row| {
+        // §3.5: 旧版 .ok().unwrap_or(0) 把 SQLITE_BUSY 吞成 0 → 调用方误判"从未 consolidate"
+        // → 每次都全表扫重算 (consolidate 突发忙时退化为 O(N) 扫描, 越忙越慢)。
+        // 改: 区分无记录 (MAX 返 NULL→row.get(0) 对 Option<i64> 得 None, 或空表 QueryReturnedNoRows) vs 真错误上抛。
+        let at: Option<i64> =
+            match conn.query_row("SELECT MAX(started_at) FROM consolidation_log", [], |row| {
                 row.get(0)
-            })
-            .ok();
+            }) {
+                Ok(v) => v,
+                Err(rusqlite::Error::QueryReturnedNoRows) => None,
+                Err(e) => return Err(e.into()),
+            };
         Ok(at.unwrap_or(0) as u64)
     }
 
@@ -575,20 +748,52 @@ const _: () = {
 };
 
 fn row_to_memory(row: &rusqlite::Row) -> rusqlite::Result<MemoryItem> {
+    let id: String = row.get("id")?;
     let memory_type_str: String = row.get("memory_type")?;
     let tier_str: String = row.get("tier")?;
     let entities_json: String = row.get("entities_json")?;
-    let entities: Vec<EntityNode> =
-        serde_json::from_str(&entities_json).unwrap_or_else(|_| Vec::new());
+    // §3.2: 坏 JSON 静默成空实体 → 图边消失但源记忆仍指旧 vector_ref, consolidate 当新鲜 episodic 处理。
+    // 改: 坏 JSON warn 留痕 (仍降级空 Vec 保服务连续, 不 panic), 运维可据 warn 定位损坏行。
+    let entities: Vec<EntityNode> = match serde_json::from_str(&entities_json) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(id = %id, error = %e, "row_to_memory: entities_json corrupt, degraded to empty");
+            Vec::new()
+        }
+    };
     let tombstone_i: i64 = row.get("tombstone")?;
     let pending_i: i64 = row.get("entities_pending")?;
+    // §3.2: 未知 enum 字符串静默降级默认 → 记忆语义被改写 (Procedural 被截断成 Episodic)。
+    // 改: 未知值 warn 留痕 (仍降级默认保服务连续)。
+    let memory_type = match MemoryType::parse(&memory_type_str) {
+        Some(t) => t,
+        None => {
+            warn!(
+                id = %id,
+                raw = %memory_type_str,
+                "row_to_memory: unknown memory_type, degraded to Episodic"
+            );
+            MemoryType::Episodic
+        }
+    };
+    let tier = match MemoryTier::parse(&tier_str) {
+        Some(t) => t,
+        None => {
+            warn!(
+                id = %id,
+                raw = %tier_str,
+                "row_to_memory: unknown tier, degraded to Short"
+            );
+            MemoryTier::Short
+        }
+    };
     Ok(MemoryItem {
-        id: row.get("id")?,
+        id,
         interaction_id: row.get("interaction_id")?,
         turn_idx: row.get::<_, i64>("turn_idx")? as u32,
         session_id: row.get("session_id")?,
-        memory_type: MemoryType::parse(&memory_type_str).unwrap_or(MemoryType::Episodic),
-        tier: MemoryTier::parse(&tier_str).unwrap_or(MemoryTier::Short),
+        memory_type,
+        tier,
         content: row.get("content")?,
         entities,
         vector_ref: row.get("vector_ref")?,
@@ -651,8 +856,7 @@ mod tests {
         assert_eq!(got.entities[0].id, "ent-a");
         // memory_entity 行存在 (FK 关联)
         let n: i64 = p
-            .conn
-            .lock()
+            .conn()
             .unwrap()
             .query_row(
                 "SELECT COUNT(*) FROM memory_entity WHERE memory_id=?1",
@@ -677,8 +881,7 @@ mod tests {
         p.physical_delete("m-del").unwrap();
         assert!(p.get_memory("m-del").unwrap().is_none(), "memory_item 应删");
         let n: i64 = p
-            .conn
-            .lock()
+            .conn()
             .unwrap()
             .query_row(
                 "SELECT COUNT(*) FROM memory_entity WHERE memory_id=?1",
@@ -987,5 +1190,80 @@ mod tests {
 
         // 不存在的 entity 不抛错
         assert!(p.append_entity_alias("ghost", "x").is_ok());
+    }
+
+    // §1.10: init_conn 后 user_version 应 == SCHEMA_VERSION, 重复 open 幂等 (migrate 不重跑)。
+    #[test]
+    fn migrate_sets_user_version() {
+        let p = Persist::open_in_memory().unwrap();
+        let c = p.conn().unwrap();
+        let v = schema::user_version(&c).unwrap();
+        assert_eq!(v, schema::SCHEMA_VERSION);
+        // 再 migrate 一次应 no-op (from >= to 早返)
+        schema::migrate(&c).unwrap();
+        assert_eq!(schema::user_version(&c).unwrap(), schema::SCHEMA_VERSION);
+    }
+
+    // §1.10: idx_memory_entity_eid 索引存在 (audit_by_entities 反查依赖)。
+    #[test]
+    fn schema_has_memory_entity_eid_index() {
+        let p = Persist::open_in_memory().unwrap();
+        let n: i64 = p
+            .conn()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_memory_entity_eid'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1);
+    }
+
+    // §1.15: audit_by_entities 走 memory_entity join, 只返回命中 entity 的记忆。
+    #[test]
+    fn audit_by_entities_join() {
+        let p = Persist::open_in_memory().unwrap();
+        let mut m1 = sample_item("m-a1", "ix1", 0);
+        m1.entities.push(EntityNode::new(
+            "ent-a".into(),
+            "A".into(),
+            EntityType::Tech,
+        ));
+        let mut m2 = sample_item("m-a2", "ix2", 0);
+        m2.entities.push(EntityNode::new(
+            "ent-b".into(),
+            "B".into(),
+            EntityType::Tech,
+        ));
+        p.put_memory(&m1).unwrap();
+        p.put_memory(&m2).unwrap();
+
+        let hit_a = p.audit_by_entities(&["ent-a".into()]).unwrap();
+        assert_eq!(hit_a.len(), 1);
+        assert_eq!(hit_a[0].id, "m-a1");
+
+        let hit_both = p
+            .audit_by_entities(&["ent-a".into(), "ent-b".into()])
+            .unwrap();
+        assert_eq!(hit_both.len(), 2);
+
+        assert!(p.audit_by_entities(&[]).unwrap().is_empty());
+    }
+
+    // §1.15: tombstone 记忆不被 audit 返回 (join 带 m.tombstone=0)。
+    #[test]
+    fn audit_by_entities_excludes_tombstone() {
+        let p = Persist::open_in_memory().unwrap();
+        let mut m = sample_item("m-tb", "ix1", 0);
+        m.entities.push(EntityNode::new(
+            "ent-t".into(),
+            "T".into(),
+            EntityType::Tech,
+        ));
+        p.put_memory(&m).unwrap();
+        p.tombstone_memory("m-tb").unwrap();
+        let hit = p.audit_by_entities(&["ent-t".into()]).unwrap();
+        assert!(hit.is_empty(), "tombstone 记忆不应出现在 audit");
     }
 }

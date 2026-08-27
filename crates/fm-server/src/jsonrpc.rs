@@ -5,6 +5,7 @@
 //!      + delete_scope/count (issue #2 fusion-agent-studio adapter 契约)。
 //! delete/delete_scope 需 params.confirm=true（B5 二次确认）。
 
+use axum::http::StatusCode;
 use fm_core::{
     ConsolidationReport, FormattedContext, Interaction, MemoryId, MemoryItem, RetrieveQuery,
 };
@@ -67,23 +68,67 @@ impl RpcError {
             message: msg.into(),
         }
     }
+    // §3.1: NotFound → -32001 (server error 段, 永久)。客户端 fail-fast, 不重试。
+    pub fn not_found(msg: impl Into<String>) -> Self {
+        Self {
+            code: -32001,
+            message: msg.into(),
+        }
+    }
+    // §2.8: Poisoned → -32002 (永久, 需重启)。运维据此识别锁中毒。
+    pub fn poisoned(msg: impl Into<String>) -> Self {
+        Self {
+            code: -32002,
+            message: msg.into(),
+        }
+    }
+    // §2.8/§3.1: Busy → -32003 (瞬时, 可重试)。客户端退避后重试。
+    pub fn busy(msg: impl Into<String>) -> Self {
+        Self {
+            code: -32003,
+            message: msg.into(),
+        }
+    }
+
+    // §3.1: 按 MemoryError 分类返回码。NotFound→-32001, Poisoned→-32002, Busy→-32003, 其余→-32603。
+    // 旧版全压 -32603 internal, 客户端无法区分 "引擎 bug"/"id 不存在"/"瞬时 busy"/"锁中毒"。
+    pub fn from_engine(e: &fm_core::MemoryError) -> Self {
+        if e.is_not_found() {
+            Self::not_found(e.to_string())
+        } else if matches!(e, fm_core::MemoryError::Poisoned) {
+            Self::poisoned(e.to_string())
+        } else if e.retryable() {
+            Self::busy(e.to_string())
+        } else {
+            Self::internal(e.to_string())
+        }
+    }
 }
 
-/// dispatch 单个请求。engine 经 EngineHandle 持有（Arc dyn trait）。
-pub async fn dispatch(req: &RpcRequest, engine: &EngineHandle) -> RpcResponse {
-    debug!(method = %req.method, "rpc dispatch");
-    let res: Result<Value, RpcError> = match req.method.as_str() {
-        "commit" => commit(req, engine).await,
-        "retrieve" => retrieve(req, engine).await,
+/// §3.8: dispatch 取 owned RpcRequest, 各 handler 取 owned params, 消除 `req.params.clone()` 深克隆。
+/// 旧版 8 handler 全 `serde_json::from_value(req.params.clone())` — 已反序列化的 params 再深克隆整树再解析。
+/// id 仍 clone 进响应 (Value 多为小整数/字符串, 克隆廉价, 响应需保留 id 不可避免)。
+pub async fn dispatch(req: RpcRequest, engine: &EngineHandle) -> RpcResponse {
+    // 拆字段: method 仅借用做匹配, params move 进 handler, id move 进响应。
+    let RpcRequest {
+        method,
+        params,
+        id,
+        jsonrpc: _,
+    } = req;
+    debug!(method = %method, "rpc dispatch");
+    let res: Result<Value, RpcError> = match method.as_str() {
+        "commit" => commit(params, engine).await,
+        "retrieve" => retrieve(params, engine).await,
         // issue #1/#4: fusion-event 契约别名 (text-in, fused shape out)。
-        "memory.retrieve_context" => retrieve_context_contract(req, engine).await,
+        "memory.retrieve_context" => retrieve_context_contract(params, engine).await,
         "consolidate" => consolidate(engine).await,
-        "get" => get(req, engine).await,
-        "delete" => delete(req, engine).await,
+        "get" => get(params, engine).await,
+        "delete" => delete(params, engine).await,
         // issue #2: fusion-agent-studio adapter 契约 (scope 批量删 + 计数)。
-        "delete_scope" => delete_scope(req, engine).await,
-        "count" => count(req, engine).await,
-        "audit" => audit(req, engine).await,
+        "delete_scope" => delete_scope(params, engine).await,
+        "count" => count(params, engine).await,
+        "audit" => audit(params, engine).await,
         "health" => Ok(Value::String("ok".into())),
         other => Err(RpcError::method_not_found(other)),
     };
@@ -92,7 +137,7 @@ pub async fn dispatch(req: &RpcRequest, engine: &EngineHandle) -> RpcResponse {
             jsonrpc: "2.0".into(),
             result: Some(v),
             error: None,
-            id: req.id.clone(),
+            id,
         },
         Err(e) => {
             warn!(code = e.code, msg = %e.message, "rpc error");
@@ -100,9 +145,41 @@ pub async fn dispatch(req: &RpcRequest, engine: &EngineHandle) -> RpcResponse {
                 jsonrpc: "2.0".into(),
                 result: None,
                 error: Some(e),
-                id: req.id.clone(),
+                id,
             }
         }
+    }
+}
+
+/// §3.18: 序列化 RpcResponse 为 JSON 行, 永不发畸形 `{}`。
+/// 旧版 uds `to_string(&resp).unwrap_or_else(|_| "{}".into())` — 序列化失败客户端收字面 `{}`,
+/// 无 jsonrpc/id/error 字段, 客户端解析器失配/挂起、不知哪个 request id 失败。
+/// 改: 主序列化失败 → 降级为合法 jsonrpc 2.0 error 帧 (id=null, code=-32603); 该帧再失败 → 字面量兜底。
+pub fn serialize_response(resp: &RpcResponse) -> String {
+    serde_json::to_string(resp).unwrap_or_else(|e| {
+        warn!(%e, "rpc response serialize failed, emitting error frame");
+        serde_json::to_string(&RpcResponse {
+            jsonrpc: "2.0".into(),
+            result: None,
+            error: Some(RpcError::internal(format!("serialize failed: {e}"))),
+            id: Value::Null,
+        })
+        .unwrap_or_else(|_| {
+            r#"{"jsonrpc":"2.0","result":null,"error":{"code":-32603,"message":"serialize failed"},"id":null}"#
+                .into()
+        })
+    })
+}
+
+/// §2.9: RPC 错误码 → HTTP 状态码映射。引擎侧错误不再埋进 200 body。
+/// -32700/-32601/-32602 (parse/method/params) → 400; -32001 NotFound → 404;
+/// -32002 Poisoned/-32003 Busy → 503; -32603 internal → 500。
+pub fn http_status_for_error(code: i64) -> StatusCode {
+    match code {
+        -32700 | -32601 | -32602 => StatusCode::BAD_REQUEST,
+        -32001 => StatusCode::NOT_FOUND,
+        -32002 | -32003 => StatusCode::SERVICE_UNAVAILABLE,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
 
@@ -113,13 +190,13 @@ struct CommitParams {
     interaction: Interaction,
 }
 
-async fn commit(req: &RpcRequest, engine: &EngineHandle) -> Result<Value, RpcError> {
-    let p: CommitParams = serde_json::from_value(req.params.clone())
-        .map_err(|e| RpcError::invalid_params(e.to_string()))?;
+async fn commit(params: Value, engine: &EngineHandle) -> Result<Value, RpcError> {
+    let p: CommitParams =
+        serde_json::from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
     let ids: Vec<MemoryId> = engine
         .commit_episodic_memory(&p.session_id, &p.interaction)
         .await
-        .map_err(|e| RpcError::internal(e.to_string()))?;
+        .map_err(|e| RpcError::from_engine(&e))?;
     serde_json::to_value(ids.iter().map(|i| i.0.clone()).collect::<Vec<_>>())
         .map_err(|e| RpcError::internal(e.to_string()))
 }
@@ -148,9 +225,9 @@ fn default_true() -> bool {
     true
 }
 
-async fn retrieve(req: &RpcRequest, engine: &EngineHandle) -> Result<Value, RpcError> {
-    let p: RetrieveParams = serde_json::from_value(req.params.clone())
-        .map_err(|e| RpcError::invalid_params(e.to_string()))?;
+async fn retrieve(params: Value, engine: &EngineHandle) -> Result<Value, RpcError> {
+    let p: RetrieveParams =
+        serde_json::from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
     let q = RetrieveQuery {
         text: p.text,
         top_k: p.top_k,
@@ -162,7 +239,7 @@ async fn retrieve(req: &RpcRequest, engine: &EngineHandle) -> Result<Value, RpcE
     let ctx: FormattedContext = engine
         .retrieve_context(&q)
         .await
-        .map_err(|e| RpcError::internal(e.to_string()))?;
+        .map_err(|e| RpcError::from_engine(&e))?;
     serde_json::to_value(ctx).map_err(|e| RpcError::internal(e.to_string()))
 }
 
@@ -170,7 +247,7 @@ async fn consolidate(engine: &EngineHandle) -> Result<Value, RpcError> {
     let report: ConsolidationReport = engine
         .consolidate_memories()
         .await
-        .map_err(|e| RpcError::internal(e.to_string()))?;
+        .map_err(|e| RpcError::from_engine(&e))?;
     serde_json::to_value(report).map_err(|e| RpcError::internal(e.to_string()))
 }
 
@@ -180,13 +257,13 @@ struct GetParams {
     id: String,
 }
 
-async fn get(req: &RpcRequest, engine: &EngineHandle) -> Result<Value, RpcError> {
-    let p: GetParams = serde_json::from_value(req.params.clone())
-        .map_err(|e| RpcError::invalid_params(e.to_string()))?;
+async fn get(params: Value, engine: &EngineHandle) -> Result<Value, RpcError> {
+    let p: GetParams =
+        serde_json::from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
     let m: Option<MemoryItem> = engine
         .get_memory(&p.id)
         .await
-        .map_err(|e| RpcError::internal(e.to_string()))?;
+        .map_err(|e| RpcError::from_engine(&e))?;
     serde_json::to_value(m).map_err(|e| RpcError::internal(e.to_string()))
 }
 
@@ -198,9 +275,9 @@ struct DeleteParams {
     confirm: bool,
 }
 
-async fn delete(req: &RpcRequest, engine: &EngineHandle) -> Result<Value, RpcError> {
-    let p: DeleteParams = serde_json::from_value(req.params.clone())
-        .map_err(|e| RpcError::invalid_params(e.to_string()))?;
+async fn delete(params: Value, engine: &EngineHandle) -> Result<Value, RpcError> {
+    let p: DeleteParams =
+        serde_json::from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
     if !p.confirm {
         return Err(RpcError::invalid_params(
             "delete requires confirm=true (B5 二次确认)",
@@ -209,7 +286,7 @@ async fn delete(req: &RpcRequest, engine: &EngineHandle) -> Result<Value, RpcErr
     engine
         .delete_memory(&p.id)
         .await
-        .map_err(|e| RpcError::internal(e.to_string()))?;
+        .map_err(|e| RpcError::from_engine(&e))?;
     Ok(Value::String("deleted".into()))
 }
 
@@ -219,13 +296,13 @@ struct AuditParams {
     entity_ids: Vec<String>,
 }
 
-async fn audit(req: &RpcRequest, engine: &EngineHandle) -> Result<Value, RpcError> {
-    let p: AuditParams = serde_json::from_value(req.params.clone())
-        .map_err(|e| RpcError::invalid_params(e.to_string()))?;
+async fn audit(params: Value, engine: &EngineHandle) -> Result<Value, RpcError> {
+    let p: AuditParams =
+        serde_json::from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
     let ms: Vec<MemoryItem> = engine
         .audit_memory_access(&p.entity_ids)
         .await
-        .map_err(|e| RpcError::internal(e.to_string()))?;
+        .map_err(|e| RpcError::from_engine(&e))?;
     serde_json::to_value(ms).map_err(|e| RpcError::internal(e.to_string()))
 }
 
@@ -237,9 +314,9 @@ struct DeleteScopeParams {
     confirm: bool,
 }
 
-async fn delete_scope(req: &RpcRequest, engine: &EngineHandle) -> Result<Value, RpcError> {
-    let p: DeleteScopeParams = serde_json::from_value(req.params.clone())
-        .map_err(|e| RpcError::invalid_params(e.to_string()))?;
+async fn delete_scope(params: Value, engine: &EngineHandle) -> Result<Value, RpcError> {
+    let p: DeleteScopeParams =
+        serde_json::from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
     if !p.confirm {
         return Err(RpcError::invalid_params(
             "delete_scope requires confirm=true (B5 二次确认)",
@@ -248,7 +325,7 @@ async fn delete_scope(req: &RpcRequest, engine: &EngineHandle) -> Result<Value, 
     let n = engine
         .delete_scope(&p.scope)
         .await
-        .map_err(|e| RpcError::internal(e.to_string()))?;
+        .map_err(|e| RpcError::from_engine(&e))?;
     serde_json::to_value(serde_json::json!({"deleted_count": n}))
         .map_err(|e| RpcError::internal(e.to_string()))
 }
@@ -260,13 +337,13 @@ struct CountParams {
     scope: Option<String>,
 }
 
-async fn count(req: &RpcRequest, engine: &EngineHandle) -> Result<Value, RpcError> {
-    let p: CountParams = serde_json::from_value(req.params.clone())
-        .map_err(|e| RpcError::invalid_params(e.to_string()))?;
+async fn count(params: Value, engine: &EngineHandle) -> Result<Value, RpcError> {
+    let p: CountParams =
+        serde_json::from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
     let n = engine
         .count(p.scope.as_deref())
         .await
-        .map_err(|e| RpcError::internal(e.to_string()))?;
+        .map_err(|e| RpcError::from_engine(&e))?;
     serde_json::to_value(serde_json::json!({"count": n}))
         .map_err(|e| RpcError::internal(e.to_string()))
 }
@@ -288,11 +365,11 @@ struct RetrieveContextContractParams {
 /// 契约返回: {context, memory_ids, cache_hit}。context = block turns_text 拼接;
 /// memory_ids = 命中 interaction_id 去重列表; cache_hit 恒 false (memory 端不缓存, 调用方自管 TTL)。
 async fn retrieve_context_contract(
-    req: &RpcRequest,
+    params: Value,
     engine: &EngineHandle,
 ) -> Result<Value, RpcError> {
-    let p: RetrieveContextContractParams = serde_json::from_value(req.params.clone())
-        .map_err(|e| RpcError::invalid_params(e.to_string()))?;
+    let p: RetrieveContextContractParams =
+        serde_json::from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
     debug!(trigger = %p.trigger_id, node = %p.node_id, "memory.retrieve_context contract");
     let q = RetrieveQuery {
         text: p.query,
@@ -305,16 +382,18 @@ async fn retrieve_context_contract(
     let ctx: FormattedContext = engine
         .retrieve_context(&q)
         .await
-        .map_err(|e| RpcError::internal(e.to_string()))?;
+        .map_err(|e| RpcError::from_engine(&e))?;
     let context = ctx
         .blocks
         .iter()
         .map(|b| b.turns_text.as_str())
         .collect::<Vec<_>>()
         .join("\n---\n");
+    // §3.13: 旧版 `Vec::contains` O(n)/次 → O(n²) 块数 (100 块 = 1 万次串比较)。改 HashSet 去重 O(1)。
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut memory_ids: Vec<String> = Vec::new();
     for b in &ctx.blocks {
-        if !memory_ids.contains(&b.interaction_id) {
+        if seen.insert(b.interaction_id.clone()) {
             memory_ids.push(b.interaction_id.clone());
         }
     }
@@ -375,9 +454,37 @@ mod tests {
         assert_eq!(RpcError::method_not_found("x").code, -32601);
         assert_eq!(RpcError::invalid_params("e").code, -32602);
         assert_eq!(RpcError::internal("e").code, -32603);
+        // §3.1 新增分类码
+        assert_eq!(RpcError::not_found("e").code, -32001);
+        assert_eq!(RpcError::poisoned("e").code, -32002);
+        assert_eq!(RpcError::busy("e").code, -32003);
+    }
+
+    // §3.1: from_engine 按 MemoryError 分类返回码。
+    #[test]
+    fn from_engine_classifies() {
+        assert_eq!(
+            RpcError::from_engine(&fm_core::MemoryError::NotFound("x".into())).code,
+            -32001
+        );
+        assert_eq!(
+            RpcError::from_engine(&fm_core::MemoryError::Poisoned).code,
+            -32002
+        );
+        assert_eq!(
+            RpcError::from_engine(&fm_core::MemoryError::Busy("x".into())).code,
+            -32003
+        );
+        assert_eq!(
+            RpcError::from_engine(&fm_core::MemoryError::Sqlite("boom".into())).code,
+            -32603
+        );
     }
 
     // ---- dispatch 全方法覆盖（StubEngine，不连 mlx）----
+    // §1.12: 本组为 dispatch 路由接线测试 (StubEngine 返常量, 证 "wire passes params"),
+    // 非行为测试。真实 MemoryEngine 经 HTTP/JSON-RPC 的行为覆盖见
+    // tests/offline_integration.rs + tests/consumer_scenarios.rs (stub engine, 真栈往返)。
 
     use crate::engine_handle::EngineHandle;
     use fm_core::{
@@ -412,6 +519,8 @@ mod tests {
             Ok(FormattedContext {
                 blocks: vec![],
                 total_tokens: 7,
+                stale_read: false,
+                last_sync_at: 0,
             })
         }
         async fn consolidate_memories(&self) -> fm_core::MemoryResult<ConsolidationReport> {
@@ -476,13 +585,13 @@ mod tests {
     }
 
     async fn dispatch_ok(req: &RpcRequest, eng: &EngineHandle) -> Value {
-        let resp = dispatch(req, eng).await;
+        let resp = dispatch(req.clone(), eng).await;
         assert!(resp.error.is_none(), "unexpected error: {:?}", resp.error);
         resp.result.expect("missing result")
     }
 
     async fn dispatch_err(req: &RpcRequest, eng: &EngineHandle) -> RpcError {
-        let resp = dispatch(req, eng).await;
+        let resp = dispatch(req.clone(), eng).await;
         resp.error.expect("expected error, got result")
     }
 
@@ -647,5 +756,112 @@ mod tests {
     fn parse_line_rejects_garbage() {
         assert!(parse_line("not json").is_none());
         assert!(parse_line("").is_none());
+    }
+
+    // §2.9: RPC 错误码 → HTTP 状态码映射。引擎错误不再埋进 200 body。
+    #[test]
+    fn http_status_mapping() {
+        use axum::http::StatusCode;
+        assert_eq!(http_status_for_error(-32700), StatusCode::BAD_REQUEST);
+        assert_eq!(http_status_for_error(-32601), StatusCode::BAD_REQUEST);
+        assert_eq!(http_status_for_error(-32602), StatusCode::BAD_REQUEST);
+        assert_eq!(http_status_for_error(-32001), StatusCode::NOT_FOUND);
+        assert_eq!(
+            http_status_for_error(-32002),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            http_status_for_error(-32003),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            http_status_for_error(-32603),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(
+            http_status_for_error(-99999),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    // §3.18: serialize_response 永不发畸形 `{}`, 序列化失败降级合法 jsonrpc error 帧。
+    #[test]
+    fn serialize_response_is_valid_jsonrpc() {
+        let resp = RpcResponse {
+            jsonrpc: "2.0".into(),
+            result: Some(Value::String("ok".into())),
+            error: None,
+            id: Value::from(1i64),
+        };
+        let s = serialize_response(&resp);
+        let v: Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["jsonrpc"], "2.0");
+        assert_eq!(v["result"], "ok");
+        assert_eq!(v["id"], 1);
+    }
+
+    // §3.13: retrieve_context_contract 去重保留首现顺序, HashSet O(1) 替 Vec::contains O(n)。
+    #[tokio::test]
+    async fn dispatch_retrieve_context_contract_dedup() {
+        // 造 stub 返多块同 interaction_id, 验证 memory_ids 去重且顺序保留。
+        struct DupStub;
+        #[async_trait::async_trait]
+        impl fm_core::FusionMemoryEngine for DupStub {
+            async fn commit_episodic_memory(
+                &self,
+                _: &str,
+                _: &Interaction,
+            ) -> fm_core::MemoryResult<Vec<MemoryId>> {
+                Ok(vec![])
+            }
+            async fn retrieve_context(
+                &self,
+                _: &RetrieveQuery,
+            ) -> fm_core::MemoryResult<FormattedContext> {
+                use fm_core::context::ContextBlock;
+                use fm_core::MemoryType;
+                let mk = |iid: &str, txt: &str| ContextBlock {
+                    interaction_id: iid.into(),
+                    turns: vec![],
+                    memory_type: MemoryType::Episodic,
+                    turns_text: txt.into(),
+                    score: 0.0,
+                    source_entities: vec![],
+                };
+                Ok(FormattedContext {
+                    blocks: vec![mk("ixA", "t1"), mk("ixA", "t2"), mk("ixB", "t3")],
+                    total_tokens: 3,
+                    stale_read: false,
+                    last_sync_at: 0,
+                })
+            }
+            async fn consolidate_memories(&self) -> fm_core::MemoryResult<ConsolidationReport> {
+                Ok(ConsolidationReport::default())
+            }
+            async fn get_memory(&self, _: &str) -> fm_core::MemoryResult<Option<MemoryItem>> {
+                Ok(None)
+            }
+            async fn delete_memory(&self, _: &str) -> fm_core::MemoryResult<()> {
+                Ok(())
+            }
+            async fn audit_memory_access(
+                &self,
+                _: &[String],
+            ) -> fm_core::MemoryResult<Vec<MemoryItem>> {
+                Ok(vec![])
+            }
+        }
+        let eng = EngineHandle::from_concrete(DupStub);
+        let v = dispatch_ok(
+            &rpc(
+                "memory.retrieve_context",
+                serde_json::json!({"query":"q"}),
+                17,
+            ),
+            &eng,
+        )
+        .await;
+        let ids: Vec<String> = serde_json::from_value(v["memory_ids"].clone()).unwrap();
+        assert_eq!(ids, vec!["ixA".to_string(), "ixB".to_string()]);
     }
 }

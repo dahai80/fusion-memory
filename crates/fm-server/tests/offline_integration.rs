@@ -109,11 +109,11 @@ async fn http_auth_enforced_on_real_engine() {
 
 #[tokio::test]
 async fn http_delete_without_confirm_rejected_on_real_engine() {
-    // delete 无 confirm=true → -32602 invalid_params (B5 二次确认)
+    // delete 无 confirm=true → -32602 invalid_params (B5 二次确认)。§2.9: 映射 HTTP 400。
     let st = stub_state();
     let app = fm_server::http::app(st);
     let body = r#"{"jsonrpc":"2.0","method":"delete","params":{"id":"m1"},"id":1}"#;
     let (code, body) = post(&app, "/v1/memory/delete", body, Some("Bearer test-key")).await;
-    assert_eq!(code, 200);
+    assert_eq!(code, 400);
     assert!(body.contains("-32602"), "delete body={body}");
 }

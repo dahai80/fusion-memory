@@ -15,6 +15,12 @@ pub mod transport;
 pub use config::{ClusterConfig, SyncConfig};
 pub use error::{ClusterError, ClusterResult};
 pub use protocol::{Frame, FrameKind, Hello, SyncRequest, SyncResponse};
-pub use replay::{replay_wops, ReplayOutcome, ReplaySink, WopSource};
-pub use role::{detect_role, detect_role_with_home, write_role_file, NodeRole};
+pub use replay::{
+    decode_commit_payload, encode_commit_payload, replay_wops, CommitEnvelope, ReplayOutcome,
+    ReplaySink, WopSource,
+};
+pub use role::{
+    detect_role, detect_role_with_home, read_epoch_file, write_epoch_file, write_role_file,
+    NodeRole,
+};
 pub use transport::{Follower, Leader};

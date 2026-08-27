@@ -15,11 +15,26 @@ pub fn check_bearer(headers: &HeaderMap, api_key: &str) -> Result<(), Response> 
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     let expected = format!("Bearer {api_key}");
-    if auth == expected {
+    // §2.12: 旧版 `auth == expected` 用 String::eq 首字节失配即短路 → 时序侧信道逐字节泄漏 token。
+    // 改: 常时比较 (同 fm-cluster transport.rs), 全字节遍历 XOR 累积, 不短路。
+    if constant_time_eq(auth.as_bytes(), expected.as_bytes()) {
         Ok(())
     } else {
         Err((StatusCode::UNAUTHORIZED, "unauthorized").into_response())
     }
+}
+
+/// §2.12: 常时字节比较。长度不等先返 false (长度本身非敏感), 等长则全字节 XOR 累积不短路。
+/// 与 fm-cluster/src/transport.rs::constant_time_eq 同模式, 避免引入外部 crate。
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff: u8 = 0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 #[cfg(test)]

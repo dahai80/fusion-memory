@@ -18,6 +18,17 @@ pub enum PersistError {
     // P1: Mutex poison — 持锁线程 panic 后续不再 panic 放大, 上抛 Err 让调用方决策。
     #[error("persist conn lock poisoned (prior panic in critical section)")]
     Poisoned,
+
+    // §1.1: r2d2 连接池错误 (池满超时/连接初始化失败)。
+    #[error("connection pool error: {0}")]
+    Pool(String),
+}
+
+// §1.1: r2d2::Error → PersistError::Pool (供 Pool::builder().build()? 的 ? 转换)。
+impl From<r2d2::Error> for PersistError {
+    fn from(e: r2d2::Error) -> Self {
+        PersistError::Pool(e.to_string())
+    }
 }
 
 impl PersistError {
@@ -25,12 +36,36 @@ impl PersistError {
         match self {
             PersistError::Serde(e) => fm_core::MemoryError::Serde(e),
             PersistError::Io(e) => fm_core::MemoryError::Io(e),
-            PersistError::Sqlite(e) => fm_core::MemoryError::Sqlite(e.to_string()),
-            PersistError::Poisoned => {
-                fm_core::MemoryError::Sqlite("persist conn lock poisoned".into())
+            // §2.8: Poisoned → MemoryError::Poisoned (非 Sqlite 字符串)。
+            // 旧版压成 Sqlite("...poisoned"), 运维误当 sqlite 错误跑 VACUUM, 真诊断 (重启) 被隐藏。
+            PersistError::Poisoned => fm_core::MemoryError::Poisoned,
+            // §1.1: 池错误 (满/超时/初始化) → Busy (瞬时可重试) 或 Sqlite。保守判字符串含 busy/timeout → Busy。
+            PersistError::Pool(s) => {
+                if s.to_lowercase().contains("timed out") || s.to_lowercase().contains("busy") {
+                    fm_core::MemoryError::Busy(s)
+                } else {
+                    fm_core::MemoryError::Sqlite(s)
+                }
+            }
+            // §2.8/§3.5: SQLITE_BUSY (SQLITE_BUSY/locked) → MemoryError::Busy (可重试)。
+            // 旧版全压成 Sqlite 字符串, 调用方无法区分瞬时 vs 永久, 且 §3.5 被 .ok() 吞成全表扫。
+            PersistError::Sqlite(e) => {
+                if sqlite_is_busy(&e) {
+                    fm_core::MemoryError::Busy(e.to_string())
+                } else {
+                    fm_core::MemoryError::Sqlite(e.to_string())
+                }
             }
         }
     }
+}
+
+// SQLITE_BUSY (code 5) / SQLITE_LOCKED (code 6) → 瞬时可重试。其余按永久处理。
+fn sqlite_is_busy(e: &rusqlite::Error) -> bool {
+    if let Some(code) = e.sqlite_extended_error_code() {
+        return code == 5 || code == 6;
+    }
+    e.to_string().to_lowercase().contains("busy")
 }
 
 #[cfg(test)]
@@ -58,5 +93,20 @@ mod tests {
         let e = PersistError::Sqlite(rusqlite::Error::InvalidQuery);
         let m = e.to_memory();
         assert!(matches!(m, fm_core::MemoryError::Sqlite(_)));
+    }
+
+    // §2.8: Poisoned → MemoryError::Poisoned (非 Sqlite 字符串)。运维可据此区分锁中毒 vs sqlite 错误。
+    #[test]
+    fn poisoned_to_memory_poisoned() {
+        let m = PersistError::Poisoned.to_memory();
+        assert!(matches!(m, fm_core::MemoryError::Poisoned));
+        assert!(!m.retryable(), "Poisoned 永久, 不可重试");
+    }
+
+    // §2.8: Poisoned 非 NotFound (is_not_found=false)。
+    #[test]
+    fn poisoned_not_found_flag() {
+        let m = PersistError::Poisoned.to_memory();
+        assert!(!m.is_not_found());
     }
 }

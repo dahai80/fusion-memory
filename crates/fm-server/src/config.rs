@@ -5,6 +5,8 @@
 
 use std::path::PathBuf;
 
+use tracing::warn;
+
 /// 服务配置。
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
@@ -52,7 +54,8 @@ fn dirs_home() -> Option<PathBuf> {
 }
 
 impl ServerConfig {
-    /// 从 env 读覆盖。PRD §12.3。
+    /// 从 env 读覆盖。PRD §12.3。§2.10: 坏值不再静默回退默认, 改 warn 结构化日志 (fail-visible)。
+    /// 不 hard-fail: 运行中服务因端口笔误 panic 更糟; warn 让运维从日志诊断哪个 env 坏。
     pub fn from_env() -> Self {
         let mut c = Self::default();
         if let Ok(v) = std::env::var("FM_HOME") {
@@ -63,18 +66,34 @@ impl ServerConfig {
             c.sock_path = PathBuf::from(v);
         }
         if let Ok(v) = std::env::var("FUSION_MEMORY_HTTP_PORT") {
-            if let Ok(p) = v.parse::<u16>() {
-                c.http_port = p;
+            match v.parse::<u16>() {
+                Ok(p) => c.http_port = p,
+                Err(e) => warn!(
+                    raw = %v,
+                    error = %e,
+                    fallback = c.http_port,
+                    "FUSION_MEMORY_HTTP_PORT 坏值, 回退默认 (运维请检查 env 拼写)"
+                ),
             }
         }
         if let Ok(v) = std::env::var("FUSION_MEMORY_API_KEY") {
             c.api_key = v;
         }
         if let Ok(v) = std::env::var("FUSION_MEMORY_DIM") {
-            if let Ok(d) = v.parse::<usize>() {
-                if d > 0 {
-                    c.dim = d;
-                }
+            match v.parse::<usize>() {
+                Ok(d) if d > 0 => c.dim = d,
+                Ok(d) => warn!(
+                    raw = %v,
+                    dim = d,
+                    fallback = c.dim,
+                    "FUSION_MEMORY_DIM=0 非法, 回退默认 (嵌入维度须 >0)"
+                ),
+                Err(e) => warn!(
+                    raw = %v,
+                    error = %e,
+                    fallback = c.dim,
+                    "FUSION_MEMORY_DIM 坏值, 回退默认 (运维请检查 env 拼写)"
+                ),
             }
         }
         c
@@ -125,8 +144,10 @@ mod tests {
     }
 
     #[test]
-    fn from_env_overrides_and_bad_values_ignored() {
+    fn from_env_overrides_and_bad_values_warn_and_fallback() {
         // 单测合并：env 测试并发跑会串扰，合并成顺序块，自洽设/清。
+        // §2.10: 坏值不再静默回退, 改 warn (fail-visible)。行为仍是回退默认值 (不 panic),
+        // 但测试名+注释显式标注这是 fail-visible 路径, 非"坏值忽略"。
         std::env::set_var("FM_HOME", "/tmp/fm-cfg-env-home");
         std::env::set_var("FUSION_MEMORY_API_KEY", "envkey");
         std::env::set_var("FUSION_MEMORY_HTTP_PORT", "9999");
@@ -138,7 +159,7 @@ mod tests {
         assert_eq!(c.dim, 512);
         assert!(c.http_ok());
 
-        // 坏值：端口非数字、dim=0 → 保持默认
+        // 坏值：端口非数字、dim=0 → 回退默认 (同时发 warn, 见 from_env 实现)
         std::env::set_var("FUSION_MEMORY_HTTP_PORT", "not-a-port");
         std::env::set_var("FUSION_MEMORY_DIM", "0");
         let c2 = ServerConfig::from_env();

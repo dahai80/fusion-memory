@@ -14,7 +14,7 @@ use fm_core::{
 };
 use fm_embed::{vector_id_from_ulid, Embedder};
 use fm_persist::{MergeLogEntry, Persist};
-use fm_store::{FusionStoreEngine, StoreStub};
+use fm_store::FusionStoreEngine;
 use tracing::{debug, info, warn};
 
 use crate::entity_extract::{chat_completion, EntityExtractor, ExtractConfig, ExtractResult};
@@ -26,21 +26,40 @@ const MERGE_KNN: usize = 5;
 const SUMMARIZE_MIN_EPISODIC: usize = 3;
 
 pub struct MemoryEngine {
-    store: Arc<StoreStub>,
+    // §1.4: store 抽象 trait-object 化 (非硬编码 Arc<StoreStub>)。store-fusion 后端落地时
+    // 仅换 build 端构造, 引擎字段/方法/调用方零改动。旧版焊死具体类型 → 抽象死亡, store-fusion 空壳。
+    store: Arc<dyn FusionStoreEngine>,
     persist: Arc<Persist>,
     embedder: Arc<dyn Embedder>,
     extractor: Option<Arc<dyn EntityExtractor>>,
     extract_config: Option<ExtractConfig>,
     /// PII 脱敏开关 (R8/§10.4)。true 时 commit 路径 embed+persist 前脱敏。默认 false。
     redact: bool,
-    /// H4: consolidate 串行锁。consolidate_memories 持锁期间与 retrieve 的 touch_access
-    /// 写互斥, 使"读快照→决策→写"原子化, 防并发 touch 把 access_count/last_accessed 回退
-    /// (lost update) 或刚被访问的记忆被回收 (TOCTOU)。consolidate 罕见 (定时/手动), touch 短临界区。
+    /// §1.2: touch_access 短临界区锁。仅持此锁跑同步 touch_access_batch (快, ~ms),
+    /// 不跨 LLM await。旧版与 consolidate 共用一把锁 → consolidate saga 持锁 60s+ LLM await
+    /// 期间全部 retrieve 的 touch 在 :747 阻塞 → 全部 Agent 读冻结。
+    /// 改: touch 独立锁, 与 consolidate_lock 解耦。consolidate 已用 list_changed_since 快照
+    /// 读点, touch 写新 access_count 由下次 consolidate 捕获; TOCTOU 风险 (刚访问项被回收)
+    /// 在 consolidate 罕见 (定时/手动) 下可接受, 换取读路径不冻结。
+    touch_lock: tokio::sync::Mutex<()>,
+    /// H4: consolidate saga 串行锁。仅防两个 consolidate 并发 (读快照→决策→写)。
+    /// §1.2 后不再与 touch 共用, 故 LLM await 持此锁不阻塞 retrieve touch。
     consolidate_lock: tokio::sync::Mutex<()>,
+    /// §2.5: follower 陈旧读信号。standalone/leader 恒 false。follower 由 fm-server
+    /// cluster 层在同步停滞时调 mark_stale(true), retrieve_context 读此 flag 写入 FormattedContext。
+    /// AtomicBool 无锁读, retrieve 热路径不阻塞。
+    stale_flag: std::sync::atomic::AtomicBool,
+    /// §2.5: 最近一次成功同步 leader 的时间戳 (ms)。follower 由 cluster 层更新;
+    /// standalone/leader 恒 0。retrieve 写入 FormattedContext 供消费方算 staleness。
+    last_sync_at: std::sync::atomic::AtomicU64,
 }
 
 impl MemoryEngine {
-    pub fn new(store: Arc<StoreStub>, persist: Arc<Persist>, embedder: Arc<dyn Embedder>) -> Self {
+    pub fn new(
+        store: Arc<dyn FusionStoreEngine>,
+        persist: Arc<Persist>,
+        embedder: Arc<dyn Embedder>,
+    ) -> Self {
         Self {
             store,
             persist,
@@ -48,7 +67,10 @@ impl MemoryEngine {
             extractor: None,
             extract_config: None,
             redact: false,
+            touch_lock: tokio::sync::Mutex::new(()),
             consolidate_lock: tokio::sync::Mutex::new(()),
+            stale_flag: std::sync::atomic::AtomicBool::new(false),
+            last_sync_at: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -62,6 +84,20 @@ impl MemoryEngine {
     pub fn with_redact(mut self) -> Self {
         self.redact = true;
         self
+    }
+
+    /// §2.5: follower 陈旧读状态注入。cluster 层 (fm-server cluster.rs) 调用:
+    /// 同步成功 → mark_stale(false) + mark_synced(now); 同步停滞/leader down → mark_stale(true)。
+    /// standalone/leader 不调用, stale_flag 恒 false。
+    pub fn mark_stale(&self, stale: bool) {
+        self.stale_flag
+            .store(stale, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// §2.5: 记录最近一次成功同步 leader 的时间戳 (ms)。
+    pub fn mark_synced(&self, at_ms: u64) {
+        self.last_sync_at
+            .store(at_ms, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// 注入抽取器 + chat 配置 (summarize 复用)。生产路径推荐。
@@ -79,7 +115,8 @@ impl MemoryEngine {
         &self.persist
     }
 
-    pub fn store(&self) -> &Arc<StoreStub> {
+    // §1.4: store getter 返回 trait-object (非具体 StoreStub)。
+    pub fn store(&self) -> &Arc<dyn FusionStoreEngine> {
         &self.store
     }
 
@@ -236,6 +273,13 @@ impl MemoryEngine {
                         error: e.to_string(),
                     });
                 }
+                // §1.9: emit merge wop → follower 重放 (tombstone source + record_merge)。
+                // payload = "source_id\ttarget_id\treason\tat"。follower vector 已由 leader 删,
+                // follower reconcile 兜底清孤儿向量。旧版不 emit → follower 双重合并分叉。
+                let merge_payload = format!("{}\t{}\tann-sim+shared-entity\t{at}", src.id, tgt.id);
+                if let Err(e) = self.persist.append_wop("merge", &merge_payload, at) {
+                    warn!(source = %src.id, error = %e, "merge wop append failed, follower may diverge");
+                }
                 merged += 1;
                 info!(source = %src.id, target = %tgt.id, sim, "merged");
                 break; // 每个 source 只合并一次
@@ -307,7 +351,20 @@ impl MemoryEngine {
             item.vector_ref = vec_id.to_string();
             item.tier = MemoryTier::Long;
             item.entities_pending = true;
-            if let Err(e) = self.persist.put_memory(&item) {
+            // §2.4: put_memory + append_wop 原子 (同 commit 路径)。旧版两步独立 INSERT,
+            // put_memory 成功 append_wop 失败 → semantic 行在但 wop_log 无 → follower 永缺。
+            // §2.7: 携带摘要向量 (CommitEnvelope), follower 直用免 re-embed。
+            let envelope = fm_cluster::CommitEnvelope {
+                item: item.clone(),
+                vector: Some(vec.clone()),
+            };
+            let wop_payload = serde_json::to_string(&envelope)?;
+            if let Err(e) = self
+                .persist
+                .put_memory_with_wop(&item, "summarize", &wop_payload, at)
+            {
+                // H1: persist 失败 → 反向清已插向量
+                let _ = self.store.delete_vector(vec_id);
                 failures.push(ConsolidationFailure {
                     memory_id: id,
                     stage: "summarize".into(),
@@ -315,9 +372,6 @@ impl MemoryEngine {
                 });
                 continue;
             }
-            self.persist
-                .append_wop("summarize", &id, at)
-                .map_err(|e| e.to_memory())?;
             summarized += 1;
             info!(session = %sess, "summarized into new semantic");
         }
@@ -434,12 +488,20 @@ impl MemoryEngine {
             .map_err(|e| e.to_memory())?
         {
             item.tombstone = false;
-            // 重建向量 (merge 时 delete_vector 了)
+            // 重建向量 (merge 时 delete_vector 了)。
+            // §3.4: 旧版 get_vector(vr).unwrap_or(None).is_none() 把真 sled I/O 错误 (满盘/锁竞争)
+            // 当 "无向量" → 触发 re-embed + insert_vector 静默丢错 → 记忆 untombstone 但 store 无向量 (幽灵)。
+            // 改: 区分 Err(I/O) vs Ok(None); I/O 错误向上传播不 re-embed; insert_vector 错误也向上传播不静默丢。
             if let Ok(vr) = item.vector_ref.parse::<u64>() {
-                if self.store.get_vector(vr).unwrap_or(None).is_none() {
-                    if let Ok(v) = self.embedder.embed(&item.content).await {
-                        let _ = self.store.insert_vector(vr, &v);
-                    }
+                let existing = self.store.get_vector(vr)?;
+                if existing.is_none() {
+                    let v = self
+                        .embedder
+                        .embed(&item.content)
+                        .await
+                        .map_err(|e| e.to_memory())?;
+                    self.store.insert_vector(vr, &v)?;
+                    info!(source = %source_id, vec_id = vr, "unmerge rebuilt vector");
                 }
             }
             self.persist.put_memory(&item).map_err(|e| e.to_memory())?;
@@ -524,13 +586,64 @@ impl fm_cluster::ReplaySink for MemoryEngine {
         Ok(())
     }
     async fn insert_vector(&self, vec_id: u64, vec: &[f32]) -> fm_cluster::ClusterResult<()> {
-        FusionStoreEngine::insert_vector(self.store.as_ref(), vec_id, vec)?;
+        self.store.insert_vector(vec_id, vec)?;
         Ok(())
     }
     async fn tombstone(&self, id: &str) -> fm_cluster::ClusterResult<()> {
         self.persist
             .tombstone_memory(id)
             .map_err(fm_cluster::ClusterError::from)?;
+        Ok(())
+    }
+    /// §1.9: promote wop 落地 — follower 改 tier (Short→Long)。
+    async fn promote_tier(&self, id: &str, tier: &str) -> fm_cluster::ClusterResult<()> {
+        let tier_enum = match tier {
+            "Long" => MemoryTier::Long,
+            "Short" => MemoryTier::Short,
+            "Working" => MemoryTier::Working,
+            _ => {
+                return Err(fm_cluster::ClusterError::Replay(format!(
+                    "promote_tier unknown tier: {tier}"
+                )))
+            }
+        };
+        let Some(mut item) = self
+            .persist
+            .get_memory(id)
+            .map_err(fm_cluster::ClusterError::from)?
+        else {
+            // 记忆已不存在 (可能已删) → 幂等成功, 不阻断重放游标。
+            warn!(id, "promote_tier: memory not found, skip (idempotent)");
+            return Ok(());
+        };
+        item.tier = tier_enum;
+        self.persist
+            .put_memory(&item)
+            .map_err(fm_cluster::ClusterError::from)?;
+        Ok(())
+    }
+    /// §1.9: merge wop 落地 — follower 记 merge_log (source tombstone 已由 replay_one 的 tombstone 调用处理)。
+    async fn record_merge(
+        &self,
+        source_id: &str,
+        target_id: &str,
+        reason: &str,
+        at: u64,
+    ) -> fm_cluster::ClusterResult<()> {
+        self.persist
+            .record_merge(source_id, target_id, reason, at)
+            .map_err(fm_cluster::ClusterError::from)?;
+        Ok(())
+    }
+    /// §2.5: follower 与 leader 追平 → 清 stale_read + 记同步时间 (retrieve_context 暴露给客户端)。
+    async fn on_sync_ok(&self) -> fm_cluster::ClusterResult<()> {
+        self.mark_stale(false);
+        self.mark_synced(Self::now_ms());
+        Ok(())
+    }
+    /// §2.5: follower 同步停滞 (leader down / 永久错误) → 标 stale_read, 客户端知数据可能落后。
+    async fn on_sync_stale(&self) -> fm_cluster::ClusterResult<()> {
+        self.mark_stale(true);
         Ok(())
     }
 }
@@ -544,6 +657,10 @@ impl fm_core::FusionMemoryEngine for MemoryEngine {
     ) -> fm_core::MemoryResult<Vec<MemoryId>> {
         let mut ids = Vec::with_capacity(interaction.turns.len());
         let now = Self::now_ms();
+        // §3.7: per-turn 错误隔离。旧版任一 turn 失败即 return Err, 但 turn 1..i-1 已入库带 wop,
+        // 函数返 Err 暗示"啥也没提交"是谎言; 客户端重试整交互 → turn 1..i-1 拿新 ULID 再提交 = 重复。
+        // 改: 失败 turn 跳过 (warn+反向清向量), 继续后续 turn, 返已成功提交的 ids。
+        // 全部 turn 失败 → ids 空, 仍返 Ok([]) (非 Err): 已有 0 条提交, 不需客户端重试避免空交互重放。
         for turn in &interaction.turns {
             let id = Self::new_ulid();
             let raw = Self::turn_content(turn);
@@ -567,32 +684,47 @@ impl fm_core::FusionMemoryEngine for MemoryEngine {
                 now,
             );
             let vec_id = vector_id_from_ulid(&id);
-            let vec = self
-                .embedder
-                .embed(&content)
-                .await
-                .map_err(|e| e.to_memory())?;
-            self.store.insert_vector(vec_id, &vec)?;
+            // §3.7: embed 失败 (fusion-mlx 429/挂) → 跳过此 turn 不 abort 整交互。
+            let vec = match self.embedder.embed(&content).await {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!(id = %id, turn_idx = turn.turn_idx, error = %e.to_memory(), "commit: embed failed, skip turn");
+                    continue;
+                }
+            };
+            if let Err(e) = self.store.insert_vector(vec_id, &vec) {
+                warn!(id = %id, turn_idx = turn.turn_idx, error = %e, "commit: insert_vector failed, skip turn");
+                continue;
+            }
             item.vector_ref = vec_id.to_string();
             // entities_pending=true: 实体待异步抽 (C5: content+vector 先存)
             item.entities_pending = true;
-            if let Err(e) = self.persist.put_memory(&item) {
-                // H1 反向清理: insert_vector 已落 hnsw+sled, put_memory 失败 (磁盘满/SQLite busy)
-                // → 删向量避免幽灵 (索引可见但无元数据, retrieve 拿 id 却 get_memory=None)。
-                warn!(id = %id, error = %e, "put_memory failed, reverse-clean vector");
+            // §2.7: wop payload 携带 leader 已算向量 (CommitEnvelope{item, vector})。
+            // follower 直用免 re-embed — MlxEmbedder(bge-m3) 跨进程浮点非确定, re-embed 致检索发散。
+            // 旧版仅序列化 MemoryItem (vector_ref 是 u64 id 串非真向量) → follower 必须 re-embed。
+            let envelope = fm_cluster::CommitEnvelope {
+                item: item.clone(),
+                vector: Some(vec.clone()),
+            };
+            let wop_payload = serde_json::to_string(&envelope)?;
+            // §2.4: put_memory + append_wop 单 transaction 原子。旧版两步独立 INSERT,
+            // put_memory 成功后崩溃/append_wop 失败 → memory_item 行在但 wop_log 无 →
+            // follower since_seq 永拉不到 → 永久静默缺口。改 put_memory_with_wop 同事务全 commit 或全 rollback。
+            if let Err(e) = self
+                .persist
+                .put_memory_with_wop(&item, "commit", &wop_payload, now)
+            {
+                // H1 反向清理: insert_vector 已落 hnsw+sled, persist 失败 → 删向量避免幽灵
+                // (索引可见但无元数据, retrieve 拿 id 却 get_memory=None)。
+                warn!(id = %id, error = %e.to_memory(), "commit: put_memory_with_wop failed, reverse-clean vector");
                 let _ = self.store.delete_vector(vec_id);
-                return Err(e.to_memory());
+                continue;
             }
-            // wop payload = 序列化 MemoryItem（不含向量，follower 本地 re-embed，§6.3 同 content 同向量）。
-            let wop_payload = serde_json::to_string(&item)?;
-            self.persist
-                .append_wop("commit", &wop_payload, now)
-                .map_err(|e| e.to_memory())?;
             ids.push(MemoryId(id.clone()));
             // 异步抽实体回写 (不阻塞 commit 返回; 此处同步 await 保证可测)
             self.extract_and_attach(&id, &content).await;
         }
-        info!(interaction = %interaction.id, turns = interaction.turns.len(), "commit done");
+        info!(interaction = %interaction.id, turns = interaction.turns.len(), committed = ids.len(), "commit done");
         Ok(ids)
     }
 
@@ -625,10 +757,16 @@ impl fm_core::FusionMemoryEngine for MemoryEngine {
             .map_err(|e| e.to_memory())?;
         let knn = self.store.search_knn(&qvec, query.top_k)?;
         debug!(hits = knn.len(), "knn done");
-        let all = self.persist.list_all().map_err(|e| e.to_memory())?;
+        // §1.3: 定向查 KNN 命中 vec_id 对应的 memory_item, 走 idx_memory_vector_ref 索引。
+        // 旧版 list_all 全表扫 + HashMap (10k 记忆 ≈ 2MB clone/次) 仅为查 ~10 个 KNN 命中。
+        let knn_vec_ids: Vec<u64> = knn.iter().map(|(vid, _)| *vid).collect();
+        let hits = self
+            .persist
+            .get_by_vector_refs(&knn_vec_ids)
+            .map_err(|e| e.to_memory())?;
         let mut by_vec_ref: std::collections::HashMap<u64, MemoryItem> =
             std::collections::HashMap::new();
-        for m in all {
+        for m in hits {
             if let Ok(vr) = m.vector_ref.parse::<u64>() {
                 by_vec_ref.insert(vr, m);
             }
@@ -651,9 +789,15 @@ impl fm_core::FusionMemoryEngine for MemoryEngine {
                     }
                 }
                 // 融合评分: cosine + W(t) + graph_affinity (L1: query_entity_ids 已抽)
-                let score =
-                    scoring::score_candidate(&self.persist, *sim as f64, m, &query_entity_ids, now)
-                        .map_err(|e| fm_core::MemoryError::Store(e.to_string()))?;
+                // §1.5: score_candidate 取 &dyn GraphStore; Arc<Persist> deref → &Persist coerce。
+                let score = scoring::score_candidate(
+                    self.persist.as_ref(),
+                    *sim as f64,
+                    m,
+                    &query_entity_ids,
+                    now,
+                )
+                .map_err(|e| fm_core::MemoryError::Store(e.to_string()))?;
                 let entry = best_score.entry(m.interaction_id.clone()).or_insert(0.0);
                 if score > *entry {
                     *entry = score;
@@ -720,11 +864,12 @@ impl fm_core::FusionMemoryEngine for MemoryEngine {
             total_tokens += block_tokens;
             kept.push(block);
         }
-        // L2 + H4: 命中项去重后批量 touch (一次 retrieve 一次 access_count +1, 非 N 次单行写),
-        // 并持 consolidate_lock 与 consolidate 写互斥 (防 lost update / TOCTOU)。
+        // L2 + H4: 命中项去重后批量 touch (一次 retrieve 一次 access_count +1, 非 N 次单行写)。
+        // §1.2: touch 持 touch_lock (短临界区, 不跨 LLM await), 不持 consolidate_lock。
+        // 旧版持 consolidate_lock → consolidate saga 持锁 60s+ LLM await 时全部 retrieve touch 阻塞 → 读冻结。
         let touched_ids: Vec<String> = sorted_groups_turn_ids(&groups, &kept);
         if !touched_ids.is_empty() {
-            let _guard = self.consolidate_lock.lock().await;
+            let _guard = self.touch_lock.lock().await;
             if let Err(e) = self.persist.touch_access_batch(&touched_ids, now) {
                 warn!(error = %e, "touch_access_batch failed");
             }
@@ -732,6 +877,13 @@ impl fm_core::FusionMemoryEngine for MemoryEngine {
         Ok(FormattedContext {
             blocks: kept,
             total_tokens,
+            // §2.5: stale_read 由 follower 同步状态决定。engine 本身不判角色 (无 cluster 依赖),
+            // 由 fm-server cluster 层在 follower 角色下经 set_stale 状态注入。此处分两路:
+            //   - leader/standalone: 恒不陈旧 (last_sync_at=0)
+            //   - follower: 由上层 (fm-server cluster.rs) 调用 engine.mark_stale() 后取此处快照
+            // engine 默认 stale=false/last_sync_at=0, follower 路径在 retrieve 前覆写。
+            stale_read: self.stale_flag.load(std::sync::atomic::Ordering::Relaxed),
+            last_sync_at: self.last_sync_at.load(std::sync::atomic::Ordering::Relaxed),
         })
     }
 
@@ -757,42 +909,71 @@ impl fm_core::FusionMemoryEngine for MemoryEngine {
             .map_err(|e| e.to_memory())?;
 
         // 1. 衰减回收 + 晋升 (增量)
-        for m in &changed {
-            if scoring::should_recycle(m, now) {
-                if let Ok(vr) = m.vector_ref.parse::<u64>() {
-                    if let Err(e) = self.store.delete_vector(vr) {
-                        warn!(id = %m.id, error = %e, "recycle delete_vector failed");
-                        failures.push(ConsolidationFailure {
-                            memory_id: m.id.clone(),
-                            stage: "recycle".into(),
-                            error: e.to_string(),
-                        });
+        // §1.13: phase-1 全同步 SQL I/O (delete_vector/tombstone/put_memory) 放 spawn_blocking,
+        // 不阻塞 tokio worker 线程。旧版在 async fn 内同步阻塞 → 占满 worker (CPU 核少的小机器饥饿)。
+        // phase-2/3 有 LLM await 自然 yield 不阻塞, 故仅 phase-1 入 blocking。
+        let store = self.store.clone();
+        let persist = self.persist.clone();
+        let (changed, phase1_dropped, phase1_promoted, phase1_failures) =
+            tokio::task::spawn_blocking(move || {
+                let mut d = 0usize;
+                let mut p = 0usize;
+                let mut fl: Vec<ConsolidationFailure> = Vec::new();
+                for m in &changed {
+                    if scoring::should_recycle(m, now) {
+                        if let Ok(vr) = m.vector_ref.parse::<u64>() {
+                            if let Err(e) = store.delete_vector(vr) {
+                                warn!(id = %m.id, error = %e, "recycle delete_vector failed");
+                                fl.push(ConsolidationFailure {
+                                    memory_id: m.id.clone(),
+                                    stage: "recycle".into(),
+                                    error: e.to_string(),
+                                });
+                            }
+                        }
+                        if let Err(e) = persist.tombstone_memory(&m.id) {
+                            fl.push(ConsolidationFailure {
+                                memory_id: m.id.clone(),
+                                stage: "recycle".into(),
+                                error: e.to_string(),
+                            });
+                        }
+                        // §1.9: emit recycle wop → follower tombstone 同步 (向量 leader 已删,
+                        // follower reconcile 兜底)。旧版不 emit → follower 该 tombstone 的仍活。
+                        if let Err(e) = persist.append_wop("recycle", &m.id, now) {
+                            warn!(id = %m.id, error = %e, "recycle wop append failed, follower may diverge");
+                        }
+                        d += 1;
+                        continue;
+                    }
+                    if m.tier == MemoryTier::Short && scoring::should_promote(m, now) {
+                        let mut up = m.clone();
+                        up.tier = MemoryTier::Long;
+                        if let Err(e) = persist.put_memory(&up) {
+                            fl.push(ConsolidationFailure {
+                                memory_id: m.id.clone(),
+                                stage: "promote".into(),
+                                error: e.to_string(),
+                            });
+                        } else {
+                            // §1.9: emit promote wop → follower promote_tier 同步。
+                            // payload = "id\ttier"。旧版不 emit → follower 该 Long 的仍 Short。
+                            if let Err(e) =
+                                persist.append_wop("promote", &format!("{}\tLong", m.id), now)
+                            {
+                                warn!(id = %m.id, error = %e, "promote wop append failed, follower may diverge");
+                            }
+                            p += 1;
+                        }
                     }
                 }
-                if let Err(e) = self.persist.tombstone_memory(&m.id) {
-                    failures.push(ConsolidationFailure {
-                        memory_id: m.id.clone(),
-                        stage: "recycle".into(),
-                        error: e.to_string(),
-                    });
-                }
-                dropped += 1;
-                continue;
-            }
-            if m.tier == MemoryTier::Short && scoring::should_promote(m, now) {
-                let mut up = m.clone();
-                up.tier = MemoryTier::Long;
-                if let Err(e) = self.persist.put_memory(&up) {
-                    failures.push(ConsolidationFailure {
-                        memory_id: m.id.clone(),
-                        stage: "promote".into(),
-                        error: e.to_string(),
-                    });
-                } else {
-                    promoted += 1;
-                }
-            }
-        }
+                (changed, d, p, fl)
+            })
+            .await
+            .map_err(|e| fm_core::MemoryError::Store(format!("consolidate phase-1 join: {e}")))?;
+        dropped += phase1_dropped;
+        promoted += phase1_promoted;
+        failures.extend(phase1_failures);
 
         // 2. 图合并 (ANN top-5, sim>0.92 + 共享实体) — 仅 Semantic
         let merged = self
@@ -820,6 +1001,13 @@ impl fm_core::FusionMemoryEngine for MemoryEngine {
                                 error: e.to_string(),
                             });
                         } else {
+                            // §1.9: emit reextract wop → follower put_item 覆写 entities 同步。
+                            // payload = MemoryItem JSON (向量不变, 内容未变)。旧版不 emit →
+                            // follower entities_pending 永真, audit_memory_access 返不同集合。
+                            let payload = serde_json::to_string(&item).unwrap_or_default();
+                            if let Err(e) = self.persist.append_wop("reextract", &payload, now) {
+                                warn!(id = %m.id, error = %e, "reextract wop append failed, follower may diverge");
+                            }
                             reextracted += 1;
                         }
                     }
@@ -892,14 +1080,11 @@ impl fm_core::FusionMemoryEngine for MemoryEngine {
         &self,
         entity_ids: &[String],
     ) -> fm_core::MemoryResult<Vec<MemoryItem>> {
-        let all = self.persist.list_all().map_err(|e| e.to_memory())?;
-        let wanted: std::collections::HashSet<&str> =
-            entity_ids.iter().map(|s| s.as_str()).collect();
-        let out: Vec<MemoryItem> = all
-            .into_iter()
-            .filter(|m| m.entities.iter().any(|e| wanted.contains(e.id.as_str())))
-            .collect();
-        Ok(out)
+        // §1.15: 旧版 list_all() 全表拉 + Rust HashSet filter → O(N) 扫描。N 大时 audit 拖垮服务。
+        // 改: persist.audit_by_entities 走 memory_entity join + PK 索引, 只查命中行。
+        self.persist
+            .audit_by_entities(entity_ids)
+            .map_err(|e| e.to_memory())
     }
 }
 
@@ -924,6 +1109,7 @@ mod tests {
     use super::*;
     use fm_core::{FusionMemoryEngine, MemoryTier, ToolCall};
     use fm_embed::StubEmbedder;
+    use fm_store::StoreStub;
 
     fn tmp_engine(dim: usize) -> MemoryEngine {
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -970,6 +1156,103 @@ mod tests {
             let m = eng.get_memory(id.as_str()).await.unwrap().unwrap();
             assert_eq!(m.interaction_id, "ix-1");
         }
+    }
+
+    /// §2.4: put_memory + wop 同事务原子。commit 后 wop_seq 增量 == committed turns 数,
+    /// 无 memory_item 行在但 wop_log 缺的分裂态。旧版两步独立 INSERT 有永久静默缺口窗口。
+    #[tokio::test]
+    async fn commit_wop_count_matches_committed_turns() {
+        let eng = tmp_engine(16);
+        let before = eng.persist().last_wop_seq().unwrap();
+        let ix = sample_interaction("ix-wop", 4);
+        let ids = eng.commit_episodic_memory("sess-1", &ix).await.unwrap();
+        assert_eq!(ids.len(), 4);
+        let after = eng.persist().last_wop_seq().unwrap();
+        // 每 turn 一条 commit wop → seq 增 4
+        assert_eq!(after - before, 4, "wop seq 增量应等于 committed turns");
+        // memory_item 行数 == committed ids (无 wop 无行 / 行无 wop 的分裂)
+        let all = eng.persist().list_all().unwrap();
+        let committed: Vec<_> = all
+            .iter()
+            .filter(|m| m.interaction_id == "ix-wop")
+            .collect();
+        assert_eq!(committed.len(), 4, "memory_item 行数应等于 committed turns");
+    }
+
+    /// §3.7: per-turn 错误隔离。中间 turn embed 失败 → 跳过该 turn 不 abort 整交互,
+    /// 前后 turn 正常提交, 返 Ok(成功 ids) 而非 Err。旧版返 Err 暗示"啥也没提交"是谎言,
+    /// 客户端重试 → 已提交 turn 拿新 ULID 再提交 = 重复。
+    #[tokio::test]
+    async fn commit_skips_failing_turn_not_abort_whole_interaction() {
+        use async_trait::async_trait;
+        use fm_embed::{EmbedError, StubEmbedder};
+        // FlakyEmbedder: 含 "FAIL" 的 turn embed 失败 (模拟 fusion-mlx 429), 其余正常。
+        struct FlakyEmbed(StubEmbedder);
+        #[async_trait]
+        impl Embedder for FlakyEmbed {
+            async fn embed(&self, text: &str) -> Result<Vec<f32>, EmbedError> {
+                if text.contains("FAIL") {
+                    return Err(EmbedError::Unavailable("simulated 429".into()));
+                }
+                self.0.embed(text).await
+            }
+            fn dimension(&self) -> usize {
+                self.0.dimension()
+            }
+            fn is_live(&self) -> bool {
+                false
+            }
+        }
+        let dir = std::env::temp_dir().join(format!(
+            "fm-engine-test-flaky-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Arc::new(StoreStub::open(&dir, 16).unwrap());
+        let persist = Arc::new(Persist::open_in_memory().unwrap());
+        let embedder: Arc<dyn Embedder> = Arc::new(FlakyEmbed(StubEmbedder::new(16)));
+        let eng = MemoryEngine::new(store, persist, embedder);
+
+        let ix = Interaction {
+            id: "ix-flaky".into(),
+            session_id: "sess-1".into(),
+            turns: vec![
+                Turn {
+                    turn_idx: 0,
+                    user_message: "user says 0".into(),
+                    assistant_message: "assistant replies 0".into(),
+                    tool_calls: vec![],
+                },
+                Turn {
+                    turn_idx: 1,
+                    user_message: "user says FAIL".into(), // embed 失败
+                    assistant_message: "assistant replies 1".into(),
+                    tool_calls: vec![],
+                },
+                Turn {
+                    turn_idx: 2,
+                    user_message: "user says 2".into(),
+                    assistant_message: "assistant replies 2".into(),
+                    tool_calls: vec![],
+                },
+            ],
+            timestamp: 1000,
+            metadata: serde_json::json!({}),
+        };
+        // 旧版返 Err; §3.7 改返 Ok(2 ids) — turn 0,2 成功, turn 1 跳过
+        let ids = eng.commit_episodic_memory("sess-1", &ix).await.unwrap();
+        assert_eq!(ids.len(), 2, "失败 turn 跳过, 成功 turn 2 条");
+        // turn 1 (FAIL) 不在 ids; 用 persist list_all 同步查内容
+        let all = eng.persist().list_all().unwrap();
+        assert!(
+            !all.iter().any(|m| m.content.contains("FAIL")),
+            "FAIL turn 不应被提交"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

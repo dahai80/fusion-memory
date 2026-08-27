@@ -26,7 +26,7 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::PyString;
 use tokio::runtime::Runtime;
-use tracing::error;
+use tracing::{error, info};
 
 // M3: 全进程单 tokio runtime。旧版每个 Python Engine 各建 Runtime (多 worker 线程),
 // N 个 Engine → N×worker 线程爆炸。改 OnceLock 共享单 runtime, 所有 PyEngine 复用。
@@ -80,6 +80,12 @@ impl PyEngine {
             Arc::new(mlx)
         };
         let mut engine = MemoryEngine::new(store, persist, embedder);
+        // §1.16: PII 脱敏默认开 (redact_enabled_env 默认 true, fail-closed)。
+        // 与 fm-server engine_builder 路径一致; 显式 FUSION_MEMORY_REDACT_PII=0 关闭。
+        if fm_engine::redact_enabled_env() {
+            engine = engine.with_redact();
+            info!("PII redaction enabled (R8/§1.16, fm-py path)");
+        }
         if !stub {
             let xcfg = fm_engine::entity_extract::ExtractConfig {
                 mlx_url: std::env::var("FUSION_MLX_URL")

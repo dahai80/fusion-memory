@@ -2,7 +2,10 @@
 //!
 //! standalone → 无 task。leader → Leader::serve (源=engine.persist())。
 //! follower + FUSION_MEMORY_LEADER → Follower::run (落地=engine, local_last_seq=engine.last_wop_seq)。
+//! §1.8: leader/follower epoch 经 ClusterConfig::with_home(data_dir) 读 (env 优先, 次读 home/epoch 文件)。
+//! §2.5: follower 同步 ok/stale 经 ReplaySink::on_sync_ok/on_sync_stale 注入 engine.mark_stale/mark_synced。
 
+use std::path::Path;
 use std::sync::Arc;
 
 use fm_cluster::{ClusterConfig, Follower, Leader, NodeRole, ReplaySink, SyncConfig, WopSource};
@@ -12,18 +15,27 @@ use tracing::{info, warn};
 
 /// 按 role 装配集群同步 task 到 set。无配置 (standalone/无 leader) → 不 spawn。
 /// role 由调用方传入 (serve 经 detect_role 读 env), 使测试可注入确定 role 免 env 竞争。
+/// §1.8: data_dir 供 ClusterConfig::with_home 读 epoch 文件 (fm cluster promote 落地)。
 pub fn spawn_cluster(
     engine: Arc<MemoryEngine>,
     role: NodeRole,
+    data_dir: &Path,
     set: &mut JoinSet<Result<(), String>>,
 ) {
     info!(role = %role, "cluster role detected");
     match role {
         NodeRole::Leader => {
-            let cfg = ClusterConfig::default();
+            let cfg = ClusterConfig::with_home(data_dir);
             let port = cfg.sync_port;
             let source: Arc<dyn WopSource> = engine.persist().clone();
-            let leader = Arc::new(Leader::new(source, port).with_token(cfg.cluster_token));
+            // §1.8: with_epoch (fencing) + with_bind_addr (跨机) + with_allow_no_token (单机测试)。
+            let leader = Arc::new(
+                Leader::new(source, port)
+                    .with_token(cfg.cluster_token)
+                    .with_epoch(cfg.epoch)
+                    .with_bind_addr(cfg.bind_addr.clone())
+                    .with_allow_no_token(cfg.allow_no_token),
+            );
             set.spawn(async move {
                 leader
                     .serve()
@@ -81,9 +93,9 @@ mod tests {
     #[tokio::test]
     async fn standalone_spawns_nothing() {
         // role 注入 → 无 env 依赖, 无竞争。
-        let (engine, _dir) = make_engine();
+        let (engine, dir) = make_engine();
         let mut set: JoinSet<Result<(), String>> = JoinSet::new();
-        spawn_cluster(engine, NodeRole::Standalone, &mut set);
+        spawn_cluster(engine, NodeRole::Standalone, dir.path(), &mut set);
         assert!(set.is_empty());
     }
 
@@ -92,9 +104,9 @@ mod tests {
         // role=follower 但 FUSION_MEMORY_LEADER 未配 → from_env None → 不 spawn。
         let _g = lock();
         std::env::remove_var("FUSION_MEMORY_LEADER");
-        let (engine, _dir) = make_engine();
+        let (engine, dir) = make_engine();
         let mut set: JoinSet<Result<(), String>> = JoinSet::new();
-        spawn_cluster(engine, NodeRole::Follower, &mut set);
+        spawn_cluster(engine, NodeRole::Follower, dir.path(), &mut set);
         assert!(set.is_empty());
     }
 
@@ -105,8 +117,8 @@ mod tests {
         {
             let _g = lock();
             std::env::set_var("FUSION_MEMORY_LEADER", "127.0.0.1:65535");
-            let (engine, _dir) = make_engine();
-            spawn_cluster(engine, NodeRole::Follower, &mut set);
+            let (engine, dir) = make_engine();
+            spawn_cluster(engine, NodeRole::Follower, dir.path(), &mut set);
             assert_eq!(set.len(), 1);
             std::env::remove_var("FUSION_MEMORY_LEADER");
         }
@@ -120,8 +132,8 @@ mod tests {
         {
             let _g = lock();
             std::env::set_var("FUSION_MEMORY_SYNC_PORT", "0");
-            let (engine, _dir) = make_engine();
-            spawn_cluster(engine, NodeRole::Leader, &mut set);
+            let (engine, dir) = make_engine();
+            spawn_cluster(engine, NodeRole::Leader, dir.path(), &mut set);
             assert_eq!(set.len(), 1);
             std::env::remove_var("FUSION_MEMORY_SYNC_PORT");
         }
