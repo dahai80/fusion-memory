@@ -177,13 +177,45 @@ impl Persist {
         Ok(())
     }
 
-    pub fn append_wop(&self, op: &str, payload: &str, at: u64) -> PersistResult<()> {
+    pub fn append_wop(&self, op: &str, payload: &str, at: u64) -> PersistResult<i64> {
         let conn = self.conn.lock().expect("persist conn lock poisoned");
         conn.execute(
             "INSERT INTO wop_log(op,payload,at) VALUES(?1,?2,?3)",
             params![op, payload, at as i64],
         )?;
-        Ok(())
+        let seq = conn.last_insert_rowid();
+        debug!(seq, op, "wop appended");
+        Ok(seq)
+    }
+
+    // 返回最大 seq，空表返回 0。follower 拉增量基线。
+    pub fn last_wop_seq(&self) -> PersistResult<i64> {
+        let conn = self.conn.lock().expect("persist conn lock poisoned");
+        let seq: i64 = conn.query_row("SELECT COALESCE(MAX(seq), 0) FROM wop_log", [], |r| {
+            r.get(0)
+        })?;
+        Ok(seq)
+    }
+
+    // 增量拉取 seq > since 的 wop 条目，按 seq 升序，最多 limit 条。leader→follower 复制读路径。
+    pub fn list_wop_since(&self, since_seq: i64, limit: usize) -> PersistResult<Vec<WopEntry>> {
+        let conn = self.conn.lock().expect("persist conn lock poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT seq,op,payload,at FROM wop_log WHERE seq > ?1 ORDER BY seq ASC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![since_seq, limit as i64], |row| {
+            Ok(WopEntry {
+                seq: row.get(0)?,
+                op: row.get(1)?,
+                payload: row.get(2)?,
+                at: row.get(3)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
     }
 
     pub fn record_merge(
@@ -425,6 +457,15 @@ pub struct MergeLogEntry {
     pub reason: String,
 }
 
+// wop_log 条目 (leader→follower 复制传输单元)。PRD §16 wop_log replay。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WopEntry {
+    pub seq: i64,
+    pub op: String,
+    pub payload: String,
+    pub at: i64,
+}
+
 const _: () = {
     // 占位：保证 entities_json 列名常量可见（避免未来误删）
 };
@@ -565,9 +606,31 @@ mod tests {
     #[test]
     fn wop_append() {
         let p = Persist::open_in_memory().unwrap();
-        p.append_wop("commit", "{}", 100).unwrap();
-        p.append_wop("delete", "{}", 200).unwrap();
+        let s1 = p.append_wop("commit", "{}", 100).unwrap();
+        let s2 = p.append_wop("delete", "{}", 200).unwrap();
         assert_eq!(p.count().unwrap(), 0);
+        assert_eq!(s1, 1);
+        assert_eq!(s2, 2);
+        assert_eq!(p.last_wop_seq().unwrap(), 2);
+    }
+
+    #[test]
+    fn wop_list_since() {
+        let p = Persist::open_in_memory().unwrap();
+        assert_eq!(p.last_wop_seq().unwrap(), 0);
+        p.append_wop("commit", "a", 100).unwrap();
+        p.append_wop("delete", "b", 200).unwrap();
+        p.append_wop("commit", "c", 300).unwrap();
+        let all = p.list_wop_since(0, 10).unwrap();
+        assert_eq!(all.len(), 3);
+        assert_eq!(all[0].seq, 1);
+        assert_eq!(all[0].op, "commit");
+        assert_eq!(all[2].payload, "c");
+        let tail = p.list_wop_since(1, 10).unwrap();
+        assert_eq!(tail.len(), 2);
+        assert_eq!(tail[0].seq, 2);
+        let limited = p.list_wop_since(0, 2).unwrap();
+        assert_eq!(limited.len(), 2);
     }
 
     #[test]

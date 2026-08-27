@@ -4,6 +4,7 @@
 //! 未配 FUSION_MEMORY_API_KEY 但 HTTP 端口开 → 拒启 HTTP（不裸跑）。
 
 pub mod auth;
+pub mod cluster;
 pub mod config;
 pub mod engine_builder;
 pub mod engine_handle;
@@ -18,6 +19,7 @@ use tracing::{error, info, warn};
 pub use config::ServerConfig;
 pub use engine_builder::{build_server_engine, ServerEngine};
 pub use engine_handle::EngineHandle;
+use fm_engine::MemoryEngine;
 
 /// 服务运行选项。
 pub struct ServeOpts {
@@ -27,9 +29,15 @@ pub struct ServeOpts {
 /// 启动服务：UDS + HTTP 并发。阻塞至任一退出。
 pub async fn serve(cfg: ServerConfig, opts: ServeOpts) -> Result<(), String> {
     let ServerEngine { engine } = build_server_engine(&cfg, opts.stub)?;
-    let handle = EngineHandle::new(Arc::new(engine));
+    let engine: Arc<MemoryEngine> = Arc::new(engine);
+    let handle = EngineHandle::new(engine.clone());
 
     let mut set: tokio::task::JoinSet<Result<(), String>> = tokio::task::JoinSet::new();
+
+    // M6 集群: leader/follower 同步 task 装配 (standalone → 空)。PRD §16。
+    // role 解析: env 优先, 次读 data_dir/role 文件 (fm cluster promote 落地), 末 standalone。
+    let role = fm_cluster::detect_role_with_home(Some(&cfg.data_dir));
+    cluster::spawn_cluster(engine.clone(), role, &mut set);
 
     if cfg.uds_enabled {
         let h = handle.clone();
@@ -72,6 +80,7 @@ pub async fn serve(cfg: ServerConfig, opts: ServeOpts) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    // cluster::tests 不再 set FUSION_MEMORY_ROLE (role 注入), 故 serve 读 env 恒 standalone, 无竞争。
     #[tokio::test]
     async fn serve_no_server_enabled_errors() {
         // UDS 关 + HTTP 关（端口 0）→ set 空 → 返回错误

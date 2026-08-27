@@ -8,4 +8,4 @@ pub mod schema;
 pub mod store;
 
 pub use error::{PersistError, PersistResult};
-pub use store::{MergeLogEntry, Persist};
+pub use store::{MergeLogEntry, Persist, WopEntry};

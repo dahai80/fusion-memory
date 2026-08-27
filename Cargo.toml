@@ -10,6 +10,7 @@ members = [
     "crates/fm-persist",
     "crates/fm-server",
     "crates/fm-py",
+    "crates/fm-cluster",
     "crates/fm-cli",
 ]
 
@@ -31,6 +32,7 @@ fm-embed = { path = "crates/fm-embed" }
 fm-persist = { path = "crates/fm-persist" }
 fm-server = { path = "crates/fm-server" }
 fm-py = { path = "crates/fm-py" }
+fm-cluster = { path = "crates/fm-cluster" }
 
 # 序列化
 serde = { version = "1", features = ["derive"] }
