@@ -30,6 +30,8 @@ Fusion 生态（"一核九端"）系统级长/短期记忆与认知图谱中枢�
 | M5 | PII 脱敏 + perf 基线 + store-fusion/guard 降级 | ✅（部分） |
 | M6 | 集群同步 leader-follower | ✅ |
 
+> **里程碑全集 M0–M6（终态）**：落地架构 `~/fusion/fusion-memory-prd-plan-0826.md` §14 仅定义 M0–M6，M6 为最终里程碑，**无 M7+**。§15 未决项 6 项全部 ✅ 已裁定；§17 审计修正 E1（8 项）/E2（10 项）/E3（3 项）全部已落地或已决策，审计闭环无遗留。后续工作仅两类：(1) M5(b) 待上游 `fusion-guard#2` 补 PII 类后接正式 DLP gate；(2) PRD 外的运维/性能/消费方演进。
+
 ### M2 PRD 偏离记录（Rule 7）
 
 - **Kuzu DB → SQLite 递归 CTE**（裁定 2026-08-26）：PRD §9.2 选 Kuzu DB 嵌入图，但 Kuzu 无 Rust binding。改用 SQLite 递归 CTE（`relation` 表 + `WITH RECURSIVE` N-hop 遍历），`fm-persist` 内实现，`fm-graph::graph_affinity` 消费。功能等价（N-hop 可达性 + 直接命中），无需额外 server 进程。
@@ -39,7 +41,7 @@ Fusion 生态（"一核九端"）系统级长/短期记忆与认知图谱中枢�
 PRD §14 M5 三部分，(a) store-fusion 可选切换、(b) fusion-guard DLP gate 降级为自带 PII 正则脱敏，(c) perf 基线已落地。
 
 - **(a) store-fusion 切换 → 降级不实施**（裁定 2026-08-27）：PRD §14/Tech Selection 拟复用 `fusion-store`（HNSW）做零拷贝后端。但实测：① `fusion-store` 的 `FusionStoreEngine`（`fs-core/src/engine.rs`）与 fm-store 的同名 trait 是**两套不同 API**（方法集不同：create_vector_index/open_vector_index/columnar/checkpoint/recover，全签 `timeout: Option<Duration>`、返 `Result<bool>` vs fm-store 返 `MemoryResult<()>`），非同名 trait；② fusion-store 非 git 仓库、非本 workspace 成员，受"只能改本目录工程"约束无法作 path dep 消费；③ fm-store A4 已否定零拷贝（"放弃零拷贝幻象，get_vector 返回 owned Vec"）。故 store-stub 保持长期生产后端，store-fusion 切换不实施。perf gate 亦针对 store-stub（非 fusion-store），(c) 不受影响。
-- **(b) fusion-guard DLP gate → 降级为自带 PII 正则脱敏**（裁定 2026-08-27）：PRD R8/§10.4 "M5 接 guard 做正式 DLP gate"，但 fusion-guard 未落地且不可改跨工程。降级：fusion-memory 自带最小 PII 正则脱敏（`fm-engine/src/redact.rs`，五类 PII），填补 M3 前的脱敏真空。guard 落地后再升级为正式 DLP gate，届时提 issue 跟进。
+- **(b) fusion-guard DLP gate → 暂用自带 PII 正则脱敏，正式 gate 待上游补 PII 类**（裁定 2026-08-27，复核 2026-08-27）：PRD R8/§10.4 "M5 接 guard 做正式 DLP gate"。复核发现 **fusion-guard 已落地**（git 仓库 `dahai80/fusion-guard`，13 crate，`fg-audit-engine::AuditEngine` 真正 DLP gate + UDS JSON-RPC `guard.redact/evaluate/reveal/confirm` via `fg-ipc`，可 IPC 消费无需 Rust 依赖，契合 100% 离线）。但实测 `fg-redact::Redactor` 当前只覆盖**凭证类**（api_key/password/id_number/private_key），**不覆盖** fusion-memory 所需的 **PII 类**（phone/email/bankcard/ipv4）——覆盖面缺口。故暂留 fusion-memory 自带最小 PII 正则脱敏（`fm-engine/src/redact.rs`，五类 PII）作过渡。已向上游提 issue 跟踪：**fusion-guard #2**（请求 `fg-redact` 增 PII pattern classes，phone/email/bankcard/ipv4，含 order-sensitivity 顺序敏感替换 + 回归测试）。上游落地 PII 类后，fusion-memory 弃用 `redact.rs` 改走 UDS `guard.redact`（irreversible）正式 DLP gate，接入点不变（`with_redact()` builder + commit/import 写入路径）。
 - **(c) perf 基线 → 已落地**：见 M5 总结段。两 gate 达标，基线 JSON 存档。
 
 ## 架构
