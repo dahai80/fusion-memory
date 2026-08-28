@@ -18,6 +18,12 @@ Fusion 生态（"一核九端"）系统级长/短期记忆与认知图谱中枢�
 - 客户端协商：调 `version` RPC 或 `GET /v1/memory/version` 取 `api_version`，据版本号分支处理。
 - 1.0 前的 0.x 版本为技术预览，无稳定承诺。
 
+**store-fusion adapter + fg-redact 凭据脱敏落地（2026-08-28，未发版）**：用户需求 "现在建 store-fusion adapter ，然后换上游fg-redact" 两部分全落地。
+- **store-fusion adapter**（`fm-store/src/fusion.rs`，feature `store-fusion`）：实现 fm-store `FusionStoreEngine` trait，包上游 fusion-store `fs-core` 的 `Engine`（HNSW + mmap KV）。距离语义桥接：fs-core 返 `distance = 1 - cos_sim`，adapter 转 `similarity = 1.0 - distance` 对齐 fm-store 契约（同 local.rs 公式）。UFCS 调 fs-core trait 方法（两 crate 同名 trait `FusionStoreEngine`）。ZeroCopyBuffer mmap→owned 桥接。6 测试绿（kv 往返 / 向量插入+取+搜 / dim 不匹配拒 / 搜索 dim 不匹配 / 删后取 None / list_ids 排除软删）。**附加非互斥**：与 local-store 共存（local-store 默认 + 常开；store-fusion 可选，默认关），两者同编译。关闭 RC 已知限制 #2（store-stub 命名 —— store-fusion 现为真实 fusion-store 后端备选，非仅 "stub"）。
+- **fg-redact 凭据脱敏**（`fm-engine/src/redact.rs`）：段 1 凭据脱敏委托上游 `fg-redact::Redactor::redact_credentials()`（fusion-guard PR #11 / issue #10）。fg-redact 补 fusion-memory 原没有的 10 类凭据（JWT/private_key/oauth_bearer/api_key/conn_string/password/secret_kv/env_kv/netrc/aws_secret）。段 2 PII 仍 fusion-memory 自带（手机+86/0086/邮箱/身份证/银行卡+Luhn/IPv4/护照/IPv6/国际手机）—— fg-redact 的 PII 行为更差（身份证被 credit_card 错吞 / id_number 误吞长数字 / +86 phone 被 border 拒），故 PII 不走 fg-redact，见 redact.rs 模块文档。关闭 RC 已知限制 #3 凭据部分（凭据现走上游；PII 按设计留本地）。4 新测试（jwt / password / 凭据+PII 同段 / 身份证仍本地非 bankcard）。幂等：凭据占位 `[REDACTED:jwt]` 无数字 → PII 正则不二次匹配。
+- **测试计数**：默认 feature 425→429（+4 凭据测试）；`--features fm-store/store-fusion` 435（429 + 6 store-fusion 测试）。gate 全绿（fmt / clippy -D warnings / check / test）。
+- **上游**：fusion-guard #10/#11 凭据 API 已落地（issue 提 + PR #11 实现 + 8 issue10_* 测试），fusion-memory 消费 `redact_credentials()`。fusion-store #3/#4 仍跟踪（adapter 已建消费 fs-core path dep；store-stub 仍默认生产后端）。
+
 **M2 已完成**：真实 bge-m3 embedding（dim=1024）+ 实体抽取（防注入 prompt + 严格 JSON 解析）+ SQLite 递归 CTE 图遍历 + 规则优先实体对齐 + 融合评分（cosine+衰减+graph_affinity）+ agent-studio 历史记忆导入。验收：实体抽取 JSON 解析成功率 100%（>90%），规则优先对齐正确（同名同 type 合并 / 同名异 type 不合并），真实 embedding 往返 dim=1024。测试覆盖率 lines 90.59% / regions 92.17%。162 测试全绿，clippy -D warnings 通过。
 
 **M3 已完成**：fm-server（UDS JSON-RPC 0600 + HTTP axum 强制 Bearer B5，端口 11435，无 API_KEY 拒启 HTTP）+ fm-py PyO3 绑定（`allow_threads` GIL 安全 C2）+ consolidate_memories saga（增量遗忘 + merge/summarize/reconcile，跨库对账 + merge_log + unmerge）+ fm-cli（consolidate/merges/unmerge/reconcile）+ start.sh（start/stop/restart/status/log/doctor）。验收：PyO3 往返 GIL 不冻结（commit→2 ids / retrieve→block / consolidate→report）；HTTP 无 token 被拒 + DELETE 无 confirm 被拒 + 无 API_KEY 拒启 HTTP；consolidate 报告字段完整 + 对账差异检出；start.sh 三命令可用。242 离线 + live 测试全绿，regions 离线 90.63% / live 92.07%。
@@ -140,8 +146,8 @@ Fusion 生态（"一核九端"）系统级长/短期记忆与认知图谱中枢�
 
 PRD §14 M5 三部分，(a) store-fusion 可选切换、(b) fusion-guard DLP gate 降级为自带 PII 正则脱敏，(c) perf 基线已落地。
 
-- **(a) store-fusion 切换 → 降级不实施**（裁定 2026-08-27）：PRD §14/Tech Selection 拟复用 `fusion-store`（HNSW）做零拷贝后端。但实测：① `fusion-store` 的 `FusionStoreEngine`（`fs-core/src/engine.rs`）与 fm-store 的同名 trait 是**两套不同 API**（方法集不同：create_vector_index/open_vector_index/columnar/checkpoint/recover，全签 `timeout: Option<Duration>`、返 `Result<bool>` vs fm-store 返 `MemoryResult<()>`），非同名 trait；② fusion-store 非 git 仓库、非本 workspace 成员，受"只能改本目录工程"约束无法作 path dep 消费；③ fm-store A4 已否定零拷贝（"放弃零拷贝幻象，get_vector 返回 owned Vec"）。故 store-stub 保持长期生产后端，store-fusion 切换不实施。perf gate 亦针对 store-stub（非 fusion-store），(c) 不受影响。
-- **(b) fusion-guard DLP gate → 暂用自带 PII 正则脱敏，正式 gate 待上游补 PII 类**（裁定 2026-08-27，复核 2026-08-27）：PRD R8/§10.4 "M5 接 guard 做正式 DLP gate"。复核发现 **fusion-guard 已落地**（git 仓库 `dahai80/fusion-guard`，13 crate，`fg-audit-engine::AuditEngine` 真正 DLP gate + UDS JSON-RPC `guard.redact/evaluate/reveal/confirm` via `fg-ipc`，可 IPC 消费无需 Rust 依赖，契合 100% 离线）。但实测 `fg-redact::Redactor` 当前只覆盖**凭证类**（api_key/password/id_number/private_key），**不覆盖** fusion-memory 所需的 **PII 类**（phone/email/bankcard/ipv4）——覆盖面缺口。故暂留 fusion-memory 自带最小 PII 正则脱敏（`fm-engine/src/redact.rs`，五类 PII）作过渡。已向上游提 issue 跟踪：**fusion-guard #2**（请求 `fg-redact` 增 PII pattern classes，phone/email/bankcard/ipv4，含 order-sensitivity 顺序敏感替换 + 回归测试）。上游落地 PII 类后，fusion-memory 弃用 `redact.rs` 改走 UDS `guard.redact`（irreversible）正式 DLP gate，接入点不变（`with_redact()` builder + commit/import 写入路径）。
+- **(a) store-fusion 切换 → 原"降级不实施"，2026-08-28 adapter 落地**（裁定 2026-08-27 → 更新 2026-08-28）：PRD §14/Tech Selection 拟复用 `fusion-store`（HNSW）做零拷贝后端。原裁定"降级不实施"基于：① `fusion-store` 的 `FusionStoreEngine`（`fs-core`）与 fm-store 同名 trait 是两套不同 API；② 受"只能改本目录工程"约束。**2026-08-28 更新**：上游 fusion-store 落地 `fs-core` 后，fm-store 新增 `store-fusion` feature + `fusion.rs` adapter（包 fs-core `Engine`，UFCS 调具体方法非经 fs-core trait，避 API 不对齐），作为**可选后端**落地（默认关，local-store 仍默认 + 常开生产后端）。两 crate 同名 trait 由 UFCS 全限定消歧。零拷贝经 ZeroCopyBuffer mmap→owned 桥接（跨调用持 mmap 引用不安全，故 owned 拷贝；真零拷贝需上层借 mmap handle 保活，后续优化）。6 测试绿。**store-stub 保持默认长期生产后端不变**，store-fusion 为可选备选。perf gate 仍针对 store-stub（默认路径），(c) 不受影响。
+- **(b) fusion-guard DLP gate → 凭据段已接上游 fg-redact，PII 段留本地**（裁定 2026-08-27 → 更新 2026-08-28）：PRD R8/§10.4 "M5 接 guard 做正式 DLP gate"。复核发现 fusion-guard 已落地（`fg-redact::Redactor` 覆盖凭据 + PII，但 **PII 行为有缺陷**：身份证被 credit_card 错吞 / id_number 无 validator 误吞长数字 / +86 phone 被 border validator 拒）。**2026-08-28 处置**（用户需求"换上游 fg-redact"）：向上游提 **fusion-guard #10**（请求 `redact_credentials` 凭据子集 API，跳 PII）→ PR **fusion-guard#11** 落地 `redact_credentials()` + `redact_with_patterns()` + `CREDENTIAL_PATTERNS` const（8 issue10_* 测试）。fusion-memory `redact.rs` 段 1 消费 `redact_credentials()`（10 类凭据，补原没有的 AWS/JWT/PEM/bearer/conn_string/.env 覆盖）；段 2 PII 仍 fusion-memory 自带（比 fg-redact PII 准，已测）。接入点不变（`with_redact()` builder + commit/import 写入路径）。未来全量 UDS `guard.redact` DLP gate 待上游 PII 行为修复后接。
 - **(c) perf 基线 → 已落地**：见 M5 总结段。两 gate 达标，基线 JSON 存档。
 
 ### v1.0.0 商用阻断修复（2026-08-28，第四轮 — 商用就绪 hardening）
@@ -149,8 +155,8 @@ PRD §14 M5 三部分，(a) store-fusion 可选切换、(b) fusion-guard DLP gat
 针对商用发布前 7 项阻断的处置。A 类 3 项受跨工程/账户约束非代码可修（盯上游 issue），B 类 2 项 epic + C 类 2 项在本轮落地。
 
 **A 类 — 跨工程/账户阻断（非本仓库可修，已提上游 issue 跟踪）**
-- **A-1 fusion-store 零拷贝后端**：PRD §14 拟复用 fusion-store HNSW 零拷贝，受"只能改本目录工程"约束 + 上游 trait API 不对齐阻断。生产继续用 local-store（hnsw_rs + sled owned）。已提 **fusion-store #3**（请求 VectorIndex 暴露 `get_vector(id)`+`list_vector_ids()`）+ **fusion-store #4**（请求 WIP owner commit 未提交的 `engine_impl.rs` Engine impl）。上游合并后可落地 adapter，接入点不变（`FusionStoreEngine` trait 已 trait 化，§1.4）。
-- **A-2 fusion-guard DLP 闸**：见 M5 偏离记录 (b)。自带 `redact.rs` 过渡，已提 **fusion-guard #2** 等上游补 PII 类。
+- **A-1 fusion-store 零拷贝后端**：PRD §14 拟复用 fusion-store HNSW 零拷贝。**2026-08-28 adapter 已建**（`fm-store/src/fusion.rs`，feature `store-fusion`，包 fs-core `Engine`），作为可选后端落地（默认关，local-store 仍默认生产后端）。仍跟踪 **fusion-store #3**（请求 VectorIndex 暴露 `get_vector(id)`+`list_vector_ids()`）+ **fusion-store #4**（请求 Engine impl）以补全 fs-core API 面。接入点不变（`FusionStoreEngine` trait 已 trait 化，§1.4）。
+- **A-2 fusion-guard DLP 闸**：见 M5 偏离记录 (b)。**2026-08-28 凭据段已接上游**（fusion-guard #10/#11，`redact_credentials()` 消费）；PII 段留 fusion-memory 本地（fg-redact PII 行为缺陷，按设计）。全量 UDS `guard.redact` DLP gate 待上游 PII 修复后接。
 - **A-3 GitHub Actions CI**：账户计费阻断（P0-5），非代码。本地 gate（fmt/clippy/check/test + fuzz）为代理口径全绿。
 
 **B 类 — 此前延后 epic，本轮落地**
@@ -161,7 +167,7 @@ PRD §14 M5 三部分，(a) store-fusion 可选切换、(b) fusion-guard DLP gat
 - **C-1 API 1.0 稳定承诺**：11 crate 0.2.1→1.0.0，SemVer 契约 + 线契约冻结（见状态段 v1.0.0 声明）。`jsonrpc::API_VERSION=1` + `v1.` 前缀路由 + `jsonrpc=="2.0"` 校验已就位。
 - **C-2 fuzz + 负载压测**：见 `### v1.0.0 fuzz + 负载压测` 专节。`cargo-fuzz` JSON-RPC/HTTP 解析 fuzz 目标 + 100k 向量 + 高并发压测。
 
-**仍待上游落地（非本轮）**：fusion-store #3/#4（零拷贝后端）、fusion-guard #2（正式 DLP PII 闸）、GitHub 账户计费恢复（CI）。
+**仍待上游落地（非本轮）**：fusion-store #3/#4（fs-core API 面补全，adapter 已建消费 path dep）、fusion-guard PII 行为修复（凭据段已接 #10/#11，全量 UDS DLP gate 待 PII 修复）、GitHub 账户计费恢复（CI）。
 
 **v1.0.0 B/C 批次验收**：425 离线测试全绿（基线 408 → +16 election 单元 + B-1 加密 4 已并入基线 + 1 B-2 e2e 全链路 orbit），clippy `-D warnings` + fmt clean + `cargo check --workspace` clean。B-1 静态加密 4 测试（明文兼容/加密往返/错 key fail-open/无 cipher 读密文）+ B-2 选举 16 单元测试（投票 4 判据 + quorum + 竞胜负 + 租约 + live TCP vote listener + from_env 边界）+ B-2 e2e 1 测试（`fm-server/tests/election_failover.rs`，orbit 全链路：leader 宕 → campaign → quorum → epoch++/role 文件 → detect Leader）。
 
@@ -212,7 +218,7 @@ PRD §14 M5 三部分，(a) store-fusion 可选切换、(b) fusion-guard DLP gat
 | `fm-engine` | 引擎实现：MemoryEngine + 实体抽取 + 融合评分 + 衰减 + Long 晋升 |
 | `fm-similarity` | 余弦相似度 + 衰减 W(t)（遗忘曲线 + 强化封顶） |
 | `fm-graph` | 规则优先实体对齐（A5）+ alias 字典 + graph_affinity（N-hop） |
-| `fm-store` | `FusionStoreEngine` trait + store-stub 后端 |
+| `fm-store` | `FusionStoreEngine` trait + local-store 后端（默认）+ store-fusion 后端（可选 feature，包 fusion-store fs-core） |
 | `fm-embed` | fusion-mlx bge-m3 embedding（LRU+信号量）+ StubEmbedder |
 | `fm-persist` | SQLite WAL 元数据 schema + CRUD + relation 表（递归 CTE 图遍历） |
 | `fm-server` | UDS JSON-RPC + HTTP 服务 |
@@ -224,7 +230,7 @@ PRD §14 M5 三部分，(a) store-fusion 可选切换、(b) fusion-guard DLP gat
 
 ```bash
 cargo check --workspace        # 编译检查
-cargo test --workspace         # 全离线测试 (425 用例, 排除 fm-py cdylib)
+cargo test --workspace         # 全离线测试 (429 用例, 排除 fm-py cdylib; --features fm-store/store-fusion = 435)
 cargo clippy --workspace --all-targets -- -D warnings   # lint
 cargo fmt --all --check        # 格式检查
 
@@ -245,7 +251,7 @@ cargo fmt --all --check        # 格式检查
 
 ```bash
 # 离线默认（CI 口径）：排除 fm-py（PyO3 cdylib 绑定层，验收走 PyO3 往返，不走单测覆盖率）。
-# regions 90.82%。425 用例全绿。
+# regions 90.82%。429 用例全绿 (--features fm-store/store-fusion = 435)。
 # 注：跑覆盖率前先 `cargo llvm-cov clean`，旧 profraw（含未触发的 bench 插桩二进制）会稀释 regions。
 # engine.rs summarize/consolidate saga + engine_builder.rs !stub 分支离线不可达（走真 mlx LLM/embedding），
 # PRD 验收口径 = live（覆盖这些分支）。

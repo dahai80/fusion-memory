@@ -29,6 +29,13 @@ ulid = { workspace = true }
 thiserror = { workspace = true }
 reqwest = { workspace = true }
 regex = { workspace = true }
+# 凭据脱敏上游: fusion-guard fg-redact (PR fusion-guard#11 / issue #10 `redact_credentials` API,
+# 仅跑凭据子集, 跳 PII)。fg-redact 补 fusion-memory 没有的凭据覆盖 (AWS Secret/JWT/PEM/bearer/
+# GCP/Azure/Stripe/连接串/.env); PII (手机/身份证/银行卡/IPv4/护照/IPv6/国际手机) 由 fusion-memory
+# 自带逻辑脱敏 (比 fg-redact PII 准, 见 redact.rs 段 2)。见 redact.rs。
+# path dep (monorepo 同级兄弟项目 fusion-guard/crates/fg-redact)。100% 离线: 纯本地 path,
+# 无 git fetch / 无 cloud。default 无 feature 门, 始终启用 (凭据脱敏为默认安全基线, §1.16 fail-closed)。
+fg-redact = { path = "../../../fusion-guard/crates/fg-redact" }
 
 [dev-dependencies]
 tokio = { workspace = true }
