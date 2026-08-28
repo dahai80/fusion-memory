@@ -85,6 +85,27 @@ enum Cmd {
         #[command(subcommand)]
         sub: ClusterCmd,
     },
+    /// P0-4: 备份数据目录 (SQLite VACUUM INTO + sled 目录快照) 到目标目录。
+    Backup {
+        /// 备份目标目录 (默认 <home>/backups/<timestamp>)。
+        #[arg(long)]
+        dest: Option<String>,
+    },
+    /// P0-4: 从备份目录恢复 (覆盖现数据目录, 需先停 fm-server)。
+    Restore {
+        /// 备份源目录。
+        #[arg(long)]
+        source: String,
+        /// 确认覆盖现数据目录 (破坏性, 必须显式)。
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// P1-3: 列审计日志 (核心路径 commit/retrieve/consolidate/delete who/when/what)。
+    Audit {
+        /// 仅显示最近 N 条 (默认 50)。
+        #[arg(long, default_value_t = 50)]
+        limit: u64,
+    },
 }
 
 #[derive(Subcommand, Debug)]

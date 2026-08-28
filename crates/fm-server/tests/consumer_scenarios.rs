@@ -37,6 +37,7 @@ fn stub_state() -> HttpState {
     HttpState {
         engine,
         api_key: Arc::new("consumer-key".into()),
+        metrics: fm_server::metrics::HttpMetrics::new(),
     }
 }
 
@@ -102,8 +103,16 @@ async fn cowork_memory_commit_retrieve_node_flow() {
     // 1. memory_commit: 多轮 trajectory → commit → 期望 2 个 turn 级 memory_id
     let (code, body) = post(&app, &two_turn_interaction("ix-cw-1", "sess-cowork")).await;
     assert_eq!(code, 200, "cowork commit body={body}");
-    // result = ["<id1>","<id2>"] (turn 级, 2 turn → 2 id)
+    // P1-1: result 现为 CommitOutcome 对象 {memory_ids, failed_turns}。
     assert!(body.contains(r#""result""#), "cowork commit body={body}");
+    assert!(
+        body.contains(r#""memory_ids""#),
+        "cowork commit body={body}"
+    );
+    assert!(
+        body.contains(r#""failed_turns""#),
+        "cowork commit body={body}"
+    );
     assert!(body.contains('['), "cowork commit body={body}");
     assert!(body.contains(']'), "cowork commit body={body}");
 

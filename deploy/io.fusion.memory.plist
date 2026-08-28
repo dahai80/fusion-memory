@@ -1,0 +1,70 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  P0-1: fusion-memory launchd plist (macOS)。
+  进程守护: KeepAlive=true, 崩溃自动拉起 (验收标准)。
+  RunAtLoad=true 开机自启。
+
+  安装 (用户级 LaunchAgent, 无需 root):
+    mkdir -p ~/Library/LaunchAgents
+    cp deploy/io.fusion.memory.plist ~/Library/LaunchAgents/
+    launchctl load ~/Library/LaunchAgents/io.fusion.memory.plist
+  卸载:
+    launchctl unload ~/Library/LaunchAgents/io.fusion.memory.plist
+    rm ~/Library/LaunchAgents/io.fusion.memory.plist
+  查日志:
+    tail -f ~/.fusion-memory/logs/launchd-stderr.log
+  改 env: 编辑本 plist EnvironmentVariables 字段后重新 load。
+
+  二进制路径: ~/fusion-memory/target/release/fm-server (按部署改 ProgramArguments 第一项)。
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>io.fusion.memory</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>~/fusion-memory/target/release/fm-server</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>FM_HOME</key>
+        <string>~/.fusion-memory</string>
+        <key>FUSION_MEMORY_HTTP_PORT</key>
+        <string>11435</string>
+        <key>FUSION_MEMORY_DIM</key>
+        <string>1024</string>
+        <key>FUSION_MEMORY_STUB</key>
+        <string>1</string>
+        <key>RUST_LOG</key>
+        <string>info</string>
+        <!-- HTTP 必配 Bearer token (生产改强随机)。 -->
+        <!-- <key>FUSION_MEMORY_API_KEY</key> -->
+        <!-- <string>change-me</string> -->
+    </dict>
+
+    <!-- 进程守护: 崩溃自动拉起。验收: kill -9 后拉起。 -->
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- 开机自启。 -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- 崩溃重启间隔 (秒): 防极速崩溃循环烧 CPU。 -->
+    <key>ThrottleInterval</key>
+    <integer>5</integer>
+
+    <!-- 日志。 -->
+    <key>StandardOutPath</key>
+    <string>~/.fusion-memory/logs/launchd-stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>~/.fusion-memory/logs/launchd-stderr.log</string>
+
+    <!-- 仅本机 (离线约束, launchd 无原生 IP 限权, 由 fm-server 内 bind 127.0.0.1 保证)。 -->
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>

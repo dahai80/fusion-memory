@@ -39,6 +39,25 @@ pub struct ConsolidationFailure {
     pub error: String,
 }
 
+/// commit 结果 (P1-1)。成功/失败 turn 分列, 客户端可感知重试失败 turn。
+/// 全部 turn 成功 → failed_turns 空; 全部失败 → memory_ids 空 + failed_turns 满 (非 Err)。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CommitOutcome {
+    /// 成功落库的 turn 级 memory_id 列表 (与 interaction.turns 顺序一致, 跳过的 turn 不含)。
+    pub memory_ids: Vec<MemoryId>,
+    /// 失败 turn 明细 (embed/insert_vector/persist 失败均记此)。
+    pub failed_turns: Vec<TurnFailure>,
+}
+
+/// 单 turn commit 失败明细 (P1-1)。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TurnFailure {
+    pub turn_idx: u32,
+    /// 失败阶段: "embed" / "insert_vector" / "persist"。
+    pub stage: String,
+    pub error: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

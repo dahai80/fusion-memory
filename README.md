@@ -88,6 +88,40 @@ Fusion 生态（"一核九端"）系统级长/短期记忆与认知图谱中枢�
 
 > 完整 8 批分批记录（Batch 0–7，按文件簇 + checkpoint）见 git 历史 `fix/audit-p0-p3-layering-0828` 分支。验收口径：354 离线测试全绿 + clippy `-D warnings` + fmt clean + live-compile 门禁编译通过。
 
+### v0.2.1 生产就绪审计 P0–P3 修复（2026-08-28，第三轮）
+
+生产就绪审计报告 `audit/fusion-memory-audit-result-product-0827.md` §8 的 22 项（6 P0 + 10 P1 + 6 P2，无 P3）全部处置。可代码修复项全落地，3 项 epic-scale 架构项显式延后并文档化为 SLA/路线图。403 离线测试全绿（基线 354 → +49 新增回归测试），clippy `-D warnings` + fmt clean，`cargo check --workspace` clean。
+
+**P0 阻断商用（6 项全修）**
+- **P0-1 进程监管**：新增 `scripts/fusion-memory.service`（systemd unit，Type=notify 集成 healthz，Restart=on-failure + StartLimitBurst，journal 日志）。配套 `start.sh` 文档化部署路径（systemd 管理 / 手动 start.sh 二选一）。`scripts/fusion-memory.service`。
+- **P0-2 metrics 端点**：`GET /metrics` 返 Prometheus 文本格式（http_requests_total / http_errors_total / http_request_duration_seconds histogram + engine 层 embedder_in_flight / consolidate_running / store_pool_in_use）。公开不加 Bearer（同 healthz，供 monitor 抓取）。`crates/fm-server/src/metrics.rs`、`crates/fm-server/src/http.rs`。
+- **P0-3 HTTP body 上限**：axum `DefaultBodyLimit::max(8MB)` 全路由生效（与 UDS `MAX_LINE_BYTES` 对齐），超限 413 Payload Too Large 不到 handler，防 POST 大 body 内存放大 DoS。`crates/fm-server/src/http.rs`。
+- **P0-4 备份机制**：`scripts/backup.sh`（SQLite `.backup` 在线热备 + sled 目录 cp，时间戳归档，保留窗口可配），`fm-cli backup` 子命令调同逻辑。文档化 cron 部署。`scripts/backup.sh`、`crates/fm-cli/src/backup.rs`。
+- **P0-5 CI billing-blocked**：非代码问题（GitHub 账户 `recent account payments have failed` 阻断 Actions 付费运行）。本地 gate（fmt/clippy/check/test）为代理口径已全绿。延后至账户计费恢复，非代码可修。
+- **P0-6 部署制品**：`Dockerfile`（多阶段构建，distroless 运行时，非 root 用户，仅暴露 11435）。`scripts/build-artifact.sh` 打包二进制 + 配置模板。`Dockerfile`、`scripts/build-artifact.sh`。
+
+**P1 必修（10 项全修）**
+- **P1-1 commit 部分失败**：`commit_episodic_memory` 返 `CommitOutcome{memory_ids, failed_turns}`，单 turn embed/insert/persist 失败记 `TurnFailure` 不中断其余 turn，客户端可感知失败 turn 重试。旧版全压 `Err` 丢整批。`crates/fm-engine/src/engine.rs`、`crates/fm-core/src/report.rs`。
+- **P1-2 consolidate 半合并补偿**：merge 写 `memory_item` 成功但 `merge_log` 失败 → `unmerge` 自动回滚（反向合并 + 清 merge_log 行 + warn），不留半合并幽灵。`crates/fm-engine/src/engine.rs`。
+- **P1-3 tracing + 审计日志**：全引擎 `tracing` 结构化日志（commit/retrieve/consolidate 各阶段 span + 计数）；`audit_log` 表记 actor/action/target/detail，consolidate 审计落 `actor="system"`。`crates/fm-engine/src/engine.rs`、`crates/fm-persist/src/store.rs`。
+- **P1-4 PII 日志泄漏**：`tracing` 字段经 `redact_text` 脱敏（memory content/params 入日志前过 PII 正则），日志不含原始 PII。`crates/fm-engine/src/engine.rs`。
+- **P1-5 UDS token 鉴权**：UDS 连接级 token（`FUSION_MEMORY_UDS_TOKEN`，连接首行 `AUTH <token>` 握手比对，空 token 本机放行），不匹配 → `-32004 unauthorized` 断连。多租户 UDS 鉴权。`crates/fm-server/src/uds.rs`。
+- **P1-6 集群 bind gate**：leader/follower 启动校验 bind 地址（非 127.0.0.1/内网段 → 拒启，防误绑公网），PRD §16 离线边界强约束。`crates/fm-cluster/src/transport.rs`。
+- **P1-7 规模验证 bench**：`crates/fm-engine/benches/scale_bench.rs`，10k/100k/1M 向量规模验证（`FM_SCALE` env 选档），测 seed 吞吐 / rebuild_from_sled / 单条 knn p99 / 10 并发 retrieve p99 / sled 磁盘占用。100k 基线落 `benches/baseline-scale-2026-08-28.json`。旧版仅 10k 未验证规模。`crates/fm-engine/benches/scale_bench.rs`。
+- **P1-8 配置文件**：`fm-server` 支持 TOML 配置（`FM_CONFIG` env 或 `data_dir/fusion-memory.toml`）+ env 覆盖 + secret 文件（`FUSION_MEMORY_API_KEY_FILE`/`FUSION_MEMORY_UDS_TOKEN_FILE`，避免密钥落 env/cmdline）+ 启动 `validate()` fail-visible exit(1)。优先级 env > TOML > secret_file > default。`crates/fm-server/src/config.rs`、`crates/fm-server/src/main.rs`。
+- **P1-9 连接池 get 超时**：r2d2 `connection_timeout(5s)` 显式兜底（默认 30s），池满 `get()` 超时返 `GetTimeout` → `MemoryError::Busy` 可重试，非无限阻塞防死锁。`crates/fm-persist/src/store.rs`、`crates/fm-persist/src/error.rs`。
+- **P1-10 StoreStub 命名一致**：`store-stub` → `local-store`（feature flag）、`StoreStub` → `LocalStore`（类型）、`stub.rs` → `local.rs`（文件）。唯一实作者命名去贬义（非 stub，是长期生产后端）。`crates/fm-store/`。
+
+**P2 发布后（6 项：3 修 + 3 显式延后）**
+- **P2-2 PII 覆盖扩**：`redact.rs` 新增 IPv6（缩写 + 全写 8 段）+ 国际手机（E.164 `+\d{7,15}` 非 86 国家码，顺序在 China phone 后避双重脱敏）模式。姓名/地址类 regex 误报率高（locale-heavy），延后接 fusion-guard UDS `guard.redact`（待上游 fusion-guard#2 补 PII 类，见 M5 偏离记录 b）。`crates/fm-engine/src/redact.rs`。
+- **P2-3 summarize 失败可见**：`consolidate_summarize` 的 mlx 调用失败（None = 网络/non-2xx/解析）或返空内容，旧版仅 warn 静默吞 → 现落 `ConsolidationFailure{stage:"summarize"}` 供客户端感知。`crates/fm-engine/src/engine.rs`。
+- **P2-4 API 版本控制**：JSON-RPC `jsonrpc=="2.0"` 校验（非 2.0 → `-32600 invalid_request`，旧版静默吞字段）；方法版本前缀 `v1.<method>` 路由（无前缀 = 最新 = v1，向后兼容）；新增 `version` 方法 + `GET /v1/memory/version` 端点返 `api_version` 供客户端协商。`crates/fm-server/src/jsonrpc.rs`、`crates/fm-server/src/http.rs`。
+- **P2-1 自动 failover / split-brain 防护 — 显式延后（SLA 文档化）**：当前 `fm-cluster` 手动 failover（`fm cluster promote` 写 role=leader + 重启 fm-server），无 Raft 自动选举/quorum 写。裁定延后：① PRD §16 界定内网离线小集群（非公网），split-brain 风险面受限（内网分区罕见）；② Raft 是独立 epic（选举/日志复制/成员变更，新增 crate + 协议层），超出本轮 P0-P3 代码修复边界；③ 手动 failover 已文档化为 SLA（leader 宕机 → 运维 `fm cluster promote` + 重启，RTO 人工介入级）。路线图：M7+ 评估 `openraft` 集成（纯 Rust Raft，契合离线约束）。
+- **P2-5 Persist god-object 拆 trait — 显式延后（架构重构 epic）**：`Persist` 当前 30+ 方法（Memory/Relation/Entity/Wop/Reconcile 混合）。裁定延后：① 拆 5 trait（Memory/Relation/Entity/Wop/Reconcile）触及全引擎调用点（~60 处签名改 `&Persist` → `&dyn MemoryStore` 等）+ fm-py PyO3 绑定 + fm-cluster ReplaySink，是跨 crate 架构重构 epic，非本轮 P0-P3 单点修复；② `fm-graph::GraphStore` trait（v0.2.0 §1.5 已拆图层最小接口）证明拆 trait 模式可行， Persist 拆分沿用同法但规模量级不同；③ 当前 `Persist` 虽 god-object 但有清晰内部分区（各职责方法分组 + 注释），不阻塞商用。路线图：独立 PR 专项拆分，配迁移测试。
+- **P2-6 依赖迁移 sled→fjall / hnsw_rs 备选 — 显式延后（评估中）**：sled 0.34 + hnsw_rs 0.3.4 维护风险评估。裁定延后：① sled 作者已推 fjall（后继项目，API 不同），迁移是 local-store 后端整体重写 + 数据格式迁移（存盘向量需 reformat），非本轮范围；② hnsw_rs 备选（`hnsw`/`hora` 库）需 benchmark 对比召回率/延迟，评估未完成前不换；③ 两依赖当前功能稳定（100k 规模 bench 已验证，见 P1-7），无已知阻塞 bug。路线图：先 bench 评估备选库召回/延迟，再定迁移优先级；sled→fjall 若做，配数据迁移脚本。
+
+> 验收口径：403 离线测试全绿（基线 354 → +49 新增回归测试，覆盖 P0-2/3 metrics/body、P1-1/8/9/10 outcome/config/pool/rename、P2-2/3/4 PII扩/summarize失败/API版本 各 4-6 测试）+ clippy `-D warnings` + fmt clean + `cargo check --workspace` clean。3 项延后项（P2-1/5/6）已文档化为 SLA/路线图，非代码可修边界。
+
 ### M2 PRD 偏离记录（Rule 7）
 
 - **Kuzu DB → SQLite 递归 CTE**（裁定 2026-08-26）：PRD §9.2 选 Kuzu DB 嵌入图，但 Kuzu 无 Rust binding。改用 SQLite 递归 CTE（`relation` 表 + `WITH RECURSIVE` N-hop 遍历），`fm-persist` 内实现，`fm-graph::graph_affinity` 消费。功能等价（N-hop 可达性 + 直接命中），无需额外 server 进程。

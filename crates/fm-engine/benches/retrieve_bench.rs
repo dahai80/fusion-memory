@@ -1,9 +1,9 @@
-//! §13.2 perf 基线 bench: store-stub 10k 条记忆下, 单条 retrieve p99<50ms,
+//! §13.2 perf 基线 bench: local-store 10k 条记忆下, 单条 retrieve p99<50ms,
 //! 10 并发 retrieve p99<200ms。轻量手写 (无 criterion), 结果打印 + 落 JSON。
 //!
 //! 跑法: cargo bench -p fm-engine
 //! 验收门 (PRD §13.2): single p99<50ms, concurrent p99<200ms。
-//! perf gate 针对 store-stub (非 mlx), 用 StubEmbedder 免模型。
+//! perf gate 针对 local-store (非 mlx), 用 StubEmbedder 免模型。
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -12,7 +12,7 @@ use fm_core::{FusionMemoryEngine, Interaction, RetrieveQuery, Turn};
 use fm_embed::StubEmbedder;
 use fm_engine::MemoryEngine;
 use fm_persist::Persist;
-use fm_store::StoreStub;
+use fm_store::LocalStore;
 
 const TOTAL_MEMORIES: usize = 10_000;
 const TURNS_PER_INTERACTION: u32 = 2;
@@ -26,7 +26,7 @@ const CONCURRENT_ITERS: usize = 50;
 fn build_engine() -> MemoryEngine {
     let dir = std::env::temp_dir().join(format!("fm-bench-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    let store = Arc::new(StoreStub::open(&dir, 64).expect("store open"));
+    let store = Arc::new(LocalStore::open(&dir, 64).expect("store open"));
     let persist = Arc::new(Persist::open_in_memory().expect("persist open"));
     let embedder: Arc<dyn fm_embed::Embedder> = Arc::new(StubEmbedder::new(64));
     MemoryEngine::new(store, persist, embedder)
@@ -65,7 +65,7 @@ fn percentile(sorted: &[Duration], p: f64) -> Duration {
 }
 
 fn main() {
-    println!("== §13.2 perf baseline: store-stub {TOTAL_MEMORIES} memories ==");
+    println!("== §13.2 perf baseline: local-store {TOTAL_MEMORIES} memories ==");
     let rt = tokio::runtime::Runtime::new().expect("tokio rt");
     let engine = rt.block_on(async {
         let engine = build_engine();

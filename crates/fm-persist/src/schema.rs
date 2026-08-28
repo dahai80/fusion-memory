@@ -102,6 +102,19 @@ CREATE TABLE IF NOT EXISTS wop_log (\
   at INTEGER NOT NULL\
 )";
 
+// P1-3: 持久化审计日志 — 核心路径 (commit/retrieve/consolidate/delete) 的 who/when/what。
+// actor=调用方标识 (commit 用 session_id, 其余 "system"/RPC origin); action=动作;
+// target_id=操作对象 id; detail=自由文本 (如 retrieve query 摘要)。
+pub const AUDIT_LOG_DDL: &str = "\
+CREATE TABLE IF NOT EXISTS audit_log (\
+  id INTEGER PRIMARY KEY AUTOINCREMENT,\
+  at INTEGER NOT NULL,\
+  actor TEXT NOT NULL,\
+  action TEXT NOT NULL,\
+  target_id TEXT NOT NULL,\
+  detail TEXT NOT NULL\
+)";
+
 pub const INDEX_INTERACTION: &str = "\
 CREATE INDEX IF NOT EXISTS idx_memory_interaction ON memory_item(interaction_id)";
 pub const INDEX_SESSION: &str = "\
@@ -131,6 +144,7 @@ pub const ALL_DDL: &[&str] = &[
     MERGE_LOG_DDL,
     RECONCILE_REPORT_DDL,
     WOP_LOG_DDL,
+    AUDIT_LOG_DDL,
     INDEX_INTERACTION,
     INDEX_SESSION,
     INDEX_TIER,

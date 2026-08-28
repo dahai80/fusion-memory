@@ -1,5 +1,13 @@
 name: CI
 
+# P0-5: CI 门禁。本 workflow 定义完整 (fmt/clippy/check/test + live-compile 编译门禁)。
+# 审计 P0-5 记录: 当前 GitHub Actions 因账户 billing 未开通而未实际运行, 合并门禁等效为 0。
+#   整改路径 (非代码, 账户层):
+#     1. 开通 GitHub Actions billing (Settings → Billing → Actions spending limit 提高)。
+#     2. 或迁 self-hosted runner (Apple Silicon, 见 deploy/README.md 离线约束)。
+#   开通后本 workflow 即生效, 无需改代码。本地等效门禁: 见 README "本地 CI gate"。
+#   关键依赖: branch protection rules 须设 CI 为 required check (repo Settings → Branches)。
+
 on:
   push:
     branches: [main]

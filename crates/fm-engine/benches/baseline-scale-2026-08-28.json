@@ -1,0 +1,17 @@
+{
+  "_doc": "P1-7 scale bench (store-stub, 100k vectors, StubEmbedder dim=64). audit §8 P1-7 scale-unverified closure.",
+  "_run": "FM_SCALE=100k cargo bench -p fm-engine --bench scale_bench",
+  "_machine": "Apple Silicon, release profile",
+  "total_vectors": 100000,
+  "seed_secs": 8.803027625,
+  "seed_throughput_vec_per_s": 11359.73,
+  "rebuild_secs": 8.294574709,
+  "rebuild_loaded": 100000,
+  "sled_disk_mb": 51.0,
+  "single_p50_ms": 0.023625,
+  "single_p99_ms": 0.063042,
+  "concurrency": 10,
+  "concurrent_p50_ms": 4.5285,
+  "concurrent_p99_ms": 6.288166,
+  "_verdict": "100k scale verified. seed ~11.4k vec/s, rebuild ~8.3s (linear w/ N), knn p99 sub-ms, concurrent x10 retrieve p99 6.3ms (well under 200ms target). disk ~0.5KB/vec. No OOM, no degradation."
+}

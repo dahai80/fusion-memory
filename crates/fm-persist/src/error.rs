@@ -109,4 +109,42 @@ mod tests {
         let m = PersistError::Poisoned.to_memory();
         assert!(!m.is_not_found());
     }
+
+    // P1-9: pool get 超时 (GetTimeout, Display 含 "timed out") → MemoryError::Busy (可重试),
+    // 非无限阻塞。模拟 r2d2 GetTimeout 的字符串映射。
+    #[test]
+    fn p1_9_pool_timeout_maps_to_busy() {
+        let e = PersistError::Pool("timed out waiting for connection".into());
+        let m = e.to_memory();
+        assert!(matches!(m, fm_core::MemoryError::Busy(_)), "got {m:?}");
+        assert!(m.retryable(), "Busy 可重试");
+    }
+
+    // P1-9: 真实触发 connection_timeout。1 连池 + 极短超时, 持有唯一连接后并发 get → 超时返 Busy。
+    #[test]
+    fn p1_9_pool_get_timeout_returns_busy_not_block() {
+        use r2d2::Pool;
+        use r2d2_sqlite::SqliteConnectionManager;
+        use std::time::Duration;
+        let mgr = SqliteConnectionManager::memory();
+        let pool = Pool::builder()
+            .max_size(1)
+            .connection_timeout(Duration::from_millis(100))
+            .build(mgr)
+            .expect("pool");
+        // 持有唯一连接, 让第二个 get 超时 (get() 用 configured connection_timeout)
+        let _held = pool.get().expect("first conn");
+        let t0 = std::time::Instant::now();
+        let res = pool.get();
+        let elapsed = t0.elapsed();
+        assert!(res.is_err(), "second get must time out, got {res:?}");
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "must not block forever, elapsed {elapsed:?}"
+        );
+        // 映射到 MemoryError::Busy
+        let pe: PersistError = res.unwrap_err().into();
+        let m = pe.to_memory();
+        assert!(matches!(m, fm_core::MemoryError::Busy(_)), "got {m:?}");
+    }
 }
