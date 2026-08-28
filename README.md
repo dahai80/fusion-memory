@@ -161,7 +161,7 @@ PRD §14 M5 三部分，(a) store-fusion 可选切换、(b) fusion-guard DLP gat
 
 **仍待上游落地（非本轮）**：fusion-store #3/#4（零拷贝后端）、fusion-guard #2（正式 DLP PII 闸）、GitHub 账户计费恢复（CI）。
 
-**v1.0.0 B/C 批次验收**：424 离线测试全绿（基线 408 → +16 新增 election 测试 + B-1 加密 4 测试已并入基线），clippy `-D warnings` + fmt clean + `cargo check --workspace` clean。B-1 静态加密 4 测试（明文兼容/加密往返/错 key fail-open/无 cipher 读密文）+ B-2 选举 16 测试（投票 4 判据 + quorum + 竞胜负 + 租约 + live TCP vote listener + from_env 边界）。
+**v1.0.0 B/C 批次验收**：425 离线测试全绿（基线 408 → +16 election 单元 + B-1 加密 4 已并入基线 + 1 B-2 e2e 全链路 orbit），clippy `-D warnings` + fmt clean + `cargo check --workspace` clean。B-1 静态加密 4 测试（明文兼容/加密往返/错 key fail-open/无 cipher 读密文）+ B-2 选举 16 单元测试（投票 4 判据 + quorum + 竞胜负 + 租约 + live TCP vote listener + from_env 边界）+ B-2 e2e 1 测试（`fm-server/tests/election_failover.rs`，orbit 全链路：leader 宕 → campaign → quorum → epoch++/role 文件 → detect Leader）。
 
 ### v1.0.0 静态加密
 
@@ -186,7 +186,7 @@ PRD §14 M5 三部分，(a) store-fusion 可选切换、(b) fusion-guard DLP gat
 - **优先级**：节点列表下标小者优先（确定性，避随机，同 term 平票有定论）。
 - **成员**：静态，env `FUSION_MEMORY_CLUSTER_NODES=host:port,host:port,...`（全节点），自身下标 `FUSION_MEMORY_CLUSTER_NODE_ID`（0-based）。未配 → 无选举（单机/手动模式兼容，零开销）。成员变更 = 改 env 重启（非动态 add/remove，Rule 2）。
 - **新增依赖**：无（复用 transport TCP / wop_log / role epoch 文件 / async_trait）。
-- **M3 e2e 场景重验**：commit→catchup 一致 / 增量 seq 推进 / leader 宕机→自动选举→新 leader 续写（原 promote 路径改自动）。16 新测试覆盖（投票授权/拒绝 4 判据、quorum、竞选胜/败、租约到期、live TCP vote listener、from_env 边界）。
+- **M3 e2e 场景重验**：commit→catchup 一致 / 增量 seq 推进 / leader 宕机→自动选举→新 leader 续写（原 promote 路径改自动）。16 election 单元测试覆盖（投票授权/拒绝 4 判据、quorum、竞选胜/败、租约到期、live TCP vote listener、from_env 边界）+ 1 e2e 全链路集成测试 `fm-server/tests/election_failover.rs`：驱动生产入口 `spawn_cluster(role=Follower)` + 真 MemoryEngine + 真 in-process TCP，验证 leader 宕 → `follower_orbit` campaign → quorum → 写 epoch++ + role=Leader 文件 → `detect_role_with_home` 读 Leader（补 orbit 全链路覆盖，旧 claim 仅单元 + 手动 promote）。
 - **手动模式保留**：`fm cluster promote` 仍可用（无 election 配置时）。`fm cluster status` 显示 election 状态 + epoch。
 
 ### v1.0.0 fuzz + 负载压测
@@ -222,7 +222,7 @@ PRD §14 M5 三部分，(a) store-fusion 可选切换、(b) fusion-guard DLP gat
 
 ```bash
 cargo check --workspace        # 编译检查
-cargo test --workspace         # 全离线测试 (301 用例, 排除 fm-py cdylib)
+cargo test --workspace         # 全离线测试 (425 用例, 排除 fm-py cdylib)
 cargo clippy --workspace --all-targets -- -D warnings   # lint
 cargo fmt --all --check        # 格式检查
 
@@ -243,7 +243,7 @@ cargo fmt --all --check        # 格式检查
 
 ```bash
 # 离线默认（CI 口径）：排除 fm-py（PyO3 cdylib 绑定层，验收走 PyO3 往返，不走单测覆盖率）。
-# regions 90.82%。301 用例全绿。
+# regions 90.82%。425 用例全绿。
 # 注：跑覆盖率前先 `cargo llvm-cov clean`，旧 profraw（含未触发的 bench 插桩二进制）会稀释 regions。
 # engine.rs summarize/consolidate saga + engine_builder.rs !stub 分支离线不可达（走真 mlx LLM/embedding），
 # PRD 验收口径 = live（覆盖这些分支）。
