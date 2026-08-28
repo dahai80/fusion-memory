@@ -102,4 +102,4 @@ Coverage (`cargo-llvm-cov` + `llvm-tools`): run `cargo llvm-cov clean` first —
 - This is a **Rust** sub-project, not a Python domain app — do not assume the shared `.venv` applies here.
 - Hard constraint inherited from the ecosystem: **100% offline** — no cloud API calls, no external network requests. HTTP only to `127.0.0.1`.
 - Respect the business boundary strictly: vector page storage goes in `fusion-store`, code AST goes in `fusion-rag`. `fusion-memory` consumes `fusion-store`'s vector index, does not reimplement it.
-- When the monorepo-wide CLAUDE.md (`/Users/dahai/fusion/CLAUDE.md`) is updated to list `fusion-memory`, keep this file consistent with it.
+- When the monorepo-wide CLAUDE.md (`<repo-root>/CLAUDE.md`) is updated to list `fusion-memory`, keep this file consistent with it.
