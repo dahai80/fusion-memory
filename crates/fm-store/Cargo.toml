@@ -9,11 +9,16 @@ description = "fusion-memory 向量存储 trait + local-store 生产后端"
 
 [features]
 default = ["local-store"]
+# local-store: 长期生产默认后端 (hnsw_rs + sled)。fm-cli/fm-py/fm-server + 全测试硬编码使用
+# LocalStore 具体类型 → local-store 须默认开, 不可关 (关则全 workspace 编译断)。
 local-store = ["hnsw_rs", "sled"]
-# §1.4: store-fusion 与 local-store 互斥后端。非空壳: 命中时 fusion.rs 显式 compile_error
-# (上游 fusion-store trait 对齐前阻断编译), 不再产出"无 store 实现的废 crate"。
-# 上游就绪后换真实 impl (见 fusion.rs)。
-store-fusion = []
+# §1.4: store-fusion 可选后端 (上游 fusion-store#3 trait 对齐已落地, rev 47d5b83)。
+# 与 local-store **共存** (非互斥): default 仍 local-store, store-fusion 为附加可选后端。
+# 想用 fs-core mmap 后端的调用方按需 enable; 默认调用方不变。两后端同时编译不冲突
+# (fs-core 用 heed/mmap, local-store 用 hnsw_rs/sled, 无符号/type 冲突)。
+# 距离语义: fs-core cosine() 返 distance (1-cos_sim), fusion-memory search_knn 返 similarity,
+# adapter 转 similarity = 1.0 - distance (与 local-store DistCosine 同公式)。
+store-fusion = ["fs-core"]
 
 [dependencies]
 fm-core = { workspace = true }
@@ -23,6 +28,12 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 hnsw_rs = { workspace = true, optional = true }
 sled = { workspace = true, optional = true }
+# §1.4: fusion-store fs-core 上游 (issue #3 get_vector/list_vector_ids trait 对齐, rev 47d5b83)。
+# path dep (monorepo 同级兄弟项目 fusion-store/crates/fs-core)。100% 离线: 纯本地 path,
+# 无 git fetch / 无 cloud。fusion 本身是 monorepo ("一核九端"), fusion-memory checkout 伴
+# fusion-store 同级; 独立 clone fusion-memory 无兄弟项目时 store-fusion feature 编译断
+# (需 monorepo 全量 checkout)。default 不含此 feature, 不影响默认 build。
+fs-core = { path = "../../../fusion-store/crates/fs-core", optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

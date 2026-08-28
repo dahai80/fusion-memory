@@ -1,12 +1,42 @@
-//! PII 正则脱敏。PRD R8/§10.4: guard 未落地前 fusion-memory 自带最小脱敏。
+//! PII + 凭据脱敏。PRD R8/§10.4。
+//!
+//! 两段:
+//! 1. 凭据脱敏委托上游 fusion-guard fg-redact (PR fusion-guard#11 / issue #10
+//!    `redact_credentials` API)。fg-redact 跑凭据子集 (private_key/jwt/oauth_bearer/api_key/
+//!    conn_string/password/secret_kv/env_kv/netrc/aws_secret), 补 fusion-memory 原没有的
+//!    凭据覆盖 (AWS Secret/JWT/PEM/bearer/GCP/Azure/Stripe/连接串/.env)。**不跑** fg-redact
+//!    的 PII (email/ipv4/credit_card/phone/id_number) —— 其 PII 行为比 fusion-memory 差
+//!    (身份证被 credit_card 错吞 / id_number 误吞长数字 / +86 phone 被 border 拒), 由段 2 自脱。
+//! 2. PII 脱敏 fusion-memory 自带 (中文语境优先, 顺序敏感避误吞): 手机(含+86/0086)/邮箱/
+//!    身份证/银行卡(Luhn)/IPv4/护照/IPv6/国际手机。比 fg-redact PII 准, 已测。
 //!
 //! commit/import 写入路径在 embed+persist 前脱敏, 故向量/图谱/检索全用脱敏后内容。
-//! 占位符 [REDACTED:type], 不含原文。已脱敏内容不重复处理 (幂等)。
+//! 占位符 [REDACTED:type], 不含原文。已脱敏内容不重复处理 (幂等): 凭据占位 [REDACTED:jwt]
+//!    等无数字, PII 正则不二次匹配; PII 占位无凭据特征, 凭据模式不二次匹配。
 //! §1.16: 默认开 (fail-closed 安全默认), env FUSION_MEMORY_REDACT_PII=0/false 显式关闭 (测试/无 PII 场景)。
 //! MemoryEngine::redact 字段控制; engine_builder 与 fm-py 入口读 env 决定是否调 with_redact()。
 
 use regex::Regex;
 use std::sync::OnceLock;
+
+// 上游 fg-redact Redactor 单例 (凭据脱敏, 编译期正则一次性建, 运行时复用)。
+// new() 返 Result (M4 fail-closed); 编译失败 → 凭据段跳过, 仅 PII 段兜底 (不阻断服务)。
+static FG_REDACTOR: OnceLock<Option<fg_redact::Redactor>> = OnceLock::new();
+
+fn fg_redactor() -> Option<&'static fg_redact::Redactor> {
+    FG_REDACTOR
+        .get_or_init(|| match fg_redact::Redactor::new() {
+            Ok(r) => {
+                tracing::info!("fg-redact redactor initialized (credential redaction base)");
+                Some(r)
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "fg-redact init failed, fallback to PII-only redaction");
+                None
+            }
+        })
+        .as_ref()
+}
 
 // PII 模式 (中文语境优先, regex crate 无 lookaround, 靠顺序敏感避免误吞):
 // 0 手机号: 1[3-9] 开头 11 位, 或 +86/0086 前缀的国际写法 (§1.16 扩覆盖)
@@ -70,17 +100,27 @@ fn luhn_valid(digits: &str) -> bool {
     sum.is_multiple_of(10)
 }
 
-/// 脱敏单段文本。逐 pattern 命中段替换为 [REDACTED:tag]。
-/// 顺序敏感: 身份证(18位)/银行卡(13-19位) 先于手机(11位), 长串先替换为无数字占位,
+/// 脱敏单段文本。两段: (1) fg-redact 凭据 (AWS/JWT/PEM/bearer/api_key/conn_string/password/
+/// .env 等); (2) fusion-memory PII (手机/邮箱/身份证/银行卡/IPv4/护照/IPv6/国际手机)。
+///
+/// PII 段顺序敏感: 身份证(18位)/银行卡(13-19位) 先于手机(11位), 长串先替换为无数字占位,
 /// 短模式不再匹配已占位段, 避免手机吞银行卡前 11 位。
 /// 银行卡模式额外做 Luhn 校验, 不合法的长数字串 (订单号/时间戳) 不脱敏, 避免污染内容。
+/// 幂等: 凭据占位 [REDACTED:jwt] 等无数字不被 PII 正则二次匹配; PII 占位无凭据特征不被二次匹配。
 pub fn redact_text(input: &str) -> String {
+    // 阶段 1: fg-redact 凭据脱敏 (上游基座, 凭据子集)。PII 不跑 fg-redact (行为差, 段 2 自脱)。
+    let after_cred = match fg_redactor() {
+        Some(r) => r.redact_credentials(input),
+        None => input.to_string(),
+    };
+
+    // 阶段 2: fusion-memory PII 脱敏。
     let regexes = redact_regexes();
-    // 零拷贝快速路径: 任一未命中 → 原样返回 (常见 case)
-    if !regexes.iter().any(|re| re.is_match(input)) {
-        return input.to_string();
+    // 零拷贝快速路径: PII 未命中 → 凭据段结果原样返回 (可能仅凭据已脱敏)
+    if !regexes.iter().any(|re| re.is_match(&after_cred)) {
+        return after_cred;
     }
-    let mut out = input.to_string();
+    let mut out = after_cred;
     // 顺序: 身份证(2) > 银行卡(3) > 手机(0) > 邮箱(1) > IPv4(4) > 护照(5) > IPv6(6) > 国际手机(7)
     // 国际手机(7) 须在 手机(0) 后: +8613... 先被 0 脱敏, 7 只命中非 86 国家码 (E.164)。
     let order = [2usize, 3, 0, 1, 4, 5, 6, 7];
@@ -279,5 +319,49 @@ mod tests {
         let out = redact_text("电话 +8613912345678");
         let count = out.matches("[REDACTED:phone]").count();
         assert_eq!(count, 1, "+86 应单次脱敏, 实际 {count} 次: {out}");
+    }
+
+    #[test]
+    fn credential_jwt_redacted_by_fg_redact() {
+        // fg-redact 凭据段: JWT 三段式 (fusion-memory 原 PII 模式不覆盖) 应脱敏
+        let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c";
+        let out = redact_text(format!("token {jwt} here").as_str());
+        assert!(out.contains("[REDACTED:jwt]"), "JWT 凭据应脱敏: {out}");
+        assert!(!out.contains("SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"));
+    }
+
+    #[test]
+    fn credential_password_redacted_by_fg_redact() {
+        // fg-redact 凭据段: password= 键值应脱敏 (值脱敏, 标签 password= 保留可见)
+        let out = redact_text("config password=hunter2pass end");
+        assert!(
+            out.contains("[REDACTED:password]"),
+            "password 凭据应脱敏: {out}"
+        );
+        assert!(!out.contains("hunter2pass"), "凭据值须脱敏");
+        assert!(out.contains("password="), "凭据标签保留可见: {out}");
+    }
+
+    #[test]
+    fn credential_and_pii_both_redacted() {
+        // 凭据 + PII 同段: 凭据段先脱 password 值, PII 段脱手机号
+        let out = redact_text("password=secret123 and call 13912345678");
+        assert!(out.contains("[REDACTED:password]"), "凭据脱敏: {out}");
+        assert!(out.contains("[REDACTED:phone]"), "PII 脱敏: {out}");
+        assert!(!out.contains("secret123"));
+        assert!(!out.contains("13912345678"));
+    }
+
+    #[test]
+    fn fg_redact_pii_not_applied_idcard_still_local() {
+        // 关键: fg-redact 的 credit_card 不吞身份证 (redact_credentials 跳 PII);
+        // fusion-memory 本地 idcard 模式脱敏 → 标签 [REDACTED:idcard] 非 bankcard
+        let out = redact_text("身份证 11010119900307888X 复印件");
+        assert!(out.contains("[REDACTED:idcard]"), "本地 idcard 脱敏: {out}");
+        assert!(!out.contains("11010119900307888X"));
+        assert!(
+            !out.contains("[REDACTED:bankcard]"),
+            "fg-redact credit_card 不介入 PII: {out}"
+        );
     }
 }
