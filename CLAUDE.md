@@ -10,7 +10,7 @@ Authoritative spec: `architecture/fusion-memory-prd-0825.md` (repo root `archite
 
 ## Current Status
 
-**Built — M0 through M6 landed.** Rust Cargo workspace, 11 crates (`fm-cli`/`fm-core`/`fm-embed`/`fm-engine`/`fm-graph`/`fm-persist`/`fm-py`/`fm-server`/`fm-similarity`/`fm-store`/`fm-cluster`). 301 offline tests green, regions 90.82% offline / 92.47% live. Milestone detail + PRD deviation records in `README.md`. Remaining: M5 partially done (PII redaction + perf baseline landed; store-fusion switch + guard DLP gate degraded — see README "M5 PRD 偏离记录"). M4 outward integration PRs: `fusion-cowork` #68 + `fusion-agent-studio` #247 merged; `fusion-code` #151 open.
+**Built — M0 through M6 landed.** Rust Cargo workspace, 11 crates (`fm-cli`/`fm-core`/`fm-embed`/`fm-engine`/`fm-graph`/`fm-persist`/`fm-py`/`fm-server`/`fm-similarity`/`fm-store`/`fm-cluster`). 425 offline tests green, regions 90.82% offline / 92.47% live. Milestone detail + PRD deviation records in `README.md`. Remaining: M5 partially done (PII redaction + perf baseline landed; store-fusion switch + guard DLP gate degraded — see README "M5 PRD 偏离记录"). M4 outward integration PRs: `fusion-cowork` #68 + `fusion-agent-studio` #247 merged; `fusion-code` #151 open.
 
 ## Architecture (from PRD)
 
@@ -68,7 +68,7 @@ Follows the monorepo Rust pattern (see `fusion-cli` / `fusion-design`):
 
 ```bash
 cargo check --workspace                            # Compile check
-cargo test --workspace                             # All offline tests (301 cases, excludes fm-py cdylib)
+cargo test --workspace                             # All offline tests (425 cases, excludes fm-py cdylib)
 cargo test -p fm-engine --test mlx_live_extract --features mlx-live -- --include-ignored   # Single live test (needs fusion-mlx)
 cargo clippy --workspace --all-targets -- -D warnings   # Lint (warnings are errors in CI)
 cargo fmt --all --check                            # Format check
