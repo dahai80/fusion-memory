@@ -52,3 +52,11 @@ harness = false
 [[bench]]
 name = "scale_bench"
 harness = false
+
+# §13.2 live perf 基线: 真 bge-m3 (dim=1024) 端到端 retrieve 延迟。关闭 RC 已知限制 #1。
+# gate: --features mlx-live。需起 fusion-mlx 加载 bge-m3。
+# 跑: cargo bench -p fm-engine --features mlx-live --bench retrieve_bench_live
+[[bench]]
+name = "retrieve_bench_live"
+harness = false
+required-features = ["mlx-live"]

@@ -73,6 +73,7 @@ cargo test -p fm-engine --test mlx_live_extract --features mlx-live -- --include
 cargo clippy --workspace --all-targets -- -D warnings   # Lint (warnings are errors in CI)
 cargo fmt --all --check                            # Format check
 cargo bench -p fm-engine --bench retrieve_bench    # §13.2 perf baseline (store-stub 10k, no model)
+cargo bench -p fm-engine --features mlx-live --bench retrieve_bench_live   # §13.2 live perf (real bge-m3 dim=1024, needs fusion-mlx; closes RC known-limit #1)
 ```
 
 Toolchain: edition 2021, MSRV 1.87. System `rustc` (Homebrew, 1.96) compiles directly — no `rustup`, no `rust-toolchain.toml` (pinning 1.94 would block the Homebrew toolchain; Rule 7 deviation noted in README).
