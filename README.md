@@ -1,5 +1,7 @@
 # fusion-memory
 
+> **当前版本：v1.1.0-rc.1（Release Candidate）** — 商用发布候选。硬阻断项全闭环 + 真测试验证。已知限制见 `CHANGELOG.md` "Known limitations"，非阻塞 RC。GA → v1.1.0。
+
 Fusion 生态（"一核九端"）系统级长/短期记忆与认知图谱中枢。解决 Agent 跨 session 状态断层、重复提问、context window 爆炸，目标：越用越懂用户。
 
 - 权威 PRD：`architecture/fusion-memory-prd-0825.md`
