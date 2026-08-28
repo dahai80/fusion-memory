@@ -10,6 +10,7 @@ pub mod engine_builder;
 pub mod engine_handle;
 pub mod http;
 pub mod jsonrpc;
+pub mod metrics;
 pub mod uds;
 
 use std::sync::Arc;
@@ -49,6 +50,7 @@ pub async fn serve(cfg: ServerConfig, opts: ServeOpts) -> Result<(), String> {
     if cfg.uds_enabled {
         let h = handle.clone();
         let sock = cfg.sock_path.clone();
+        let uds_token = Arc::new(cfg.uds_token.clone());
         // broadcast → oneshot 适配 (uds/http 签名收 oneshot::Receiver)
         let mut brx = shutdown_tx.subscribe();
         let (otx, orx) = tokio::sync::oneshot::channel();
@@ -56,7 +58,7 @@ pub async fn serve(cfg: ServerConfig, opts: ServeOpts) -> Result<(), String> {
             let _ = brx.recv().await;
             let _ = otx.send(());
         });
-        set.spawn(async move { uds::serve(sock, h, orx).await });
+        set.spawn(async move { uds::serve(sock, h, orx, uds_token).await });
     }
 
     let http_enabled = cfg.http_ok();
@@ -67,6 +69,7 @@ pub async fn serve(cfg: ServerConfig, opts: ServeOpts) -> Result<(), String> {
         let h = handle.clone();
         let port = cfg.http_port;
         let api_key = Arc::new(cfg.api_key.clone());
+        let metrics = crate::metrics::HttpMetrics::new();
         let mut brx = shutdown_tx.subscribe();
         let (otx, orx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
@@ -74,7 +77,11 @@ pub async fn serve(cfg: ServerConfig, opts: ServeOpts) -> Result<(), String> {
             let _ = otx.send(());
         });
         set.spawn(async move {
-            let state = http::HttpState { engine: h, api_key };
+            let state = http::HttpState {
+                engine: h,
+                api_key,
+                metrics,
+            };
             http::serve(state, port, orx).await
         });
     }

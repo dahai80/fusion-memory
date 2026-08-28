@@ -1,6 +1,6 @@
 [package]
 name = "fm-engine"
-version = "0.2.0"
+version = "0.2.1"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -34,8 +34,14 @@ regex = { workspace = true }
 tokio = { workspace = true }
 tempfile = { workspace = true }
 fm-embed = { workspace = true }
+fm-persist = { workspace = true, features = ["test-utils"] }
 
 # §13.2 perf 基线 bench (轻量手写, 无 criterion 重依赖, CI 友好)。
 [[bench]]
 name = "retrieve_bench"
+harness = false
+
+# P1-7: 规模验证 bench (10k/100k/1M)。跑法: FM_SCALE=<10k|100k|1m> cargo bench -p fm-engine --bench scale_bench
+[[bench]]
+name = "scale_bench"
 harness = false

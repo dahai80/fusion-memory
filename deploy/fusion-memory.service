@@ -1,0 +1,62 @@
+# P0-1: fusion-memory systemd unit (Linux)。
+# 进程守护: Restart=always, 崩溃 5s 内自动拉起 (验收标准)。
+#
+# 安装:
+#   sudo cp deploy/fusion-memory.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now fusion-memory
+# 查日志:
+#   journalctl -u fusion-memory -f
+# 改 env: 编辑本文件 Environment= 行或用 EnvironmentFile=/etc/fusion-memory/env
+#
+# 二进制路径: /usr/local/bin/fm-server (cargo build --release 后拷入)。
+[Unit]
+Description=fusion-memory server (UDS JSON-RPC + HTTP)
+Documentation=https://github.com/dahai80/fusion-memory
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=fm
+Group=fm
+
+# 二进制 (按需改路径)。
+ExecStart=/usr/local/bin/fm-server
+
+# 运行环境 (按部署改)。FM_HOME 数据目录必须 fm 用户可写。
+Environment=FM_HOME=/var/lib/fusion-memory
+Environment=FUSION_MEMORY_HTTP_PORT=11435
+Environment=FUSION_MEMORY_DIM=1024
+Environment=FUSION_MEMORY_STUB=1
+# HTTP 必配 Bearer token (生产改强随机)。取消注释或用 EnvironmentFile 注入。
+#Environment=FUSION_MEMORY_API_KEY=change-me
+#EnvironmentFile=/etc/fusion-memory/env
+
+# 限权: 仅 127.0.0.1 (无外网, 离线约束)。
+IPAddressDeny=any
+IPAddressAllow=127.0.0.1
+IPAddressAllow=localhost
+
+# 资源限。
+LimitNOFILE=65536
+MemoryMax=4G
+
+# 守护: 崩溃自动重启, 间隔 5s (验收: kill -9 后 5s 内拉起)。
+Restart=always
+RestartSec=5s
+
+# 残留 sock 清理。
+ExecStartPre=/bin/rm -f /var/lib/fusion-memory/fusion-memory.sock
+
+# 日志走 journald。
+StandardOutput=journal
+StandardError=journal
+
+# 安装时创建数据目录。
+RuntimeDirectory=fusion-memory
+StateDirectory=fusion-memory
+StateDirectoryMode=0750
+
+[Install]
+WantedBy=multi-user.target

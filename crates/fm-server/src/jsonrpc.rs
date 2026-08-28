@@ -1,14 +1,14 @@
 //! JSON-RPC 2.0 共用 dispatch。UDS + HTTP 复用。PRD §11.2。
 //!
-//! 方法: commit/retrieve/consolidate/get/delete/audit/health
+//! 方法: commit/retrieve/consolidate/get/delete/audit/health/version
 //!      + memory.retrieve_context (issue #1/#4 fusion-event 契约)
 //!      + delete_scope/count (issue #2 fusion-agent-studio adapter 契约)。
 //! delete/delete_scope 需 params.confirm=true（B5 二次确认）。
+//! P2-4: API 版本控制。jsonrpc=="2.0" 校验 (非 2.0 → -32600); 方法版本前缀 v1.<method>
+//!       路由 (无前缀 = 最新 = v1); version 方法返支持的 api_version 供客户端协商。
 
 use axum::http::StatusCode;
-use fm_core::{
-    ConsolidationReport, FormattedContext, Interaction, MemoryId, MemoryItem, RetrieveQuery,
-};
+use fm_core::{ConsolidationReport, FormattedContext, Interaction, MemoryItem, RetrieveQuery};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing::{debug, warn};
@@ -50,6 +50,13 @@ impl RpcError {
             message: "parse error".into(),
         }
     }
+    // P2-4: invalid_request → -32600 (JSON-RPC spec)。jsonrpc 字段非 "2.0" 用此。
+    pub fn invalid_request(msg: impl Into<String>) -> Self {
+        Self {
+            code: -32600,
+            message: msg.into(),
+        }
+    }
     pub fn method_not_found(m: &str) -> Self {
         Self {
             code: -32601,
@@ -89,6 +96,13 @@ impl RpcError {
             message: msg.into(),
         }
     }
+    // P1-5: Unauthorized → -32004 (UDS token 不匹配, 连接级)。多租户 UDS 鉴权。
+    pub fn unauthorized() -> Self {
+        Self {
+            code: -32004,
+            message: "unauthorized".into(),
+        }
+    }
 
     // §3.1: 按 MemoryError 分类返回码。NotFound→-32001, Poisoned→-32002, Busy→-32003, 其余→-32603。
     // 旧版全压 -32603 internal, 客户端无法区分 "引擎 bug"/"id 不存在"/"瞬时 busy"/"锁中毒"。
@@ -105,10 +119,27 @@ impl RpcError {
     }
 }
 
+/// P2-4: 当前 API 版本。方法前缀 v1.<method> 显式钉版本; 无前缀 = 最新 = v1。
+/// version 方法返此值供客户端协商。升级破坏性变更时 bump, 老 vN 仍路由保向后兼容。
+pub const API_VERSION: u32 = 1;
+
 /// §3.8: dispatch 取 owned RpcRequest, 各 handler 取 owned params, 消除 `req.params.clone()` 深克隆。
 /// 旧版 8 handler 全 `serde_json::from_value(req.params.clone())` — 已反序列化的 params 再深克隆整树再解析。
 /// id 仍 clone 进响应 (Value 多为小整数/字符串, 克隆廉价, 响应需保留 id 不可避免)。
 pub async fn dispatch(req: RpcRequest, engine: &EngineHandle) -> RpcResponse {
+    // P2-4: jsonrpc 版本校验。非 "2.0" → -32600 invalid_request (spec), 旧版静默吞 (字段 _ 丢弃)。
+    if req.jsonrpc != "2.0" {
+        warn!(jsonrpc = %req.jsonrpc, "rpc rejected: jsonrpc field not 2.0");
+        return RpcResponse {
+            jsonrpc: "2.0".into(),
+            result: None,
+            error: Some(RpcError::invalid_request(format!(
+                "jsonrpc must be \"2.0\", got {:?}",
+                req.jsonrpc
+            ))),
+            id: req.id,
+        };
+    }
     // 拆字段: method 仅借用做匹配, params move 进 handler, id move 进响应。
     let RpcRequest {
         method,
@@ -116,6 +147,12 @@ pub async fn dispatch(req: RpcRequest, engine: &EngineHandle) -> RpcResponse {
         id,
         jsonrpc: _,
     } = req;
+    // P2-4: 方法版本前缀路由。v1.<method> 显式钉版本 (校验 == 当前版), 无前缀 = 最新 = v1。
+    // memory.<x> 命名空间 (issue 契约) 不以 v 开头, 不受影响。
+    let method = match method.strip_prefix("v1.") {
+        Some(rest) => rest.to_string(),
+        None => method,
+    };
     debug!(method = %method, "rpc dispatch");
     let res: Result<Value, RpcError> = match method.as_str() {
         "commit" => commit(params, engine).await,
@@ -130,6 +167,8 @@ pub async fn dispatch(req: RpcRequest, engine: &EngineHandle) -> RpcResponse {
         "count" => count(params, engine).await,
         "audit" => audit(params, engine).await,
         "health" => Ok(Value::String("ok".into())),
+        // P2-4: version 方法 — 返当前 api_version 供客户端协商。
+        "version" => Ok(serde_json::json!({"api_version": API_VERSION})),
         other => Err(RpcError::method_not_found(other)),
     };
     match res {
@@ -176,7 +215,7 @@ pub fn serialize_response(resp: &RpcResponse) -> String {
 /// -32002 Poisoned/-32003 Busy → 503; -32603 internal → 500。
 pub fn http_status_for_error(code: i64) -> StatusCode {
     match code {
-        -32700 | -32601 | -32602 => StatusCode::BAD_REQUEST,
+        -32700 | -32600 | -32601 | -32602 => StatusCode::BAD_REQUEST,
         -32001 => StatusCode::NOT_FOUND,
         -32002 | -32003 => StatusCode::SERVICE_UNAVAILABLE,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
@@ -193,12 +232,14 @@ struct CommitParams {
 async fn commit(params: Value, engine: &EngineHandle) -> Result<Value, RpcError> {
     let p: CommitParams =
         serde_json::from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
-    let ids: Vec<MemoryId> = engine
-        .commit_episodic_memory(&p.session_id, &p.interaction)
+    // P1-1: 返回详细结果 (memory_ids + failed_turns), 客户端可感知失败 turn 并重试。
+    // 旧契约 result: ["id1","id2"] (纯数组) → 改 result: {"memory_ids":[...],"failed_turns":[...]}。
+    // 消费方契约测试仅断言 contains "result"/[/",故宽松断言不破; 新增字段 failed_turns。
+    let outcome: fm_core::CommitOutcome = engine
+        .commit_episodic_memory_detailed(&p.session_id, &p.interaction)
         .await
         .map_err(|e| RpcError::from_engine(&e))?;
-    serde_json::to_value(ids.iter().map(|i| i.0.clone()).collect::<Vec<_>>())
-        .map_err(|e| RpcError::internal(e.to_string()))
+    serde_json::to_value(&outcome).map_err(|e| RpcError::internal(e.to_string()))
 }
 
 /// retrieve params。
@@ -610,8 +651,17 @@ mod tests {
             "interaction":{"id":"ix1","session_id":"s","turns":[{"turn_idx":0,"user_message":"hi","assistant_message":"yo","tool_calls":[]}],"timestamp":1,"metadata":{}}
         });
         let v = dispatch_ok(&rpc("commit", params, 2), &eng).await;
-        let ids: Vec<String> = serde_json::from_value(v).unwrap();
-        assert_eq!(ids, vec!["m0".to_string()]);
+        // P1-1: commit 返回 CommitOutcome 对象 {memory_ids, failed_turns}, 非纯 id 数组。
+        let outcome: fm_core::CommitOutcome = serde_json::from_value(v).unwrap();
+        assert_eq!(
+            outcome
+                .memory_ids
+                .iter()
+                .map(|i| i.0.clone())
+                .collect::<Vec<_>>(),
+            vec!["m0".to_string()]
+        );
+        assert!(outcome.failed_turns.is_empty(), "no turn should fail");
         assert!(committed.lock().await.contains(&"ix1".to_string()));
     }
 
@@ -756,6 +806,67 @@ mod tests {
     fn parse_line_rejects_garbage() {
         assert!(parse_line("not json").is_none());
         assert!(parse_line("").is_none());
+    }
+
+    // ---- P2-4: API 版本控制 ----
+
+    fn rpc_with_version(v: &str, method: &str, params: serde_json::Value, id: i64) -> RpcRequest {
+        RpcRequest {
+            jsonrpc: v.into(),
+            method: method.into(),
+            params,
+            id: Value::from(id),
+        }
+    }
+
+    #[tokio::test]
+    async fn p2_4_rejects_non_2_0_jsonrpc() {
+        // jsonrpc != "2.0" → -32600 invalid_request (旧版静默吞, 字段丢弃)
+        let (eng, _) = stub_handle();
+        let resp = dispatch(
+            rpc_with_version("1.0", "health", serde_json::json!({}), 1),
+            &eng,
+        )
+        .await;
+        let err = resp.error.expect("non-2.0 应被拒");
+        assert_eq!(err.code, -32600, "jsonrpc 非 2.0 → invalid_request");
+        assert!(err.message.contains("2.0"), "错误信息须指明需 2.0");
+    }
+
+    #[tokio::test]
+    async fn p2_4_v1_prefix_routes_to_handler() {
+        // v1.health 显式钉版本 → 路由到 health (校验 == 当前版, 转发)
+        let (eng, _) = stub_handle();
+        let resp = dispatch(
+            rpc_with_version("2.0", "v1.health", serde_json::json!({}), 2),
+            &eng,
+        )
+        .await;
+        assert!(resp.error.is_none(), "v1. 前缀应路由成功");
+        assert_eq!(resp.result, Some(Value::String("ok".into())));
+    }
+
+    #[tokio::test]
+    async fn p2_4_version_method_returns_api_version() {
+        // version 方法 → {api_version: 1} 供客户端协商
+        let (eng, _) = stub_handle();
+        let v = dispatch_ok(&rpc("version", serde_json::json!({}), 3), &eng).await;
+        assert_eq!(v["api_version"], API_VERSION);
+    }
+
+    #[tokio::test]
+    async fn p2_4_bare_method_routes_as_latest() {
+        // 无前缀 = 最新 = v1 (向后兼容: 现有客户端无前缀调用不受影响)
+        let (eng, _) = stub_handle();
+        let v = dispatch_ok(&rpc("health", serde_json::json!({}), 4), &eng).await;
+        assert_eq!(v, Value::String("ok".into()));
+    }
+
+    #[test]
+    fn p2_4_invalid_request_http_status() {
+        // -32600 invalid_request → 400 BAD_REQUEST (http_status_for_error 映射)
+        use axum::http::StatusCode;
+        assert_eq!(http_status_for_error(-32600), StatusCode::BAD_REQUEST);
     }
 
     // §2.9: RPC 错误码 → HTTP 状态码映射。引擎错误不再埋进 200 body。

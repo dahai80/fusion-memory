@@ -9,7 +9,7 @@ use fm_embed::{EmbedConfig, Embedder, MlxEmbedder, StubEmbedder};
 use fm_engine::entity_extract::{EntityExtractor, ExtractConfig, MlxEntityExtractor};
 use fm_engine::MemoryEngine;
 use fm_persist::Persist;
-use fm_store::StoreStub;
+use fm_store::LocalStore;
 use tracing::info;
 
 use crate::config::ServerConfig;
@@ -25,7 +25,8 @@ pub fn build_server_engine(cfg: &ServerConfig, stub: bool) -> Result<ServerEngin
     let store_dir = cfg.data_dir.join("store");
     let db_path = cfg.data_dir.join("memory.db");
     let dim = if stub { 64 } else { cfg.dim };
-    let store = Arc::new(StoreStub::open(&store_dir, dim).map_err(|e| format!("store open: {e}"))?);
+    let store =
+        Arc::new(LocalStore::open(&store_dir, dim).map_err(|e| format!("store open: {e}"))?);
     let persist = Arc::new(Persist::open(&db_path).map_err(|e| format!("persist open: {e}"))?);
 
     let embedder: Arc<dyn Embedder> = if stub {

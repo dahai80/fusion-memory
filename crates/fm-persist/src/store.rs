@@ -1,6 +1,7 @@
 //! SQLite 持久化。WAL 模式 + MemoryItem 全字段 CRUD。PRD §4.3, §8.4。
 
 use std::path::Path;
+use std::time::Duration;
 
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
@@ -18,6 +19,10 @@ const N_HOP_RESULT_LIMIT: i64 = 256;
 // §1.1: r2d2 连接池 (打破单 Mutex<Connection> 串行)。PooledConnection DerefMut → Connection,
 // 调用点 (prepare_cached / transaction) 零改动。WAL 原生 1 写 N 读, 池大小 8 够并发读。
 const POOL_SIZE: u32 = 8;
+// P1-9: pool get 超时 (r2d2 connection_timeout, get() 默认用它)。池满时 get() 等空连最多 5s,
+// 超时返 GetTimeout (Display 含 "timed out") → 映射 MemoryError::Busy (可重试), 非无限阻塞。
+// r2d2 默认 30s; 显式 5s 兜底防死锁/慢查询拖垮整体。connection_timeout 须 >0 (r2d2 会 panic)。
+const POOL_GET_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct Persist {
     pool: Pool<SqliteConnectionManager>,
@@ -28,8 +33,11 @@ impl Persist {
         let mgr = SqliteConnectionManager::file(path).with_init(|conn| {
             Self::init_conn(conn).map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
         });
-        let pool = Pool::builder().max_size(POOL_SIZE).build(mgr)?;
-        info!("persist opened (WAL, pool size {POOL_SIZE})");
+        let pool = Pool::builder()
+            .max_size(POOL_SIZE)
+            .connection_timeout(POOL_GET_TIMEOUT)
+            .build(mgr)?;
+        info!("persist opened (WAL, pool size {POOL_SIZE}, get_timeout 5s)");
         Ok(Self { pool })
     }
 
@@ -39,8 +47,11 @@ impl Persist {
         let mgr = SqliteConnectionManager::memory().with_init(|conn| {
             Self::init_conn(conn).map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
         });
-        let pool = Pool::builder().max_size(POOL_SIZE).build(mgr)?;
-        debug!("persist opened (in-memory, pool size {POOL_SIZE})");
+        let pool = Pool::builder()
+            .max_size(POOL_SIZE)
+            .connection_timeout(POOL_GET_TIMEOUT)
+            .build(mgr)?;
+        debug!("persist opened (in-memory, pool size {POOL_SIZE}, get_timeout 5s)");
         Ok(Self { pool })
     }
 
@@ -68,6 +79,33 @@ impl Persist {
         self.pool
             .get()
             .map_err(|e| PersistError::Pool(e.to_string()))
+    }
+
+    /// P0-4: 备份 SQLite 到目标文件。用 VACUUM INTO 生成一致快照 (WAL 合并进单文件, 无需停写)。
+    /// 目标文件不应已存在 (SQLite VACUUM INTO 要求目标不存在)。返回写入字节数。
+    pub fn backup_sqlite(&self, dest: impl AsRef<Path>) -> PersistResult<u64> {
+        let dest = dest.as_ref();
+        if dest.exists() {
+            return Err(PersistError::Io(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!(
+                    "backup target already exists: {} (refusing overwrite)",
+                    dest.display()
+                ),
+            )));
+        }
+        let conn = self.conn()?;
+        // VACUUM INTO 在线一致快照: 不阻塞写, 产出独立可移植 .db 文件 (含全部 schema+数据)。
+        let dest_str = dest.to_str().ok_or_else(|| {
+            PersistError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "backup path not utf-8",
+            ))
+        })?;
+        conn.execute_batch(&format!("VACUUM INTO '{}'", dest_str.replace('\'', "''")))?;
+        let bytes = std::fs::metadata(dest).map(|m| m.len()).unwrap_or(0);
+        info!(dest = %dest.display(), bytes, "sqlite backup done (VACUUM INTO)");
+        Ok(bytes)
     }
 
     pub fn put_memory(&self, item: &MemoryItem) -> PersistResult<()> {
@@ -287,6 +325,26 @@ impl Persist {
             "UPDATE memory_item SET tombstone=1 WHERE id=?1",
             params![id],
         )?;
+        Ok(())
+    }
+
+    /// 反 tombstone: 恢复 source 记忆可见性 (P1-2 half-merge 补偿 + unmerge 路径共用)。
+    /// 与 tombstone_memory 对称, 仅置 tombstone=0, 不重建向量 (向量由调用方按需 insert_vector)。
+    pub fn untombstone_memory(&self, id: &str) -> PersistResult<()> {
+        let conn = self.conn()?;
+        conn.execute(
+            "UPDATE memory_item SET tombstone=0 WHERE id=?1",
+            params![id],
+        )?;
+        Ok(())
+    }
+
+    /// P1-2 测试钩子: DROP merge_log 表使后续 record_merge 报错, 注入 half-merge 场景。
+    /// 仅 feature="test-utils", 生产永不启用。
+    #[cfg(feature = "test-utils")]
+    pub fn break_merge_log_for_test(&self) -> PersistResult<()> {
+        let conn = self.conn()?;
+        conn.execute("DROP TABLE IF EXISTS merge_log", [])?;
         Ok(())
     }
 
@@ -722,6 +780,49 @@ ORDER BY first_hop ASC LIMIT ?3";
         )?;
         Ok(())
     }
+
+    /// P1-3: 追加审计日志 (核心路径 who/when/what)。失败仅 warn 不阻断核心路径。
+    pub fn append_audit(
+        &self,
+        at: u64,
+        actor: &str,
+        action: &str,
+        target_id: &str,
+        detail: &str,
+    ) -> PersistResult<()> {
+        let conn = self.conn()?;
+        conn.execute(
+            "INSERT INTO audit_log(at,actor,action,target_id,detail) VALUES(?1,?2,?3,?4,?5)",
+            params![at as i64, actor, action, target_id, detail],
+        )?;
+        Ok(())
+    }
+
+    /// P1-3: 列审计日志 (fm-cli audit 用)。limit=None → 全量 (倒序)。
+    pub fn list_audit(&self, limit: Option<u64>) -> PersistResult<Vec<AuditLogEntry>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT id,at,actor,action,target_id,detail FROM audit_log ORDER BY id DESC LIMIT ?1",
+        )?;
+        let row_to_audit = |r: &rusqlite::Row| -> rusqlite::Result<AuditLogEntry> {
+            Ok(AuditLogEntry {
+                id: r.get::<_, i64>(0)? as u64,
+                at: r.get::<_, i64>(1)? as u64,
+                actor: r.get(2)?,
+                action: r.get(3)?,
+                target_id: r.get(4)?,
+                detail: r.get(5)?,
+            })
+        };
+        // limit=None → 用 i64::MAX 等价全量 (倒序 + LIMIT MAX), 避免双 SQL 分支。
+        let lim = limit.unwrap_or(i64::MAX as u64) as i64;
+        let rows = stmt.query_map(params![lim], row_to_audit)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
 }
 
 /// merge_log 条目 (fm-cli unmerge 展示用)。
@@ -741,6 +842,17 @@ pub struct WopEntry {
     pub op: String,
     pub payload: String,
     pub at: i64,
+}
+
+/// P1-3: audit_log 条目 (核心路径 who/when/what, fm-cli audit 展示用)。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditLogEntry {
+    pub id: u64,
+    pub at: u64,
+    pub actor: String,
+    pub action: String,
+    pub target_id: String,
+    pub detail: String,
 }
 
 const _: () = {

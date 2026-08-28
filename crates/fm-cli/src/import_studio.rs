@@ -16,7 +16,7 @@ use fm_core::{EntityNode, EntityType, MemoryItem, MemoryTier, MemoryType};
 use fm_embed::{EmbedConfig, Embedder, MlxEmbedder, StubEmbedder};
 use fm_engine::MemoryEngine;
 use fm_persist::Persist;
-use fm_store::StoreStub;
+use fm_store::LocalStore;
 use rusqlite::Connection;
 use tracing::{info, warn};
 
@@ -319,7 +319,8 @@ pub fn build_import_engine(home: &Option<String>, stub: bool) -> Result<MemoryEn
     let store_dir = dir.join("store");
     let db_path = dir.join("memory.db");
     let dim = if stub { 64 } else { 1024 };
-    let store = Arc::new(StoreStub::open(&store_dir, dim).map_err(|e| format!("store open: {e}"))?);
+    let store =
+        Arc::new(LocalStore::open(&store_dir, dim).map_err(|e| format!("store open: {e}"))?);
     let persist = Arc::new(Persist::open(&db_path).map_err(|e| format!("persist open: {e}"))?);
     let embedder: Arc<dyn Embedder> = if stub {
         Arc::new(StubEmbedder::new(dim))

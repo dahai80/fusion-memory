@@ -15,6 +15,10 @@ use std::sync::OnceLock;
 // 3 银行卡: 13-19 位连续数字 (配 Luhn 校验, 避免误吞订单号/时间戳等长数字串)
 // 4 IPv4
 // 5 护照: 大写字母开头 8-9 位字母数字 (中国因私护照 E+8数字 / 通用 G/E/D+8位)
+// 6 IPv6: P2-2 扩覆盖。至少 2 个冒号 (含 :: 缩写), hex 段 1-4 位。避开单词/时间 (单词无冒号)。
+//   覆盖 2001:db8::1 / fe80::1 / ::1 / 2001:0db8:0000:0000:0000:0000:0000:0001 全写。
+// 7 国际手机: P2-2 扩覆盖。+ 后 7-15 位 (E.164), 非 86 国家码 (86 由模式 0 先脱敏)。
+//   顺序在 0 之后, 故 +8613... 已被 0 替换, 此模式只命中 +1.../+44... 等。
 static PATTERNS: &[&str] = &[
     r"(?:\+86|0086)?1[3-9]\d{9}",
     r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}",
@@ -22,10 +26,18 @@ static PATTERNS: &[&str] = &[
     r"\d{13,19}",
     r"\b(?:\d{1,3}\.){3}\d{1,3}\b",
     r"\b[EeGgDd]\d{8}\b",
+    // IPv6: 至少 2 冒号, 每段 1-4 hex。容忍 :: (0 次重复段)。最简实用形。
+    r"\b[0-9a-fA-F]{1,4}(?::[0-9a-fA-F]{1,4}){2,7}\b|::[0-9a-fA-F]{1,4}(?::[0-9a-fA-F]{1,4}){0,6}\b",
+    // 国际手机: + 后 7-15 纯数字 (E.164 最短 7 最长 15)。须紧跟非数字边界避免吞后续。
+    r"\+\d{7,15}\b",
 ];
 
 // 占位符标签 (与 PATTERNS 下标对应)
-const TAGS: &[&str] = &["phone", "email", "idcard", "bankcard", "ip", "passport"];
+const TAGS: &[&str] = &[
+    "phone", "email", "idcard", "bankcard", "ip", "passport",
+    "ip",    // IPv6 复用 ip 标签 (P2-2)
+    "phone", // 国际手机复用 phone 标签 (P2-2)
+];
 
 static REDACT_REGEXES: OnceLock<Vec<Regex>> = OnceLock::new();
 
@@ -69,8 +81,9 @@ pub fn redact_text(input: &str) -> String {
         return input.to_string();
     }
     let mut out = input.to_string();
-    // 顺序: 身份证(2) > 银行卡(3) > 手机(0) > 邮箱(1) > IP(4) > 护照(5)
-    let order = [2usize, 3, 0, 1, 4, 5];
+    // 顺序: 身份证(2) > 银行卡(3) > 手机(0) > 邮箱(1) > IPv4(4) > 护照(5) > IPv6(6) > 国际手机(7)
+    // 国际手机(7) 须在 手机(0) 后: +8613... 先被 0 脱敏, 7 只命中非 86 国家码 (E.164)。
+    let order = [2usize, 3, 0, 1, 4, 5, 6, 7];
     for idx in order {
         let re = &regexes[idx];
         if idx == 3 {
@@ -231,5 +244,40 @@ mod tests {
         // §1.16 回归: 扩覆盖后裸 11 位手机仍命中
         let out = redact_text("电话 13912345678");
         assert!(out.contains("[REDACTED:phone]"));
+    }
+
+    #[test]
+    fn ipv6_redacted() {
+        // P2-2: IPv6 应脱敏 (缩写 + 全写)
+        let out = redact_text("node at 2001:db8::1 and fe80::1 alive");
+        assert!(out.contains("[REDACTED:ip]"), "IPv6 缩写应脱敏, got: {out}");
+        assert!(!out.contains("2001:db8::1"));
+        assert!(!out.contains("fe80::1"));
+    }
+
+    #[test]
+    fn ipv6_full_form_redacted() {
+        // P2-2: IPv6 全写 8 段
+        let out = redact_text("addr 2001:0db8:0000:0000:0000:0000:0000:0001 ok");
+        assert!(out.contains("[REDACTED:ip]"), "IPv6 全写应脱敏, got: {out}");
+    }
+
+    #[test]
+    fn intl_phone_generic_redacted() {
+        // P2-2: 非 86 国家码国际手机 (E.164) 应脱敏
+        let out = redact_text("call +12125550100 or +447911123456");
+        assert!(
+            out.contains("[REDACTED:phone]"),
+            "国际手机应脱敏, got: {out}"
+        );
+        assert!(!out.contains("12125550100"));
+    }
+
+    #[test]
+    fn china_plus86_not_double_redacted() {
+        // P2-2 回归: +8613... 由模式 0 脱敏, 不应再触发国际手机模式 (幂等, 无双重占位)
+        let out = redact_text("电话 +8613912345678");
+        let count = out.matches("[REDACTED:phone]").count();
+        assert_eq!(count, 1, "+86 应单次脱敏, 实际 {count} 次: {out}");
     }
 }

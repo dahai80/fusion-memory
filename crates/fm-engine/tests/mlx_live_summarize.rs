@@ -15,7 +15,7 @@ use fm_engine::{
     MemoryEngine,
 };
 use fm_persist::Persist;
-use fm_store::StoreStub;
+use fm_store::LocalStore;
 
 fn live_xcfg() -> ExtractConfig {
     let api_key = std::env::var("FUSION_MEMORY_MLX_API_KEY").unwrap_or_else(|_| "change-me".into());
@@ -35,7 +35,7 @@ fn tmp_engine_real_extractor(dim: usize) -> MemoryEngine {
     let n = COUNTER.fetch_add(1, Ordering::SeqCst);
     let dir = std::env::temp_dir().join(format!("fm-live-sum-{n}"));
     let _ = std::fs::remove_dir_all(&dir);
-    let store = Arc::new(StoreStub::open(&dir, dim).unwrap());
+    let store = Arc::new(LocalStore::open(&dir, dim).unwrap());
     let persist = Arc::new(Persist::open_in_memory().unwrap());
     // 摘要写新记忆用 embedder; 真路径用 bge-m3 (dim=1024), 但 stub 也走通逻辑。
     // 这里用 stub embedder 覆盖 store.insert_vector 分支, 摘要本体靠 mlx chat。

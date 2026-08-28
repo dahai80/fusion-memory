@@ -71,7 +71,18 @@ impl Leader {
 
     /// 绑定监听端口, 返回 TcpListener + 实际端口 (0→OS 分配)。serve_listener 复用。
     /// §1.8: bind 用可配 bind_addr (非硬编码 127.0.0.1), 支持内网跨机部署。
+    /// P1-6: 非 loopback 绑定 + 无 token → 拒启动 (防跨机明文 PII 外泄)。
+    /// allow_no_token 不豁免非 loopback (该 flag 仅单机测试, 跨机必鉴权)。
     pub async fn bind(&self) -> ClusterResult<(TcpListener, u16)> {
+        if !is_loopback(&self.bind_addr) && self.cluster_token.is_none() {
+            error!(
+                bind = %self.bind_addr,
+                "cluster leader bind to non-loopback without token, refusing start (P1-6)"
+            );
+            return Err(ClusterError::BindRequiresToken {
+                addr: self.bind_addr.clone(),
+            });
+        }
         let listener = TcpListener::bind(format!("{}:{}", self.bind_addr, self.port)).await?;
         let port = listener.local_addr()?.port();
         info!(port, bind = %self.bind_addr, "cluster leader bound");
@@ -192,6 +203,17 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
         diff |= x ^ y;
     }
     diff == 0
+}
+
+/// P1-6: 判定 bind_addr 是否 loopback (127.0.0.1/::1/localhost)。非 loopback 绑定需鉴权。
+/// 0.0.0.0 / 通配 / 内网 IP / 域名 → 视为非 loopback (保守, 域名解析前无法确认)。
+fn is_loopback(addr: &str) -> bool {
+    let a = addr.trim();
+    a == "127.0.0.1"
+        || a == "::1"
+        || a.eq_ignore_ascii_case("localhost")
+        || a == "[::1]"
+        || a.starts_with("127.")
 }
 
 /// follower: 连 leader, 周期 fetch wop 增量本地重放 + 心跳。PRD §16.5。
@@ -785,6 +807,66 @@ mod tests {
         assert_eq!(seq, 0);
         assert!(!failed);
         leader_task.abort();
+    }
+
+    #[tokio::test]
+    async fn bind_refuses_non_loopback_without_token() {
+        // P1-6: 0.0.0.0 绑定 + 无 token → BindRequiresToken, 不 bind。
+        let source = Arc::new(StubSource {
+            entries: Mutex::new(vec![]),
+        });
+        let leader = Leader::new(source, 0).with_bind_addr("0.0.0.0");
+        let err = leader.bind().await;
+        assert!(err.is_err(), "non-loopback bind without token must refuse");
+        match err.unwrap_err() {
+            ClusterError::BindRequiresToken { addr } => {
+                assert_eq!(addr, "0.0.0.0");
+            }
+            other => panic!("expected BindRequiresToken, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn bind_refuses_non_loopback_even_with_allow_no_token() {
+        // P1-6: allow_no_token 不豁免非 loopback (跨机必鉴权, 该 flag 仅单机测试)。
+        let source = Arc::new(StubSource {
+            entries: Mutex::new(vec![]),
+        });
+        let leader = Leader::new(source, 0)
+            .with_bind_addr("10.0.0.5")
+            .with_allow_no_token(true);
+        let err = leader.bind().await;
+        assert!(
+            matches!(err, Err(ClusterError::BindRequiresToken { .. })),
+            "allow_no_token must not bypass non-loopback gate, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bind_allows_non_loopback_with_token() {
+        // P1-6: 0.0.0.0 + 配 token → 放行 bind (实际绑 0 端口, OS 分配)。
+        let source = Arc::new(StubSource {
+            entries: Mutex::new(vec![]),
+        });
+        let leader = Leader::new(source, 0)
+            .with_bind_addr("0.0.0.0")
+            .with_token(Some("cluster-secret".into()));
+        let res = leader.bind().await;
+        assert!(res.is_ok(), "non-loopback + token should bind, got {res:?}");
+    }
+
+    #[tokio::test]
+    async fn bind_allows_loopback_without_token() {
+        // P1-6: loopback 127.0.0.1 + 无 token → 放行 (向后兼容, 单机 loopback 风险低)。
+        let source = Arc::new(StubSource {
+            entries: Mutex::new(vec![]),
+        });
+        let leader = Leader::new(source, 0); // 默认 bind_addr=127.0.0.1
+        let res = leader.bind().await;
+        assert!(
+            res.is_ok(),
+            "loopback bind without token should pass, got {res:?}"
+        );
     }
 
     #[test]

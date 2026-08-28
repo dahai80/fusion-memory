@@ -280,7 +280,7 @@ impl EntityExtractor for MlxEntityExtractor {
                 }
             }
             None => {
-                warn!(raw = %content, "entity extract json parse failed (content+vector still stored)");
+                warn!(raw = %redact_for_log(&content), "entity extract json parse failed (content+vector still stored)");
                 ExtractResult {
                     entities: Vec::new(),
                     success: false,
@@ -288,6 +288,12 @@ impl EntityExtractor for MlxEntityExtractor {
             }
         }
     }
+}
+
+/// 日志脱敏: redact PII + 截断到 128 字符, 防日志泄漏原始 content。P1-4。
+pub fn redact_for_log(content: &str) -> String {
+    let redacted = crate::redact::redact_text(content);
+    redacted.chars().take(128).collect()
 }
 
 /// 纯函数版: 直接给 LLM 原始输出文本, 解析转 EntityNode。供测试 + 上层复用。
@@ -385,6 +391,25 @@ mod tests {
     fn slug_normalizes() {
         assert_eq!(slug("Rust Lang"), "rust-lang");
         assert_eq!(slug("  Go  "), "go");
+    }
+
+    #[test]
+    fn redact_for_log_strips_pii() {
+        let out = redact_for_log("call 13912345678 mail user@example.com");
+        assert!(!out.contains("13912345678"), "phone must be redacted");
+        assert!(!out.contains("user@example.com"), "email must be redacted");
+    }
+
+    #[test]
+    fn redact_for_log_truncates_long_content() {
+        let long = "x".repeat(500);
+        let out = redact_for_log(&long);
+        assert_eq!(out.chars().count(), 128, "log preview capped at 128 chars");
+    }
+
+    #[test]
+    fn redact_for_log_preserves_short_clean() {
+        assert_eq!(redact_for_log("not json at all"), "not json at all");
     }
 
     #[test]

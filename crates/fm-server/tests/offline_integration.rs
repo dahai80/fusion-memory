@@ -1,5 +1,5 @@
 //! 离线集成测试: 真服务链路 (stub engine 经 HTTP app 往返)。
-//! 覆盖 engine_builder stub 分支 + http handle_rpc + jsonrpc dispatch + StoreStub trait
+//! 覆盖 engine_builder stub 分支 + http handle_rpc + jsonrpc dispatch + LocalStore trait
 //! 在 fm-server binary 实例化被调 (消除单态化 0 计数假象)。
 //! PRD §11.2 验收: commit/retrieve/consolidate HTTP 往返 + 鉴权。
 
@@ -26,6 +26,7 @@ fn stub_state() -> HttpState {
     HttpState {
         engine,
         api_key: Arc::new("test-key".into()),
+        metrics: fm_server::metrics::HttpMetrics::new(),
     }
 }
 
@@ -50,7 +51,7 @@ const COMMIT_BODY: &str = r#"{"jsonrpc":"2.0","method":"commit","params":{"sessi
 
 #[tokio::test]
 async fn http_commit_retrieve_consolidate_roundtrip() {
-    // 真链路: commit → StoreStub insert_vector + Persist put → retrieve → consolidate
+    // 真链路: commit → LocalStore insert_vector + Persist put → retrieve → consolidate
     let st = stub_state();
     let app = fm_server::http::app(st);
 
@@ -65,7 +66,7 @@ async fn http_commit_retrieve_consolidate_roundtrip() {
     assert_eq!(code, 200, "commit body={body}");
     assert!(body.contains("result"), "commit body={body}");
 
-    // 2. retrieve (走 StubEmbedder embed → StoreStub search_knn)
+    // 2. retrieve (走 StubEmbedder embed → LocalStore search_knn)
     let ret_body =
         r#"{"jsonrpc":"2.0","method":"retrieve","params":{"text":"rust sqlite","top_k":5},"id":2}"#;
     let (code, body) = post(

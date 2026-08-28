@@ -21,7 +21,7 @@ use fm_core::{FusionMemoryEngine, Interaction, RetrieveQuery};
 use fm_embed::{Embedder, StubEmbedder};
 use fm_engine::MemoryEngine;
 use fm_persist::Persist;
-use fm_store::StoreStub;
+use fm_store::LocalStore;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::PyString;
@@ -66,7 +66,7 @@ impl PyEngine {
         std::fs::create_dir_all(&dir).map_err(|e| perr(format!("mkdir: {e}")))?;
         let dim = if stub { 64 } else { 1024 };
         let store =
-            Arc::new(StoreStub::open(dir.join("store"), dim).map_err(|e| perr(e.to_string()))?);
+            Arc::new(LocalStore::open(dir.join("store"), dim).map_err(|e| perr(e.to_string()))?);
         let persist =
             Arc::new(Persist::open(dir.join("memory.db")).map_err(|e| perr(e.to_string()))?);
         let embedder: Arc<dyn Embedder> = if stub {

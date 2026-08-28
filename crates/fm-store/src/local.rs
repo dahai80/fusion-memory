@@ -1,4 +1,4 @@
-//! store-stub 长期生产后端。PRD §8.2/§8.4。
+//! local-store 长期生产后端。PRD §8.2/§8.4。
 //!
 //! hnsw_rs (内存 HNSW 索引) + sled (KV + 向量持久化 + tombstone)。
 //! 崩溃恢复: 启动从 sled `vec` tree 重放重建 hnsw，跳过 tombstone。
@@ -41,7 +41,7 @@ fn cosine_sim(a: &[f32], b: &[f32]) -> f32 {
     }
 }
 
-pub struct StoreStub {
+pub struct LocalStore {
     db: Db,
     // §3.11: 旧版每次 vec_tree()/tomb_tree()/kv_tree() 都 db.open_tree → 每调用一次 sled 路径解析 + tree 句柄分配。
     // search_knn 单次至少 open vec+tomb 两次; 高 QPS 下成倍放大 open_tree 开销。
@@ -53,7 +53,7 @@ pub struct StoreStub {
     hnsw: RwLock<Hnsw<'static, f32, DistCosine>>,
 }
 
-impl StoreStub {
+impl LocalStore {
     pub fn open(path: impl AsRef<Path>, dim: usize) -> StoreResult<Self> {
         if dim == 0 {
             return Err(StoreError::Dimension {
@@ -87,12 +87,12 @@ impl StoreStub {
             hnsw: RwLock::new(hnsw),
         };
         stub.rebuild_from_sled()?;
-        info!(dim = stub.dim, "store-stub opened");
+        info!(dim = stub.dim, "local-store opened");
         Ok(stub)
     }
 
     pub fn open_temp(dim: usize) -> StoreResult<Self> {
-        let dir = std::env::temp_dir().join(format!("fm-store-stub-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("fm-local-store-{}", std::process::id()));
         Self::open(&dir, dim)
     }
 
@@ -240,7 +240,7 @@ impl StoreStub {
     }
 }
 
-impl FusionStoreEngine for StoreStub {
+impl FusionStoreEngine for LocalStore {
     fn put_kv(&self, key: &[u8], value: &[u8]) -> fm_core::MemoryResult<()> {
         self.kv_tree
             .insert(key, value)
@@ -253,7 +253,7 @@ impl FusionStoreEngine for StoreStub {
             .kv_tree
             .get(key)
             .map_err(|e| StoreError::to_memory(StoreError::Sled(e.to_string())))?;
-        // §3.16: store-stub 非 mmap, sled::IVec 需 .as_ref().to_vec() 拷出 (IVec 生命周期绑 db)。
+        // §3.16: local-store 非 mmap, sled::IVec 需 .as_ref().to_vec() 拷出 (IVec 生命周期绑 db)。
         // ZeroCopyBuffer 类型名源自 store-fusion mmap 蓝图; stub 下实为 owned, 已在 trait_def 注释标注。
         Ok(res.map(|ia| ZeroCopyBuffer::new(ia.as_ref().to_vec())))
     }
@@ -374,9 +374,9 @@ impl FusionStoreEngine for StoreStub {
         Ok(())
     }
 
-    // §1.4: trait 化 list_vector_ids, 引擎经 dyn FusionStoreEngine 调用, 不绑死 StoreStub。
+    // §1.4: trait 化 list_vector_ids, 引擎经 dyn FusionStoreEngine 调用, 不绑死 LocalStore。
     fn list_vector_ids(&self) -> fm_core::MemoryResult<Vec<u64>> {
-        StoreStub::list_vector_ids(self).map_err(StoreError::to_memory)
+        LocalStore::list_vector_ids(self).map_err(StoreError::to_memory)
     }
 
     fn dimension(&self) -> usize {
@@ -386,7 +386,7 @@ impl FusionStoreEngine for StoreStub {
 
 // §2.13: 进程退出时 sled 异步刷盘可能丢尾写。Drop 显式 flush + flush trees 兜底优雅落盘。
 // flush 失败只 warn 不 panic (析构中 panic 不安全); 1s 批刷窗口外的写已落 WAL, 崩溃可恢复。
-impl Drop for StoreStub {
+impl Drop for LocalStore {
     fn drop(&mut self) {
         if let Err(e) = self.tomb_tree.flush() {
             warn!(error = %e, "Drop: tomb_tree flush failed");
@@ -400,7 +400,7 @@ impl Drop for StoreStub {
         if let Err(e) = self.db.flush() {
             warn!(error = %e, "Drop: db flush failed");
         }
-        debug!("store-stub dropped (flushed)");
+        debug!("local-store dropped (flushed)");
     }
 }
 
@@ -408,13 +408,13 @@ impl Drop for StoreStub {
 mod tests {
     use super::*;
 
-    fn tmp_store(dim: usize) -> StoreStub {
+    fn tmp_store(dim: usize) -> LocalStore {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, Ordering::SeqCst);
         let dir = std::env::temp_dir().join(format!("fm-store-test-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        StoreStub::open(&dir, dim).unwrap()
+        LocalStore::open(&dir, dim).unwrap()
     }
 
     #[test]
@@ -477,12 +477,12 @@ mod tests {
                 .as_nanos()
         ));
         {
-            let s = StoreStub::open(&dir, 3).unwrap();
+            let s = LocalStore::open(&dir, 3).unwrap();
             s.insert_vector(30, &[1.0, 0.0, 0.0]).unwrap();
             s.insert_vector(31, &[0.0, 1.0, 0.0]).unwrap();
             s.flush().unwrap();
         }
-        let s2 = StoreStub::open(&dir, 3).unwrap();
+        let s2 = LocalStore::open(&dir, 3).unwrap();
         assert_eq!(s2.get_vector(30).unwrap(), Some(vec![1.0, 0.0, 0.0]));
         let hits = s2.search_knn(&[1.0, 0.0, 0.0], 1).unwrap();
         assert_eq!(hits[0].0, 30);
@@ -499,18 +499,18 @@ mod tests {
                 .as_nanos()
         ));
         {
-            let s = StoreStub::open(&dir, 2).unwrap();
+            let s = LocalStore::open(&dir, 2).unwrap();
             s.insert_vector(40, &[1.0, 0.0]).unwrap();
             s.delete_vector(40).unwrap();
             s.flush().unwrap();
         }
-        let s2 = StoreStub::open(&dir, 2).unwrap();
+        let s2 = LocalStore::open(&dir, 2).unwrap();
         assert_eq!(s2.get_vector(40).unwrap(), None);
     }
 
     #[test]
     fn open_temp_works() {
-        let s = StoreStub::open_temp(4).unwrap();
+        let s = LocalStore::open_temp(4).unwrap();
         assert_eq!(s.dimension(), 4);
         s.insert_vector(1, &[1.0, 0.0, 0.0, 0.0]).unwrap();
         assert!(s.get_vector(1).unwrap().is_some());

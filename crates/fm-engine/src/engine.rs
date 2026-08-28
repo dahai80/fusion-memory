@@ -15,7 +15,7 @@ use fm_core::{
 use fm_embed::{vector_id_from_ulid, Embedder};
 use fm_persist::{MergeLogEntry, Persist};
 use fm_store::FusionStoreEngine;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::entity_extract::{chat_completion, EntityExtractor, ExtractConfig, ExtractResult};
 use crate::scoring;
@@ -26,7 +26,7 @@ const MERGE_KNN: usize = 5;
 const SUMMARIZE_MIN_EPISODIC: usize = 3;
 
 pub struct MemoryEngine {
-    // §1.4: store 抽象 trait-object 化 (非硬编码 Arc<StoreStub>)。store-fusion 后端落地时
+    // §1.4: store 抽象 trait-object 化 (非硬编码 Arc<LocalStore>)。store-fusion 后端落地时
     // 仅换 build 端构造, 引擎字段/方法/调用方零改动。旧版焊死具体类型 → 抽象死亡, store-fusion 空壳。
     store: Arc<dyn FusionStoreEngine>,
     persist: Arc<Persist>,
@@ -115,7 +115,7 @@ impl MemoryEngine {
         &self.persist
     }
 
-    // §1.4: store getter 返回 trait-object (非具体 StoreStub)。
+    // §1.4: store getter 返回 trait-object (非具体 LocalStore)。
     pub fn store(&self) -> &Arc<dyn FusionStoreEngine> {
         &self.store
     }
@@ -267,11 +267,26 @@ impl MemoryEngine {
                     self.persist
                         .record_merge(&src.id, &tgt.id, "ann-sim+shared-entity", at)
                 {
+                    // P1-2: half-merge 补偿。record_merge 失败 → source 已 tombstone + 向量已删,
+                    // 但 merge_log 未落 → source 不可见且无 unmerge 入口 (幽灵)。补偿:
+                    // 反 tombstone 恢复 source 可见 + 重新插入向量, 使 source 回到合并前状态。
+                    // 失败仍记入 failures 供 reconcile/客户端感知, 但不留半合并脏状态。
+                    warn!(source = %src.id, error = %e, "record_merge failed, compensating half-merge");
+                    if let Err(ue) = self.persist.untombstone_memory(&src.id) {
+                        error!(source = %src.id, error = %ue, "half-merge untombstone compensation failed, source left tombstoned");
+                    }
+                    if let Err(ie) = self.store.insert_vector(vr, &vec) {
+                        error!(source = %src.id, vec_id = vr, error = %ie, "half-merge vector reinsert failed, source visible but vector missing");
+                    } else {
+                        info!(source = %src.id, vec_id = vr, "half-merge compensated: source untombstoned + vector reinserted");
+                    }
                     failures.push(ConsolidationFailure {
                         memory_id: src.id.clone(),
                         stage: "merge-log".into(),
                         error: e.to_string(),
                     });
+                    // 补偿完成, 不 emit wop, 不计 merged, 跳出本 source。
+                    break;
                 }
                 // §1.9: emit merge wop → follower 重放 (tombstone source + record_merge)。
                 // payload = "source_id\ttarget_id\treason\tat"。follower vector 已由 leader 删,
@@ -325,8 +340,26 @@ impl MemoryEngine {
             .await
             {
                 Some(s) if !s.trim().is_empty() => s,
-                _ => {
-                    warn!(session = %sess, "summarize mlx returned empty, skip");
+                // P2-3: summarize LLM 失败须落 failures 供客户端感知 (旧版仅 warn 静默吞)。
+                // None = 网络/non-2xx/JSON 解析失败; Some("") = mlx 返空内容。均记失败。
+                None => {
+                    let mid = format!("summary-{sess}");
+                    warn!(session = %sess, mid = %mid, "summarize mlx call failed (network/non-2xx/parse), record failure");
+                    failures.push(ConsolidationFailure {
+                        memory_id: mid,
+                        stage: "summarize".into(),
+                        error: "mlx chat_completion failed (network/non-2xx/parse)".into(),
+                    });
+                    continue;
+                }
+                Some(_) => {
+                    let mid = format!("summary-{sess}");
+                    warn!(session = %sess, mid = %mid, "summarize mlx returned empty content, record failure");
+                    failures.push(ConsolidationFailure {
+                        memory_id: mid,
+                        stage: "summarize".into(),
+                        error: "mlx returned empty summary content".into(),
+                    });
                     continue;
                 }
             };
@@ -432,14 +465,16 @@ impl MemoryEngine {
                 }
             }
         }
-        // tombstone 三库一致 → 物理删 (但跳过 merge_log 中 source, 留待 unmerge 可恢复)
-        let merge_sources: std::collections::HashSet<String> = self
-            .persist
-            .list_merge_log()
-            .map_err(|e| e.to_memory())?
-            .into_iter()
-            .map(|m| m.source_id)
-            .collect();
+        // tombstone 三库一致 → 物理删 (但跳过 merge_log 中 source, 留待 unmerge 可恢复)。
+        // P1-2: list_merge_log 失败 (如表损坏) 不应让整个 reconcile 崩 — 降级为空集合,
+        // 即不跳过任何 tombstone (最坏: 合并 source 被物理删, 但比整个 consolidate 失败好)。
+        let merge_sources: std::collections::HashSet<String> = match self.persist.list_merge_log() {
+            Ok(logs) => logs.into_iter().map(|m| m.source_id).collect(),
+            Err(e) => {
+                warn!(error = %e, "reconcile: list_merge_log failed, degrade to empty merge_sources");
+                std::collections::HashSet::new()
+            }
+        };
         let tombs = self.persist.list_tombstoned().map_err(|e| e.to_memory())?;
         for t in &tombs {
             if merge_sources.contains(&t.id) {
@@ -566,6 +601,119 @@ impl MemoryEngine {
             .count_by_session(scope)
             .map_err(|e| e.to_memory())
     }
+
+    /// P1-1: commit 共享核心, 返回 CommitOutcome (成功/失败 turn 分列)。
+    /// §3.7 per-turn 错误隔离: 失败 turn 跳过 (warn+反向清向量), 进 failed_turns, 继续后续 turn。
+    /// 全部 turn 失败 → memory_ids 空 + failed_turns 满, 仍返 Ok (非 Err): 0 条提交, 客户端可重试失败 turn。
+    async fn commit_inner(
+        &self,
+        session_id: &str,
+        interaction: &Interaction,
+    ) -> fm_core::MemoryResult<fm_core::CommitOutcome> {
+        let mut ids = Vec::with_capacity(interaction.turns.len());
+        let mut failed_turns: Vec<fm_core::TurnFailure> = Vec::new();
+        let now = Self::now_ms();
+        for turn in &interaction.turns {
+            let id = Self::new_ulid();
+            let raw = Self::turn_content(turn);
+            // R8/§10.4 PII 脱敏: 开启时 embed+persist+wop+extract 全用脱敏后内容。
+            let content = if self.redact {
+                let r = crate::redact::redact_text(&raw);
+                if r != raw {
+                    info!(id = %id, "PII redacted on commit");
+                }
+                r
+            } else {
+                raw
+            };
+            let mut item = MemoryItem::new_turn_skeleton(
+                id.clone(),
+                interaction.id.clone(),
+                turn.turn_idx,
+                session_id.to_string(),
+                MemoryType::Episodic,
+                content.clone(),
+                now,
+            );
+            let vec_id = vector_id_from_ulid(&id);
+            // §3.7: embed 失败 (fusion-mlx 429/挂) → 跳过此 turn 不 abort 整交互。
+            let vec = match self.embedder.embed(&content).await {
+                Ok(v) => v,
+                Err(e) => {
+                    let err = e.to_memory();
+                    warn!(id = %id, turn_idx = turn.turn_idx, error = %err, "commit: embed failed, skip turn");
+                    failed_turns.push(fm_core::TurnFailure {
+                        turn_idx: turn.turn_idx,
+                        stage: "embed".into(),
+                        error: err.to_string(),
+                    });
+                    continue;
+                }
+            };
+            if let Err(e) = self.store.insert_vector(vec_id, &vec) {
+                warn!(id = %id, turn_idx = turn.turn_idx, error = %e, "commit: insert_vector failed, skip turn");
+                failed_turns.push(fm_core::TurnFailure {
+                    turn_idx: turn.turn_idx,
+                    stage: "insert_vector".into(),
+                    error: e.to_string(),
+                });
+                continue;
+            }
+            item.vector_ref = vec_id.to_string();
+            item.entities_pending = true;
+            // §2.7: wop payload 携带 leader 已算向量 (CommitEnvelope{item, vector})。
+            // follower 直用免 re-embed — MlxEmbedder(bge-m3) 跨进程浮点非确定, re-embed 致检索发散。
+            let envelope = fm_cluster::CommitEnvelope {
+                item: item.clone(),
+                vector: Some(vec.clone()),
+            };
+            let wop_payload = serde_json::to_string(&envelope)?;
+            // §2.4: put_memory + append_wop 单 transaction 原子。旧版两步独立 INSERT,
+            // put_memory 成功后崩溃/append_wop 失败 → memory_item 行在但 wop_log 无 → 永久静默缺口。
+            if let Err(e) = self
+                .persist
+                .put_memory_with_wop(&item, "commit", &wop_payload, now)
+            {
+                // H1 反向清理: insert_vector 已落 hnsw+sled, persist 失败 → 删向量避免幽灵。
+                let err = e.to_memory();
+                warn!(id = %id, error = %err, "commit: put_memory_with_wop failed, reverse-clean vector");
+                let _ = self.store.delete_vector(vec_id);
+                failed_turns.push(fm_core::TurnFailure {
+                    turn_idx: turn.turn_idx,
+                    stage: "persist".into(),
+                    error: err.to_string(),
+                });
+                continue;
+            }
+            ids.push(MemoryId(id.clone()));
+            // 异步抽实体回写 (不阻塞 commit 返回; 此处同步 await 保证可测)
+            self.extract_and_attach(&id, &content).await;
+        }
+        info!(
+            interaction = %interaction.id,
+            turns = interaction.turns.len(),
+            committed = ids.len(),
+            failed = failed_turns.len(),
+            "commit done"
+        );
+        // P1-3: 审计日志。actor=session_id (谁), action=commit, target=interaction.id, detail=turn 统计。
+        let detail = format!(
+            "turns={} committed={} failed={}",
+            interaction.turns.len(),
+            ids.len(),
+            failed_turns.len()
+        );
+        if let Err(e) =
+            self.persist
+                .append_audit(now, session_id, "commit", &interaction.id, &detail)
+        {
+            warn!(error = %e, "audit_log append failed (commit), non-fatal");
+        }
+        Ok(fm_core::CommitOutcome {
+            memory_ids: ids,
+            failed_turns,
+        })
+    }
 }
 
 // M6 集群: MemoryEngine 作 follower 重放落地。PRD §16.4。commit→re-embed+put+insert, delete→tombstone。
@@ -655,77 +803,18 @@ impl fm_core::FusionMemoryEngine for MemoryEngine {
         session_id: &str,
         interaction: &Interaction,
     ) -> fm_core::MemoryResult<Vec<MemoryId>> {
-        let mut ids = Vec::with_capacity(interaction.turns.len());
-        let now = Self::now_ms();
-        // §3.7: per-turn 错误隔离。旧版任一 turn 失败即 return Err, 但 turn 1..i-1 已入库带 wop,
-        // 函数返 Err 暗示"啥也没提交"是谎言; 客户端重试整交互 → turn 1..i-1 拿新 ULID 再提交 = 重复。
-        // 改: 失败 turn 跳过 (warn+反向清向量), 继续后续 turn, 返已成功提交的 ids。
-        // 全部 turn 失败 → ids 空, 仍返 Ok([]) (非 Err): 已有 0 条提交, 不需客户端重试避免空交互重放。
-        for turn in &interaction.turns {
-            let id = Self::new_ulid();
-            let raw = Self::turn_content(turn);
-            // R8/§10.4 PII 脱敏: 开启时 embed+persist+wop+extract 全用脱敏后内容。
-            let content = if self.redact {
-                let r = crate::redact::redact_text(&raw);
-                if r != raw {
-                    info!(id = %id, "PII redacted on commit");
-                }
-                r
-            } else {
-                raw
-            };
-            let mut item = MemoryItem::new_turn_skeleton(
-                id.clone(),
-                interaction.id.clone(),
-                turn.turn_idx,
-                session_id.to_string(),
-                fm_core::MemoryType::Episodic,
-                content.clone(),
-                now,
-            );
-            let vec_id = vector_id_from_ulid(&id);
-            // §3.7: embed 失败 (fusion-mlx 429/挂) → 跳过此 turn 不 abort 整交互。
-            let vec = match self.embedder.embed(&content).await {
-                Ok(v) => v,
-                Err(e) => {
-                    warn!(id = %id, turn_idx = turn.turn_idx, error = %e.to_memory(), "commit: embed failed, skip turn");
-                    continue;
-                }
-            };
-            if let Err(e) = self.store.insert_vector(vec_id, &vec) {
-                warn!(id = %id, turn_idx = turn.turn_idx, error = %e, "commit: insert_vector failed, skip turn");
-                continue;
-            }
-            item.vector_ref = vec_id.to_string();
-            // entities_pending=true: 实体待异步抽 (C5: content+vector 先存)
-            item.entities_pending = true;
-            // §2.7: wop payload 携带 leader 已算向量 (CommitEnvelope{item, vector})。
-            // follower 直用免 re-embed — MlxEmbedder(bge-m3) 跨进程浮点非确定, re-embed 致检索发散。
-            // 旧版仅序列化 MemoryItem (vector_ref 是 u64 id 串非真向量) → follower 必须 re-embed。
-            let envelope = fm_cluster::CommitEnvelope {
-                item: item.clone(),
-                vector: Some(vec.clone()),
-            };
-            let wop_payload = serde_json::to_string(&envelope)?;
-            // §2.4: put_memory + append_wop 单 transaction 原子。旧版两步独立 INSERT,
-            // put_memory 成功后崩溃/append_wop 失败 → memory_item 行在但 wop_log 无 →
-            // follower since_seq 永拉不到 → 永久静默缺口。改 put_memory_with_wop 同事务全 commit 或全 rollback。
-            if let Err(e) = self
-                .persist
-                .put_memory_with_wop(&item, "commit", &wop_payload, now)
-            {
-                // H1 反向清理: insert_vector 已落 hnsw+sled, persist 失败 → 删向量避免幽灵
-                // (索引可见但无元数据, retrieve 拿 id 却 get_memory=None)。
-                warn!(id = %id, error = %e.to_memory(), "commit: put_memory_with_wop failed, reverse-clean vector");
-                let _ = self.store.delete_vector(vec_id);
-                continue;
-            }
-            ids.push(MemoryId(id.clone()));
-            // 异步抽实体回写 (不阻塞 commit 返回; 此处同步 await 保证可测)
-            self.extract_and_attach(&id, &content).await;
-        }
-        info!(interaction = %interaction.id, turns = interaction.turns.len(), committed = ids.len(), "commit done");
-        Ok(ids)
+        // P1-1: 详细结果派生 id 列表 (保持原 trait 契约, 失败 turn 不含)。
+        let outcome = self.commit_inner(session_id, interaction).await?;
+        Ok(outcome.memory_ids)
+    }
+
+    async fn commit_episodic_memory_detailed(
+        &self,
+        session_id: &str,
+        interaction: &Interaction,
+    ) -> fm_core::MemoryResult<fm_core::CommitOutcome> {
+        // P1-1: 返回成功/失败 turn 分列, 客户端可感知重试。
+        self.commit_inner(session_id, interaction).await
     }
 
     async fn retrieve_context(
@@ -873,6 +962,16 @@ impl fm_core::FusionMemoryEngine for MemoryEngine {
             if let Err(e) = self.persist.touch_access_batch(&touched_ids, now) {
                 warn!(error = %e, "touch_access_batch failed");
             }
+        }
+        // P1-3: 审计日志。actor="retrieve" (无调用方标识), target=query 摘要 (截断 64),
+        // detail=命中块数 + token。query 内容可能含 PII → 仅记前 64 字符 + hits/tokens, 不记命中内容。
+        let q_preview: String = query.text.chars().take(64).collect();
+        let ret_detail = format!("blocks={} tokens={}", kept.len(), total_tokens);
+        if let Err(e) =
+            self.persist
+                .append_audit(now, "retrieve", "retrieve", &q_preview, &ret_detail)
+        {
+            warn!(error = %e, "audit_log append failed (retrieve), non-fatal");
         }
         Ok(FormattedContext {
             blocks: kept,
@@ -1036,6 +1135,24 @@ impl fm_core::FusionMemoryEngine for MemoryEngine {
             dropped,
             promoted, merged, summarized, reextracted, reconciled, "consolidate done"
         );
+        // P1-3: 审计日志。actor="system" (cron/手动触发, 无外部调用方), action=consolidate,
+        // target="saga", detail=六计数 + 失败数。
+        let con_detail = format!(
+            "dropped={} promoted={} merged={} summarized={} reextracted={} reconciled={} failures={}",
+            report.dropped,
+            report.promoted,
+            report.merged,
+            report.summarized,
+            report.reextracted,
+            report.reconciled,
+            report.failures.len()
+        );
+        if let Err(e) = self
+            .persist
+            .append_audit(now, "system", "consolidate", "saga", &con_detail)
+        {
+            warn!(error = %e, "audit_log append failed (consolidate), non-fatal");
+        }
         Ok(report)
     }
 
@@ -1065,6 +1182,13 @@ impl fm_core::FusionMemoryEngine for MemoryEngine {
             .append_wop("delete", id, now)
             .map_err(|e| e.to_memory())?;
         info!(id, "memory tombstoned");
+        // P1-3: 审计日志。actor="delete" (RPC 无外部调用方标识), action=delete, target=id。
+        if let Err(e) = self
+            .persist
+            .append_audit(now, "delete", "delete", id, "tombstone")
+        {
+            warn!(error = %e, "audit_log append failed (delete), non-fatal");
+        }
         Ok(())
     }
 
@@ -1109,7 +1233,7 @@ mod tests {
     use super::*;
     use fm_core::{FusionMemoryEngine, MemoryTier, ToolCall};
     use fm_embed::StubEmbedder;
-    use fm_store::StoreStub;
+    use fm_store::LocalStore;
 
     fn tmp_engine(dim: usize) -> MemoryEngine {
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -1117,7 +1241,7 @@ mod tests {
         let n = COUNTER.fetch_add(1, Ordering::SeqCst);
         let dir = std::env::temp_dir().join(format!("fm-engine-test-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let store = Arc::new(StoreStub::open(&dir, dim).unwrap());
+        let store = Arc::new(LocalStore::open(&dir, dim).unwrap());
         let persist = Arc::new(Persist::open_in_memory().unwrap());
         let embedder: Arc<dyn Embedder> = Arc::new(StubEmbedder::new(dim));
         MemoryEngine::new(store, persist, embedder)
@@ -1212,7 +1336,7 @@ mod tests {
                 .as_nanos()
         ));
         let _ = std::fs::remove_dir_all(&dir);
-        let store = Arc::new(StoreStub::open(&dir, 16).unwrap());
+        let store = Arc::new(LocalStore::open(&dir, 16).unwrap());
         let persist = Arc::new(Persist::open_in_memory().unwrap());
         let embedder: Arc<dyn Embedder> = Arc::new(FlakyEmbed(StubEmbedder::new(16)));
         let eng = MemoryEngine::new(store, persist, embedder);
@@ -1252,6 +1376,135 @@ mod tests {
             !all.iter().any(|m| m.content.contains("FAIL")),
             "FAIL turn 不应被提交"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P1-1: commit_episodic_memory_detailed 显式暴露失败 turn 明细, 客户端可感知重试。
+    #[tokio::test]
+    async fn commit_detailed_reports_failed_turns() {
+        use async_trait::async_trait;
+        use fm_embed::{EmbedError, StubEmbedder};
+        struct FlakyEmbed2(StubEmbedder);
+        #[async_trait]
+        impl Embedder for FlakyEmbed2 {
+            async fn embed(&self, text: &str) -> Result<Vec<f32>, EmbedError> {
+                if text.contains("FAIL") {
+                    return Err(EmbedError::Unavailable("simulated 429".into()));
+                }
+                self.0.embed(text).await
+            }
+            fn dimension(&self) -> usize {
+                self.0.dimension()
+            }
+            fn is_live(&self) -> bool {
+                false
+            }
+        }
+        let dir = std::env::temp_dir().join(format!(
+            "fm-engine-test-detailed-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Arc::new(LocalStore::open(&dir, 16).unwrap());
+        let persist = Arc::new(Persist::open_in_memory().unwrap());
+        let embedder: Arc<dyn Embedder> = Arc::new(FlakyEmbed2(StubEmbedder::new(16)));
+        let eng = MemoryEngine::new(store, persist, embedder);
+
+        let ix = Interaction {
+            id: "ix-detailed".into(),
+            session_id: "sess-1".into(),
+            turns: vec![
+                Turn {
+                    turn_idx: 0,
+                    user_message: "ok turn 0".into(),
+                    assistant_message: "a0".into(),
+                    tool_calls: vec![],
+                },
+                Turn {
+                    turn_idx: 1,
+                    user_message: "FAIL turn 1".into(),
+                    assistant_message: "a1".into(),
+                    tool_calls: vec![],
+                },
+            ],
+            timestamp: 1000,
+            metadata: serde_json::json!({}),
+        };
+        let outcome = eng
+            .commit_episodic_memory_detailed("sess-1", &ix)
+            .await
+            .unwrap();
+        // 成功 1 (turn 0), 失败 1 (turn 1 embed)。
+        assert_eq!(outcome.memory_ids.len(), 1, "turn 0 committed");
+        assert_eq!(outcome.failed_turns.len(), 1, "turn 1 failed");
+        assert_eq!(outcome.failed_turns[0].turn_idx, 1);
+        assert_eq!(outcome.failed_turns[0].stage, "embed");
+        assert!(
+            outcome.failed_turns[0].error.contains("429"),
+            "error should carry cause: {}",
+            outcome.failed_turns[0].error
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P1-1: 全部 turn 失败 → memory_ids 空 + failed_turns 满, 仍 Ok (非 Err)。
+    #[tokio::test]
+    async fn commit_detailed_all_fail_returns_empty_ids_not_err() {
+        use async_trait::async_trait;
+        use fm_embed::{EmbedError, StubEmbedder};
+        struct AlwaysFail(StubEmbedder);
+        #[async_trait]
+        impl Embedder for AlwaysFail {
+            async fn embed(&self, _text: &str) -> Result<Vec<f32>, EmbedError> {
+                Err(EmbedError::Unavailable("mlx down".into()))
+            }
+            fn dimension(&self) -> usize {
+                self.0.dimension()
+            }
+            fn is_live(&self) -> bool {
+                false
+            }
+        }
+        let dir = std::env::temp_dir().join(format!(
+            "fm-engine-test-allfail-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Arc::new(LocalStore::open(&dir, 8).unwrap());
+        let persist = Arc::new(Persist::open_in_memory().unwrap());
+        let embedder: Arc<dyn Embedder> = Arc::new(AlwaysFail(StubEmbedder::new(8)));
+        let eng = MemoryEngine::new(store, persist, embedder);
+
+        let ix = Interaction {
+            id: "ix-allfail".into(),
+            session_id: "sess-1".into(),
+            turns: vec![Turn {
+                turn_idx: 0,
+                user_message: "x".into(),
+                assistant_message: "y".into(),
+                tool_calls: vec![],
+            }],
+            timestamp: 1,
+            metadata: serde_json::json!({}),
+        };
+        let outcome = eng
+            .commit_episodic_memory_detailed("sess-1", &ix)
+            .await
+            .unwrap();
+        assert!(
+            outcome.memory_ids.is_empty(),
+            "all turns failed, 0 committed"
+        );
+        assert_eq!(outcome.failed_turns.len(), 1);
+        assert_eq!(outcome.failed_turns[0].stage, "embed");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1542,6 +1795,96 @@ mod tests {
         assert!(!ok);
     }
 
+    // P1-3: 核心路径 commit/retrieve/consolidate/delete 应落审计日志 (who/when/what)。
+    #[tokio::test]
+    async fn audit_log_records_core_paths() {
+        let eng = tmp_engine(16);
+        // commit: actor=session_id, action=commit, target=interaction.id
+        let ix = sample_interaction("ix-aud", 1);
+        eng.commit_episodic_memory("sess-aud", &ix).await.unwrap();
+        // retrieve: action=retrieve
+        let q = RetrieveQuery {
+            text: "sample query".into(),
+            top_k: 5,
+            session_id: None,
+            tier_filter: None,
+            token_budget: 1024,
+            aggregate: false,
+        };
+        eng.retrieve_context(&q).await.unwrap();
+        // consolidate: action=consolidate
+        eng.consolidate_memories().await.unwrap();
+        // delete: action=delete (先 commit 拿 id)
+        let del_ix = sample_interaction("ix-del", 1);
+        let ids = eng
+            .commit_episodic_memory("sess-del", &del_ix)
+            .await
+            .unwrap();
+        assert!(!ids.is_empty());
+        eng.delete_memory(ids[0].as_str()).await.unwrap();
+
+        let log = eng.persist().list_audit(None).unwrap();
+        let actions: Vec<&str> = log.iter().map(|a| a.action.as_str()).collect();
+        assert!(
+            actions.contains(&"commit"),
+            "audit 缺 commit, actions={:?}",
+            actions
+        );
+        assert!(
+            actions.contains(&"retrieve"),
+            "audit 缺 retrieve, actions={:?}",
+            actions
+        );
+        assert!(
+            actions.contains(&"consolidate"),
+            "audit 缺 consolidate, actions={:?}",
+            actions
+        );
+        assert!(
+            actions.contains(&"delete"),
+            "audit 缺 delete, actions={:?}",
+            actions
+        );
+        // commit 条 actor 应为 session_id (按 target_id 精确匹配, 因有两条 commit)
+        let commit_row = log
+            .iter()
+            .find(|a| a.action == "commit" && a.target_id == "ix-aud")
+            .unwrap();
+        assert_eq!(commit_row.actor, "sess-aud");
+    }
+
+    // P1-2: record_merge 失败时, 补偿应反 tombstone source + 重插向量, 不留半合并幽灵。
+    #[tokio::test]
+    async fn consolidate_merge_compensates_on_record_merge_failure() {
+        let eng = tmp_engine(16);
+        let src = semantic_item(&eng, "m-hm1", "rust cargo build error", "ent-rust").await;
+        let vr = src.vector_ref.parse::<u64>().unwrap();
+        semantic_item(&eng, "m-hm2", "rust cargo build error", "ent-rust").await;
+        // 注入 record_merge 失败 (DROP merge_log 表)
+        eng.persist.break_merge_log_for_test().unwrap();
+        let report = eng.consolidate_memories().await.unwrap();
+        // 合并未成功计入 (record_merge 失败补偿, 非 merged)
+        assert_eq!(report.merged, 0, "record_merge 失败应不计 merged");
+        // failures 含 merge-log 项
+        assert!(
+            report
+                .failures
+                .iter()
+                .any(|f| f.stage == "merge-log" && f.memory_id == src.id),
+            "应有 merge-log 失败项, failures={:?}",
+            report.failures
+        );
+        // 补偿: source 不应停留 tombstone (反 tombstone 成功)
+        let src_after = eng.get_memory(&src.id).await.unwrap().unwrap();
+        assert!(
+            !src_after.tombstone,
+            "补偿后 source 应 untombstone, 否则半合并幽灵"
+        );
+        // 补偿: 向量应重新插入 (检索可命中)
+        let got = eng.store.get_vector(vr).unwrap();
+        assert!(got.is_some(), "补偿后 source 向量应重新插入");
+    }
+
     #[tokio::test]
     async fn reconcile_physical_deletes_tombstoned() {
         let eng = tmp_engine(16);
@@ -1746,6 +2089,45 @@ mod tests {
         eng.commit_episodic_memory("sess-1", &ix).await.unwrap();
         let report = eng.consolidate_memories().await.unwrap();
         assert_eq!(report.summarized, 0, "无 config 不应 summarize");
+    }
+
+    #[tokio::test]
+    async fn p2_3_summarize_mlx_failure_recorded_not_silent() {
+        // P2-3: summarize LLM 失败须落 failures 供客户端感知, 旧版仅 warn 静默吞。
+        // 用死 url + 短超时 → chat_completion 返 None → 走 None 分支 push failure。
+        let mut eng = tmp_engine(16);
+        let cfg = ExtractConfig {
+            mlx_url: "http://127.0.0.1:1/v1".into(), // 1 端口不通, 连接拒 → None
+            api_key: String::new(),
+            chat_model: "test".into(),
+            timeout_secs: 1,
+        };
+        let ext: Arc<dyn EntityExtractor> = Arc::new(FakeExtractor {
+            entities: vec![],
+            success: false,
+        });
+        eng = eng.with_extractor_and_config(ext, cfg);
+        // 4 条 episodic (≥SUMMARIZE_MIN_EPISODIC=3) 触发 summarize 分组
+        let ix = sample_interaction("ix-p23", 4);
+        eng.commit_episodic_memory("sess-1", &ix).await.unwrap();
+        let report = eng.consolidate_memories().await.unwrap();
+        assert_eq!(report.summarized, 0, "mlx 失败不应产出 summary");
+        let sum_failures: Vec<_> = report
+            .failures
+            .iter()
+            .filter(|f| f.stage == "summarize")
+            .collect();
+        assert!(
+            !sum_failures.is_empty(),
+            "summarize 失败须落 failures, 实际 failures: {:?}",
+            report.failures
+        );
+        assert!(sum_failures[0].memory_id.starts_with("summary-"));
+        assert!(
+            sum_failures[0].error.contains("mlx"),
+            "错误信息须含 mlx 原因: {}",
+            sum_failures[0].error
+        );
     }
 
     #[tokio::test]
