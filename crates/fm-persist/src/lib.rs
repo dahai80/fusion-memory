@@ -3,6 +3,7 @@
 //! 单连接 + Mutex；WAL 模式（journal_mode=WAL, busy_timeout=5000, synchronous=NORMAL）。
 //! MemoryItem 全字段 CRUD + consolidation/merge/wop 审计日志。
 
+pub mod crypto;
 pub mod error;
 pub mod schema;
 pub mod store;

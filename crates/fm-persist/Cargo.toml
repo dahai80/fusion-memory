@@ -1,6 +1,6 @@
 [package]
 name = "fm-persist"
-version = "0.2.1"
+version = "1.0.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -17,6 +17,11 @@ rusqlite = { workspace = true }
 # §1.1: 连接池打破单 Mutex 串行。
 r2d2 = { workspace = true }
 r2d2_sqlite = { workspace = true }
+# v1.0.0 B-1: 静态加密。AES-256-GCM + argon2 KDF + base64 封装。
+aes-gcm = { workspace = true }
+argon2 = { workspace = true }
+base64 = { workspace = true }
+rand = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

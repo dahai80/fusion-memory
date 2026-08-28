@@ -42,6 +42,10 @@ pub enum MemoryError {
     #[error("serde error: {0}")]
     Serde(#[from] serde_json::Error),
 
+    // v1.0.0 B-1: 静态加密错误 (key 缺失/格式错/解密失败)。永久, 不可重试。
+    #[error("encryption error: {0}")]
+    Encrypt(String),
+
     // §2.8: 锁中毒 — 持锁线程 panic, Mutex 永久死。非瞬时, 重试无益, 需重启进程。
     // 旧版被压成 MemoryError::Sqlite("...poisoned") 字符串, 运维误当 sqlite 错误。
     #[error("lock poisoned (prior panic in critical section, restart required)")]

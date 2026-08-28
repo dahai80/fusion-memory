@@ -6,7 +6,7 @@ use tokio::net::TcpStream;
 
 use crate::error::{ClusterError, ClusterResult};
 
-/// 帧类型: hello 握手 / sync 请求 / sync 响应 / ping 心跳 / pong。
+/// 帧类型: hello 握手 / sync 请求 / sync 响应 / ping 心跳 / pong / vote 选举。
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FrameKind {
@@ -15,6 +15,9 @@ pub enum FrameKind {
     SyncResponse,
     Ping,
     Pong,
+    /// v1.0.0 B-2: 选举投票请求/响应 (自动 failover)。
+    VoteRequest,
+    VoteResponse,
 }
 
 /// 握手包: follower 告知本地 last_seq + 共享 secret token (H3 鉴权) + 已知 epoch (§1.8 fencing)。

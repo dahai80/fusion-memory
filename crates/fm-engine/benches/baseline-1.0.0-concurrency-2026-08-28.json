@@ -1,0 +1,35 @@
+{
+  "_doc": "P1-7 scale bench (local-store, StubEmbedder dim=64). audit §8 P1-7. v1.0.0 加并发梯度 (商用负载)。",
+  "_machine": "Apple Silicon, release profile",
+  "_run": "FM_SCALE=<10k|100k|1m> [FM_CONCURRENCY=1,10,50,100] cargo bench -p fm-engine --bench scale_bench",
+  "concurrency_sweep": [
+    {
+      "concurrency": 1,
+      "p50_ms": 0.155416,
+      "p99_ms": 0.277625
+    },
+    {
+      "concurrency": 10,
+      "p50_ms": 0.8933749999999999,
+      "p99_ms": 10.526542
+    },
+    {
+      "concurrency": 50,
+      "p50_ms": 7.205708,
+      "p99_ms": 21.810083000000002
+    },
+    {
+      "concurrency": 100,
+      "p50_ms": 14.873375,
+      "p99_ms": 60.541625
+    }
+  ],
+  "rebuild_loaded": 10000,
+  "rebuild_secs": 1.8153567910000001,
+  "seed_secs": 1.795525959,
+  "seed_throughput_vec_per_s": 5569.3987323744395,
+  "single_p50_ms": 0.029124999999999998,
+  "single_p99_ms": 0.030583000000000003,
+  "sled_disk_mb": 7.136385917663574,
+  "total_vectors": 10000
+}
