@@ -238,6 +238,14 @@ cargo fmt --all --check        # 格式检查
 #   cargo bench -p fm-engine --bench retrieve_bench
 #   单条 retrieve p99<50ms + 10 并发 p99<200ms, 结果落 /tmp/fm-perf-baseline-*.json
 
+# §13.2 live perf 基线 (真 fusion-mlx bge-m3 dim=1024, 端到端 retrieve 延迟, 关闭 RC 已知限制 #1):
+#   需起 fusion-mlx 加载 bge-m3 (standalone 须 FUSION_ROUTE_WARN_ONLY=true + --api-key)
+#   cargo bench -p fm-engine --features mlx-live --bench retrieve_bench_live
+#   三路径: cold (唯一 query 真打 mlx) / cached (LRU 命中跳 mlx) / concurrent x5 (真 mlx)
+#   基线 JSON: crates/fm-engine/benches/baseline-live-bgem3-2026-08-28.json
+#   live 数据 (Apple Silicon): cold p50=9.98ms/p99=10.73ms, cached p50=0.107ms/p99=0.126ms, concurrent x5 p50=44.6ms
+#   规模受 fusion-mlx rate-limit bug (#692: _serve_from_model_dir 漏配, 60rpm 常驻) 限, 小规模真延迟参考; 大规模压测用 retrieve_bench (StubEmbedder)
+
 # 真实模型集成测试 (需起 fusion-mlx 加载 bge-m3 + Qwen 聊天模型, 串行避 429):
 #   ~/claude-home/fusion-mlx/start.sh start
 #   scripts/live-test.sh            # 全 workspace live (串行)

@@ -1,0 +1,15 @@
+{
+  "_doc": "§13.2 live perf baseline (real fusion-mlx bge-m3 dim=1024). Closes RC known-limitation #1 (StubEmbedder perf).",
+  "_embedder": "MlxEmbedder (bge-m3, dim=1024, HTTP /v1/embeddings)",
+  "_machine": "Apple Silicon, release profile",
+  "_run": "cargo bench -p fm-engine --features mlx-live --bench retrieve_bench_live (needs live fusion-mlx bge-m3)",
+  "cached_p50_ms": 0.107,
+  "cached_p99_ms": 0.125791,
+  "cold_p50_ms": 9.982625,
+  "cold_p99_ms": 10.73075,
+  "concurrency": 5,
+  "concurrent_p50_ms": 44.612375,
+  "concurrent_p99_ms": 44.612375,
+  "dim": 1024,
+  "total_memories": 10
+}
