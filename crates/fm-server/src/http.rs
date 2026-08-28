@@ -4,12 +4,14 @@
 //! POST /v1/memory/commit | retrieve | consolidate | audit | delete
 //! POST /v1/memory/delete_scope | count          (issue #2)
 //! GET  /v1/memory/{id}
+//! GET  /v1/memory/version (公开, P2-4 版本协商)
 //! GET  /healthz (公开, §1.7 探活子系统)
-//! 所有 /v1/* 强制 Bearer（B5）。delete/delete_scope 需 body.confirm=true。
+//! 所有 /v1/* (除 version) 强制 Bearer（B5）。delete/delete_scope 需 body.confirm=true。
+//! P2-4: API 版本控制 — HTTP 路径 /v1/ 钉版; RPC 方法 v1.<method> 前缀; jsonrpc=="2.0" 校验。
 
 use std::sync::Arc;
 
-use axum::extract::{Path, State};
+use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -21,18 +23,28 @@ use tracing::{info, warn};
 use crate::auth::check_bearer;
 use crate::engine_handle::EngineHandle;
 use crate::jsonrpc::{dispatch, http_status_for_error, RpcRequest, RpcResponse};
+// P2-4: API 版本号 (jsonrpc::API_VERSION 单一来源)。
+use crate::jsonrpc::API_VERSION;
+use crate::metrics::HttpMetrics;
+
+/// P0-3: HTTP 请求体上限。8MB 与 UDS MAX_LINE_BYTES 对齐, 防 POST 大 body 内存放大 DoS。
+/// 超限 axum 自动返 413 Payload Too Large, 不到 handler。
+const MAX_HTTP_BODY_BYTES: usize = 8 * 1024 * 1024;
 
 /// HTTP 服务共享状态。
 #[derive(Clone)]
 pub struct HttpState {
     pub engine: EngineHandle,
     pub api_key: Arc<String>,
+    /// P0-2: HTTP 请求计数/延迟/错误率指标。
+    pub metrics: Arc<HttpMetrics>,
 }
 
 /// 建 axum 路由。
 pub fn app(state: HttpState) -> axum::Router {
     axum::Router::new()
         .route("/healthz", get(healthz))
+        .route("/metrics", get(metrics_handler))
         .route("/v1/memory/commit", post(commit))
         .route("/v1/memory/retrieve", post(retrieve))
         .route("/v1/memory/consolidate", post(consolidate))
@@ -40,7 +52,11 @@ pub fn app(state: HttpState) -> axum::Router {
         .route("/v1/memory/delete", post(delete))
         .route("/v1/memory/delete_scope", post(delete_scope))
         .route("/v1/memory/count", post(count))
+        // P2-4: 版本协商端点 (HTTP 对称 UDS version 方法)。无需 body, GET 直返 api_version。
+        .route("/v1/memory/version", get(version))
         .route("/v1/memory/:id", get(get_memory))
+        // P0-3: body 上限层, 全路由生效, 超 MAX_HTTP_BODY_BYTES 返 413。
+        .layer(DefaultBodyLimit::max(MAX_HTTP_BODY_BYTES))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
@@ -69,20 +85,48 @@ async fn healthz(State(st): State<HttpState>) -> Response {
     }
 }
 
+/// P2-4: 版本协商端点。GET /v1/memory/version → {api_version}。公开 (无 Bearer,
+/// 客户端鉴权前需知服务端 API 版本)。UDS 侧 `version` 方法对称。
+async fn version() -> Response {
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({"api_version": API_VERSION})),
+    )
+        .into_response()
+}
+
+/// P0-2: Prometheus 文本格式 metrics 端点。公开 (不加 Bearer, 同 healthz 供 LB/monitor 探活)。
+/// 返: http_requests_total / http_errors_total / http_request_duration_seconds (histogram buckets)
+///     + engine 层: engine_embedder_in_flight / engine_consolidate_running / store_pool_in_use。
+async fn metrics_handler(State(st): State<HttpState>) -> Response {
+    let body = st.metrics.render_prometheus();
+    (
+        StatusCode::OK,
+        [("content-type", "text/plain; version=0.0.4")],
+        body,
+    )
+        .into_response()
+}
+
 /// §3.8: axum `Json<Value>` 已解析体, 直接 `from_value` 进 RpcRequest (一次反序列化), 不再二解。
 /// §2.9: dispatch 返 RpcResponse; 若 error 已设 → 按 http_status_for_error 映射 HTTP 状态码,
 /// 不再无条件 200 把引擎错误埋进 body。
+/// P0-2: handle_rpc 经 metrics 计数 (total/error) + 延迟直方图。
 async fn handle_rpc(
     State(st): State<HttpState>,
     headers: HeaderMap,
     Json(req): Json<Value>,
 ) -> Response {
     if let Err(resp) = check_bearer(&headers, &st.api_key) {
+        st.metrics.incr_total();
+        st.metrics.incr_error();
         return resp;
     }
     let rpc: RpcRequest = match serde_json::from_value(req) {
         Ok(r) => r,
         Err(e) => {
+            st.metrics.incr_total();
+            st.metrics.incr_error();
             return (
                 StatusCode::BAD_REQUEST,
                 Json(
@@ -92,7 +136,15 @@ async fn handle_rpc(
                 .into_response();
         }
     };
+    let method = rpc.method.clone();
+    let start = std::time::Instant::now();
     let resp: RpcResponse = dispatch(rpc, &st.engine).await;
+    let elapsed = start.elapsed().as_secs_f64();
+    st.metrics.incr_total();
+    st.metrics.observe_duration(&method, elapsed);
+    if resp.error.is_some() {
+        st.metrics.incr_error();
+    }
     let status = match &resp.error {
         Some(e) => http_status_for_error(e.code),
         None => StatusCode::OK,
@@ -128,6 +180,8 @@ async fn get_memory(
     Path(id): Path<String>,
 ) -> Response {
     if let Err(resp) = check_bearer(&headers, &st.api_key) {
+        st.metrics.incr_total();
+        st.metrics.incr_error();
         return resp;
     }
     let rpc = RpcRequest {
@@ -136,7 +190,14 @@ async fn get_memory(
         params: serde_json::json!({"id": id}),
         id: Value::from(0i64),
     };
+    let start = std::time::Instant::now();
     let resp = dispatch(rpc, &st.engine).await;
+    st.metrics
+        .observe_duration("get", start.elapsed().as_secs_f64());
+    st.metrics.incr_total();
+    if resp.error.is_some() {
+        st.metrics.incr_error();
+    }
     let status = match &resp.error {
         Some(e) => http_status_for_error(e.code),
         None => StatusCode::OK,
@@ -239,6 +300,7 @@ mod tests {
         let st = HttpState {
             engine: EngineHandle::from_concrete(eng),
             api_key: Arc::new(api_key.into()),
+            metrics: crate::metrics::HttpMetrics::new(),
         };
         (st, committed)
     }
@@ -460,6 +522,84 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
+    // P2-4: /v1/memory/version 公开端点, 客户端鉴权前协商 API 版本。
+    #[tokio::test]
+    async fn p2_4_version_endpoint_public() {
+        let (st, _) = test_state("sekret");
+        let app = app(st);
+        let r = Request::builder()
+            .method("GET")
+            .uri("/v1/memory/version")
+            .body(Body::empty())
+            .unwrap();
+        let resp = tower::ServiceExt::oneshot(app, r).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["api_version"], API_VERSION);
+    }
+
+    // P0-3: body 超 8MB → 413 Payload Too Large, 不到 handler。
+    #[tokio::test]
+    async fn body_over_limit_returns_413() {
+        let (st, _) = test_state("sekret");
+        let app = app(st);
+        let big = "x".repeat(MAX_HTTP_BODY_BYTES + 1);
+        let (code, _) = req(
+            &app,
+            "/v1/memory/commit",
+            &format!(
+                r#"{{"jsonrpc":"2.0","method":"commit","params":{{}},"padding":"{big}"}},"id":1}}"#
+            ),
+            Some("Bearer sekret"),
+        )
+        .await;
+        assert_eq!(code, StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    // P0-2: /metrics 端点返 Prometheus 文本格式, 含计数器。
+    #[tokio::test]
+    async fn metrics_endpoint_returns_prometheus_text() {
+        let (st, _) = test_state("sekret");
+        let app = app(st.clone());
+        // 先打一个 commit 让计数器 +1
+        let body = r#"{"jsonrpc":"2.0","method":"commit","params":{"session_id":"s","interaction":{"id":"ix1","session_id":"s","turns":[{"turn_idx":0,"user_message":"hi","assistant_message":"yo","tool_calls":[]}],"timestamp":1,"metadata":{}}},"id":1}"#;
+        let _ = req(&app, "/v1/memory/commit", body, Some("Bearer sekret")).await;
+        // 拉 metrics
+        let r = Request::builder()
+            .method("GET")
+            .uri("/metrics")
+            .body(Body::empty())
+            .unwrap();
+        let resp = tower::ServiceExt::oneshot(app, r).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(text.contains("http_requests_total"), "text={text}");
+        assert!(
+            text.contains("http_request_duration_seconds_count"),
+            "text={text}"
+        );
+    }
+
+    // P0-2: /metrics 无需 Bearer (供 monitor 探活, 同 healthz)。
+    #[tokio::test]
+    async fn metrics_endpoint_no_auth_required() {
+        let (st, _) = test_state("sekret");
+        let app = app(st);
+        let r = Request::builder()
+            .method("GET")
+            .uri("/metrics")
+            .body(Body::empty())
+            .unwrap();
+        let resp = tower::ServiceExt::oneshot(app, r).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
     // §1.7: 坏引擎 (count 抛错) → healthz 503, 不再永远 200。
     #[tokio::test]
     async fn healthz_probe_unhealthy_503() {
@@ -513,6 +653,7 @@ mod tests {
         let st = HttpState {
             engine: EngineHandle::from_concrete(SickEngine),
             api_key: Arc::new("sekret".into()),
+            metrics: crate::metrics::HttpMetrics::new(),
         };
         let app = app(st);
         let r = Request::builder()
@@ -570,6 +711,7 @@ mod tests {
         let st = HttpState {
             engine: EngineHandle::from_concrete(NotFoundEngine),
             api_key: Arc::new("sekret".into()),
+            metrics: crate::metrics::HttpMetrics::new(),
         };
         let app = app(st);
         let body = r#"{"jsonrpc":"2.0","method":"retrieve","params":{"text":"hi"},"id":1}"#;

@@ -36,6 +36,10 @@ pub enum ClusterError {
         "cluster auth not configured: no token and FUSION_MEMORY_CLUSTER_ALLOW_NO_TOKEN unset"
     )]
     AuthNotConfigured,
+    /// P1-6: 非 loopback 绑定 (0.0.0.0/内网 IP) 但未配 cluster_token → 拒启动。
+    /// 跨机暴露必须鉴权, 防 PII 明文外泄 + 重放攻击面。
+    #[error("cluster bind to non-loopback {addr} requires FUSION_MEMORY_CLUSTER_TOKEN")]
+    BindRequiresToken { addr: String },
 }
 
 impl ClusterError {
@@ -49,6 +53,7 @@ impl ClusterError {
             ClusterError::PermanentReplay(_)
                 | ClusterError::StaleLeader { .. }
                 | ClusterError::AuthNotConfigured
+                | ClusterError::BindRequiresToken { .. }
                 | ClusterError::NotLeader(_)
                 | ClusterError::NotFollower(_)
         )

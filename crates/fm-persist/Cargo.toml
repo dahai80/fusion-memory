@@ -1,6 +1,6 @@
 [package]
 name = "fm-persist"
-version = "0.2.0"
+version = "0.2.1"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -20,3 +20,7 @@ r2d2_sqlite = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+
+[features]
+# 测试钩子 (DROP merge_log 注入 half-merge 场景)。生产永不启用。
+test-utils = []

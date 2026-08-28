@@ -37,6 +37,8 @@ fm-cluster = { path = "crates/fm-cluster" }
 # 序列化
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# P1-8: TOML 配置文件 (fm-server)。toml 0.8 依赖 serde + toml_edit, 轻量。
+toml = "0.8"
 
 # 异步
 tokio = { version = "1", features = ["full"] }

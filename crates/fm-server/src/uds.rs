@@ -43,10 +43,12 @@ impl Drop for ConnGuard {
 
 /// 启动 UDS 监听。sock 权限 0600。
 /// §1.11: shutdown 信号到 → 停 accept, 在飞连接 drain (handle_conn 自然 EOF 退出)。
+/// P1-5: uds_token 非空 → 每连接首行须 `AUTH <token>\n` 握手, 否则后续 RPC 全 -32004。
 pub async fn serve(
     sock_path: PathBuf,
     engine: EngineHandle,
     mut shutdown: tokio::sync::oneshot::Receiver<()>,
+    uds_token: Arc<String>,
 ) -> Result<(), String> {
     cleanup_sock(&sock_path);
     if let Some(parent) = sock_path.parent() {
@@ -56,7 +58,8 @@ pub async fn serve(
     // 权限 0600：限本用户
     std::fs::set_permissions(&sock_path, std::fs::Permissions::from_mode(0o600))
         .map_err(|e| format!("chmod sock: {e}"))?;
-    info!(path = ?sock_path, "uds server listening (0600)");
+    let auth_enabled = !uds_token.is_empty();
+    info!(path = ?sock_path, auth_enabled, "uds server listening (0600)");
     // §2.1: 全局并发连接计数, 超过 MAX_CONNS 拒新连接。
     let conn_count = Arc::new(AtomicUsize::new(0));
     // §1.11: accept 与 shutdown 竞速。用 tokio::select 让 shutdown 抢占 accept 阻塞。
@@ -81,9 +84,10 @@ pub async fn serve(
                         let guard = ConnGuard {
                             counter: conn_count.clone(),
                         };
+                        let tok = uds_token.clone();
                         tokio::spawn(async move {
                             let _g = guard; // Drop 时递减计数
-                            handle_conn(stream, eng).await;
+                            handle_conn(stream, eng, tok).await;
                         });
                     }
                     Err(e) => {
@@ -98,10 +102,12 @@ pub async fn serve(
     Ok(())
 }
 
-async fn handle_conn(stream: UnixStream, engine: EngineHandle) {
+async fn handle_conn(stream: UnixStream, engine: EngineHandle, uds_token: Arc<String>) {
     let (r, mut w) = stream.into_split();
     let mut reader = BufReader::new(r);
     let mut line = String::new();
+    let auth_required = !uds_token.is_empty();
+    let mut authenticated = !auth_required;
     loop {
         line.clear();
         // §2.1: read_line 无界 → 限制累积字节数。超 MAX_LINE_BYTES 视为恶意/异常, 丢弃该行返 parse_error。
@@ -110,6 +116,39 @@ async fn handle_conn(stream: UnixStream, engine: EngineHandle) {
             Ok(_) => {
                 let trimmed = line.trim();
                 if trimmed.is_empty() {
+                    continue;
+                }
+                // P1-5: token 启用时, 首行 AUTH <token> 握手。成功 → 后续放行; 失败 → -32004。
+                if auth_required && !authenticated {
+                    if let Some(provided) = trimmed.strip_prefix("AUTH ") {
+                        if provided == uds_token.as_str() {
+                            authenticated = true;
+                            let resp = RpcResponse {
+                                jsonrpc: "2.0".into(),
+                                result: Some(serde_json::Value::String("ok".into())),
+                                error: None,
+                                id: serde_json::Value::Null,
+                            };
+                            let mut out = serialize_response(&resp);
+                            out.push('\n');
+                            if w.write_all(out.as_bytes()).await.is_err() {
+                                break;
+                            }
+                            continue;
+                        }
+                    }
+                    warn!("uds auth failed, rejecting rpc");
+                    let resp = RpcResponse {
+                        jsonrpc: "2.0".into(),
+                        result: None,
+                        error: Some(crate::jsonrpc::RpcError::unauthorized()),
+                        id: serde_json::Value::Null,
+                    };
+                    let mut out = serialize_response(&resp);
+                    out.push('\n');
+                    if w.write_all(out.as_bytes()).await.is_err() {
+                        break;
+                    }
                     continue;
                 }
                 let resp = match parse_line(trimmed) {
@@ -224,6 +263,11 @@ mod tests {
         rx
     }
 
+    /// 测试用: 空 token = auth 关闭 (向后兼容, 纯文件权限兜底)。
+    fn no_token() -> Arc<String> {
+        Arc::new(String::new())
+    }
+
     struct EchoEngine;
     #[async_trait::async_trait]
     impl fm_core::FusionMemoryEngine for EchoEngine {
@@ -272,7 +316,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let sock = dir.path().join("test.sock");
         let engine = EngineHandle::from_concrete(EchoEngine);
-        let h = tokio::spawn(serve(sock.clone(), engine, never_shutdown()));
+        let h = tokio::spawn(serve(sock.clone(), engine, never_shutdown(), no_token()));
         // 等监听就绪
         for _ in 0..50 {
             if sock.exists() {
@@ -300,7 +344,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let sock = dir.path().join("test2.sock");
         let engine = EngineHandle::from_concrete(EchoEngine);
-        let h = tokio::spawn(serve(sock.clone(), engine, never_shutdown()));
+        let h = tokio::spawn(serve(sock.clone(), engine, never_shutdown(), no_token()));
         for _ in 0..50 {
             if sock.exists() {
                 break;
@@ -343,7 +387,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let sock = dir.path().join("garbage.sock");
         let engine = EngineHandle::from_concrete(EchoEngine);
-        let h = tokio::spawn(serve(sock.clone(), engine, never_shutdown()));
+        let h = tokio::spawn(serve(sock.clone(), engine, never_shutdown(), no_token()));
         uds_ready(&sock).await;
         let mut s = UnixStream::connect(&sock).await.unwrap();
         // 非法行 → parse_error(-32700)；空行被跳过不响应
@@ -362,7 +406,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let sock = dir.path().join("multi.sock");
         let engine = EngineHandle::from_concrete(EchoEngine);
-        let h = tokio::spawn(serve(sock.clone(), engine, never_shutdown()));
+        let h = tokio::spawn(serve(sock.clone(), engine, never_shutdown(), no_token()));
         uds_ready(&sock).await;
         let mut s = UnixStream::connect(&sock).await.unwrap();
         // 一次写两行：garbage + valid health → 两行响应
@@ -389,7 +433,7 @@ mod tests {
         let sock = dir.path().join("shutdown.sock");
         let engine = EngineHandle::from_concrete(EchoEngine);
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-        let h = tokio::spawn(serve(sock.clone(), engine, rx));
+        let h = tokio::spawn(serve(sock.clone(), engine, rx, no_token()));
         uds_ready(&sock).await;
         // 触发 shutdown
         tx.send(()).unwrap();
@@ -401,5 +445,84 @@ mod tests {
         );
         let outer = res.unwrap().unwrap(); // JoinHandle 结果
         assert!(outer.is_ok(), "serve 返错: {:?}", outer);
+    }
+
+    #[tokio::test]
+    async fn uds_token_rejects_rpc_before_auth() {
+        // P1-5: token 启用, 未握手直接发 RPC → -32004 unauthorized。
+        let dir = tempdir().unwrap();
+        let sock = dir.path().join("auth-reject.sock");
+        let engine = EngineHandle::from_concrete(EchoEngine);
+        let tok = Arc::new("secret-token".to_string());
+        let h = tokio::spawn(serve(sock.clone(), engine, never_shutdown(), tok));
+        uds_ready(&sock).await;
+        let mut s = UnixStream::connect(&sock).await.unwrap();
+        s.write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"health\",\"params\":{},\"id\":1}\n")
+            .await
+            .unwrap();
+        s.flush().await.unwrap();
+        let mut reader = BufReader::new(s);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        assert!(
+            line.contains("-32004"),
+            "未握手 RPC 应返 unauthorized, line={line}"
+        );
+        h.abort();
+    }
+
+    #[tokio::test]
+    async fn uds_token_rejects_wrong_token() {
+        // P1-5: 握手 token 不匹配 → -32004, 仍未放行。
+        let dir = tempdir().unwrap();
+        let sock = dir.path().join("auth-wrong.sock");
+        let engine = EngineHandle::from_concrete(EchoEngine);
+        let tok = Arc::new("secret-token".to_string());
+        let h = tokio::spawn(serve(sock.clone(), engine, never_shutdown(), tok));
+        uds_ready(&sock).await;
+        let mut s = UnixStream::connect(&sock).await.unwrap();
+        s.write_all(b"AUTH wrong-token\n{\"jsonrpc\":\"2.0\",\"method\":\"health\",\"params\":{},\"id\":1}\n")
+            .await
+            .unwrap();
+        s.flush().await.unwrap();
+        let mut reader = BufReader::new(s);
+        let mut l1 = String::new();
+        reader.read_line(&mut l1).await.unwrap();
+        assert!(
+            l1.contains("-32004"),
+            "错误 token 应返 unauthorized, l1={l1}"
+        );
+        let mut l2 = String::new();
+        reader.read_line(&mut l2).await.unwrap();
+        assert!(
+            l2.contains("-32004"),
+            "握手失败后 RPC 仍应 unauthorized, l2={l2}"
+        );
+        h.abort();
+    }
+
+    #[tokio::test]
+    async fn uds_token_handshake_then_rpc_allowed() {
+        // P1-5: 握手 token 正确 → 放行后续 RPC。
+        let dir = tempdir().unwrap();
+        let sock = dir.path().join("auth-ok.sock");
+        let engine = EngineHandle::from_concrete(EchoEngine);
+        let tok = Arc::new("secret-token".to_string());
+        let h = tokio::spawn(serve(sock.clone(), engine, never_shutdown(), tok));
+        uds_ready(&sock).await;
+        let mut s = UnixStream::connect(&sock).await.unwrap();
+        s.write_all(b"AUTH secret-token\n").await.unwrap();
+        s.write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"health\",\"params\":{},\"id\":1}\n")
+            .await
+            .unwrap();
+        s.flush().await.unwrap();
+        let mut reader = BufReader::new(s);
+        let mut l1 = String::new();
+        reader.read_line(&mut l1).await.unwrap();
+        assert!(l1.contains("ok"), "握手成功应返 ok, l1={l1}");
+        let mut l2 = String::new();
+        reader.read_line(&mut l2).await.unwrap();
+        assert!(l2.contains("ok"), "握手后 health RPC 应放行, l2={l2}");
+        h.abort();
     }
 }

@@ -16,5 +16,5 @@ pub use entity::{EntityNode, EntityType};
 pub use error::{MemoryError, MemoryResult};
 pub use interaction::{Interaction, ToolCall, Turn};
 pub use memory::{MemoryItem, MemoryTier, MemoryType};
-pub use report::{ConsolidationFailure, ConsolidationReport, MemoryId};
+pub use report::{CommitOutcome, ConsolidationFailure, ConsolidationReport, MemoryId, TurnFailure};
 pub use trait_def::FusionMemoryEngine;

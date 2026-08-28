@@ -71,7 +71,7 @@ mod tests {
     use super::*;
     use fm_embed::StubEmbedder;
     use fm_persist::Persist;
-    use fm_store::StoreStub;
+    use fm_store::LocalStore;
     use std::sync::{Mutex, OnceLock};
     use tempfile::TempDir;
 
@@ -84,7 +84,7 @@ mod tests {
 
     fn make_engine() -> (Arc<MemoryEngine>, TempDir) {
         let dir = TempDir::new().unwrap();
-        let store = Arc::new(StoreStub::open(dir.path(), 4).unwrap());
+        let store = Arc::new(LocalStore::open(dir.path(), 4).unwrap());
         let persist = Arc::new(Persist::open_in_memory().unwrap());
         let embedder: Arc<dyn fm_embed::Embedder> = Arc::new(StubEmbedder::new(4));
         (Arc::new(MemoryEngine::new(store, persist, embedder)), dir)

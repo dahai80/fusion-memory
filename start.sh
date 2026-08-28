@@ -204,6 +204,74 @@ cmd_doctor() {
     fi
 }
 
+# P0-1: 装/卸载进程守护单元 (systemd Linux / launchd macOS)。崩溃自动重启。
+cmd_install() {
+    local unit_src="$SCRIPT_DIR/deploy/fusion-memory.service"
+    local plist_src="$SCRIPT_DIR/deploy/io.fusion.memory.plist"
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+        if [[ ! -f "$plist_src" ]]; then
+            echo "${C_RED}✘ plist missing: $plist_src${C_RESET}" >&2
+            exit 1
+        fi
+        local dst_dir="$HOME/Library/LaunchAgents"
+        mkdir -p "$dst_dir"
+        local dst="$dst_dir/io.fusion.memory.plist"
+        cp "$plist_src" "$dst"
+        # ~ 在 plist 内不展开为绝对路径, launchd 需绝对路径。sed 替换。
+        local home_abs
+        home_abs="$(cd "$HOME" && pwd)"
+        sed -i '' "s|~/.fusion-memory|$FM_HOME|g" "$dst"
+        sed -i '' "s|~/fusion-memory/target/release/fm-server|$BIN|g" "$dst"
+        launchctl unload "$dst" 2>/dev/null || true
+        launchctl load "$dst"
+        echo "${C_GREEN}● installed launchd agent${C_RESET} $dst"
+        echo "  KeepAlive=true (崩溃自动拉起), RunAtLoad=true (开机自启)"
+        echo "  log: $FM_HOME/logs/launchd-stderr.log"
+    elif command -v systemctl >/dev/null 2>&1; then
+        if [[ ! -f "$unit_src" ]]; then
+            echo "${C_RED}✘ unit missing: $unit_src${C_RESET}" >&2
+            exit 1
+        fi
+        local dst="/etc/systemd/system/fusion-memory.service"
+        echo "${C_BLUE}━━━ Installing systemd unit (needs sudo) ━━━${C_RESET}"
+        sudo cp "$unit_src" "$dst"
+        # 二进制路径按实际 build 产物改。
+        sudo sed -i "s|/usr/local/bin/fm-server|$BIN|g" "$dst"
+        sudo sed -i "s|/var/lib/fusion-memory|$FM_HOME|g" "$dst"
+        sudo systemctl daemon-reload
+        sudo systemctl enable --now fusion-memory
+        echo "${C_GREEN}● installed systemd unit${C_RESET} $dst"
+        echo "  Restart=always RestartSec=5s (崩溃 5s 内拉起)"
+        echo "  status: systemctl status fusion-memory | log: journalctl -u fusion-memory -f"
+    else
+        echo "${C_RED}✘ neither systemd nor launchd found on this system${C_RESET}" >&2
+        echo "  fallback: run './start.sh start' manually (no auto-restart guard)" >&2
+        exit 1
+    fi
+}
+
+cmd_uninstall() {
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+        local dst="$HOME/Library/LaunchAgents/io.fusion.memory.plist"
+        if [[ -f "$dst" ]]; then
+            launchctl unload "$dst" 2>/dev/null || true
+            rm -f "$dst"
+            echo "${C_GREEN}● uninstalled launchd agent${C_RESET} $dst"
+        else
+            echo "${C_YELLOW}● no launchd agent installed${C_RESET}"
+        fi
+    elif command -v systemctl >/dev/null 2>&1; then
+        local dst="/etc/systemd/system/fusion-memory.service"
+        echo "${C_BLUE}━━━ Uninstalling systemd unit (needs sudo) ━━━${C_RESET}"
+        sudo systemctl disable --now fusion-memory 2>/dev/null || true
+        sudo rm -f "$dst"
+        sudo systemctl daemon-reload
+        echo "${C_GREEN}● uninstalled systemd unit${C_RESET} $dst"
+    else
+        echo "${C_YELLOW}● nothing to uninstall (no systemd/launchd)${C_RESET}"
+    fi
+}
+
 case "${1:-}" in
 start) cmd_start ;;
 stop) cmd_stop ;;
@@ -211,8 +279,10 @@ restart) cmd_stop; cmd_start ;;
 status) cmd_status ;;
 log) shift; cmd_log "$@" ;;
 doctor) cmd_doctor ;;
+install) shift; cmd_install "$@" ;;
+uninstall) shift; cmd_uninstall "$@" ;;
 *)
-    echo "usage: $0 {start|stop|restart|status|log [-f]|doctor}" >&2
+    echo "usage: $0 {start|stop|restart|status|log [-f]|doctor|install|uninstall}" >&2
     exit 1
     ;;
 esac

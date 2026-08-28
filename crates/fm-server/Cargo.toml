@@ -1,6 +1,6 @@
 [package]
 name = "fm-server"
-version = "0.2.0"
+version = "0.2.1"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -16,6 +16,8 @@ fm-embed = { workspace = true }
 fm-cluster = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# P1-8: TOML 配置文件解析。
+toml = { workspace = true }
 tokio = { workspace = true }
 async-trait = { workspace = true }
 tracing = { workspace = true }
