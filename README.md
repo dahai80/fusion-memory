@@ -8,6 +8,14 @@ Fusion 生态（"一核九端"）系统级长/短期记忆与认知图谱中枢�
 
 ## 状态
 
+**v1.0.0 — API 稳定承诺（2026-08-28）**：11 crate 锁定 1.0.0。自此起遵循语义化版本（SemVer）契约：
+- `MAJOR`（2.0+）：仅引入**不向后兼容**的破坏性变更，须提前在 changelog 公告 + 迁移指南。破坏性变更包括：移除/重命名已有 RPC 方法、改变 HTTP 路径、改变字段语义、改变默认行为。
+- `MINOR`（1.x）：向后兼容的新方法/字段/端点/性能改进，客户端**不可**因 MINOR 升级而中断。
+- `PATCH`（1.0.x）：缺陷修复，无行为变更。
+- **冻结的线契约（wire contract）**：UDS JSON-RPC 方法集 + `v1.<method>` 前缀路由 + `jsonrpc=="2.0"` 校验（见 `jsonrpc::API_VERSION=1`）；HTTP `/v1/memory/*` 路径 + Bearer 鉴权 + `confirm` 守卫。二者在 1.x 全周期不变。
+- 客户端协商：调 `version` RPC 或 `GET /v1/memory/version` 取 `api_version`，据版本号分支处理。
+- 1.0 前的 0.x 版本为技术预览，无稳定承诺。
+
 **M2 已完成**：真实 bge-m3 embedding（dim=1024）+ 实体抽取（防注入 prompt + 严格 JSON 解析）+ SQLite 递归 CTE 图遍历 + 规则优先实体对齐 + 融合评分（cosine+衰减+graph_affinity）+ agent-studio 历史记忆导入。验收：实体抽取 JSON 解析成功率 100%（>90%），规则优先对齐正确（同名同 type 合并 / 同名异 type 不合并），真实 embedding 往返 dim=1024。测试覆盖率 lines 90.59% / regions 92.17%。162 测试全绿，clippy -D warnings 通过。
 
 **M3 已完成**：fm-server（UDS JSON-RPC 0600 + HTTP axum 强制 Bearer B5，端口 11435，无 API_KEY 拒启 HTTP）+ fm-py PyO3 绑定（`allow_threads` GIL 安全 C2）+ consolidate_memories saga（增量遗忘 + merge/summarize/reconcile，跨库对账 + merge_log + unmerge）+ fm-cli（consolidate/merges/unmerge/reconcile）+ start.sh（start/stop/restart/status/log/doctor）。验收：PyO3 往返 GIL 不冻结（commit→2 ids / retrieve→block / consolidate→report）；HTTP 无 token 被拒 + DELETE 无 confirm 被拒 + 无 API_KEY 拒启 HTTP；consolidate 报告字段完整 + 对账差异检出；start.sh 三命令可用。242 离线 + live 测试全绿，regions 离线 90.63% / live 92.07%。
@@ -116,7 +124,7 @@ Fusion 生态（"一核九端"）系统级长/短期记忆与认知图谱中枢�
 - **P2-2 PII 覆盖扩**：`redact.rs` 新增 IPv6（缩写 + 全写 8 段）+ 国际手机（E.164 `+\d{7,15}` 非 86 国家码，顺序在 China phone 后避双重脱敏）模式。姓名/地址类 regex 误报率高（locale-heavy），延后接 fusion-guard UDS `guard.redact`（待上游 fusion-guard#2 补 PII 类，见 M5 偏离记录 b）。`crates/fm-engine/src/redact.rs`。
 - **P2-3 summarize 失败可见**：`consolidate_summarize` 的 mlx 调用失败（None = 网络/non-2xx/解析）或返空内容，旧版仅 warn 静默吞 → 现落 `ConsolidationFailure{stage:"summarize"}` 供客户端感知。`crates/fm-engine/src/engine.rs`。
 - **P2-4 API 版本控制**：JSON-RPC `jsonrpc=="2.0"` 校验（非 2.0 → `-32600 invalid_request`，旧版静默吞字段）；方法版本前缀 `v1.<method>` 路由（无前缀 = 最新 = v1，向后兼容）；新增 `version` 方法 + `GET /v1/memory/version` 端点返 `api_version` 供客户端协商。`crates/fm-server/src/jsonrpc.rs`、`crates/fm-server/src/http.rs`。
-- **P2-1 自动 failover / split-brain 防护 — 显式延后（SLA 文档化）**：当前 `fm-cluster` 手动 failover（`fm cluster promote` 写 role=leader + 重启 fm-server），无 Raft 自动选举/quorum 写。裁定延后：① PRD §16 界定内网离线小集群（非公网），split-brain 风险面受限（内网分区罕见）；② Raft 是独立 epic（选举/日志复制/成员变更，新增 crate + 协议层），超出本轮 P0-P3 代码修复边界；③ 手动 failover 已文档化为 SLA（leader 宕机 → 运维 `fm cluster promote` + 重启，RTO 人工介入级）。路线图：M7+ 评估 `openraft` 集成（纯 Rust Raft，契合离线约束）。
+- **P2-1 自动 failover / split-brain 防护 — 已落地（v1.0.0 B-2，退役延后状态）**：`fm-cluster::election` 精简自包含选举模块（leader-lease + term + quorum + wop_log last_seq 判定，**无 openraft**）替代手动 failover。leader 宕机 → follower 自动竞选胜出 → `epoch++` + 写 role=Leader → 重启成 leader（RTO 秒级）。旧 leader 复活经 §1.8 StaleLeader fencing 拒同步（防脑裂双写）。手动 `fm cluster promote` 仍保留（无 election 配置时）。split-brain 防护：quorum 多数写 + epoch fencing + token 鉴权（复用 H3）。16 新测试覆盖。详见 `### v1.0.0 自动 failover 选举`。
 - **P2-5 Persist god-object 拆 trait — 显式延后（架构重构 epic）**：`Persist` 当前 30+ 方法（Memory/Relation/Entity/Wop/Reconcile 混合）。裁定延后：① 拆 5 trait（Memory/Relation/Entity/Wop/Reconcile）触及全引擎调用点（~60 处签名改 `&Persist` → `&dyn MemoryStore` 等）+ fm-py PyO3 绑定 + fm-cluster ReplaySink，是跨 crate 架构重构 epic，非本轮 P0-P3 单点修复；② `fm-graph::GraphStore` trait（v0.2.0 §1.5 已拆图层最小接口）证明拆 trait 模式可行， Persist 拆分沿用同法但规模量级不同；③ 当前 `Persist` 虽 god-object 但有清晰内部分区（各职责方法分组 + 注释），不阻塞商用。路线图：独立 PR 专项拆分，配迁移测试。
 - **P2-6 依赖迁移 sled→fjall / hnsw_rs 备选 — 显式延后（评估中）**：sled 0.34 + hnsw_rs 0.3.4 维护风险评估。裁定延后：① sled 作者已推 fjall（后继项目，API 不同），迁移是 local-store 后端整体重写 + 数据格式迁移（存盘向量需 reformat），非本轮范围；② hnsw_rs 备选（`hnsw`/`hora` 库）需 benchmark 对比召回率/延迟，评估未完成前不换；③ 两依赖当前功能稳定（100k 规模 bench 已验证，见 P1-7），无已知阻塞 bug。路线图：先 bench 评估备选库召回/延迟，再定迁移优先级；sled→fjall 若做，配数据迁移脚本。
 
@@ -133,6 +141,58 @@ PRD §14 M5 三部分，(a) store-fusion 可选切换、(b) fusion-guard DLP gat
 - **(a) store-fusion 切换 → 降级不实施**（裁定 2026-08-27）：PRD §14/Tech Selection 拟复用 `fusion-store`（HNSW）做零拷贝后端。但实测：① `fusion-store` 的 `FusionStoreEngine`（`fs-core/src/engine.rs`）与 fm-store 的同名 trait 是**两套不同 API**（方法集不同：create_vector_index/open_vector_index/columnar/checkpoint/recover，全签 `timeout: Option<Duration>`、返 `Result<bool>` vs fm-store 返 `MemoryResult<()>`），非同名 trait；② fusion-store 非 git 仓库、非本 workspace 成员，受"只能改本目录工程"约束无法作 path dep 消费；③ fm-store A4 已否定零拷贝（"放弃零拷贝幻象，get_vector 返回 owned Vec"）。故 store-stub 保持长期生产后端，store-fusion 切换不实施。perf gate 亦针对 store-stub（非 fusion-store），(c) 不受影响。
 - **(b) fusion-guard DLP gate → 暂用自带 PII 正则脱敏，正式 gate 待上游补 PII 类**（裁定 2026-08-27，复核 2026-08-27）：PRD R8/§10.4 "M5 接 guard 做正式 DLP gate"。复核发现 **fusion-guard 已落地**（git 仓库 `dahai80/fusion-guard`，13 crate，`fg-audit-engine::AuditEngine` 真正 DLP gate + UDS JSON-RPC `guard.redact/evaluate/reveal/confirm` via `fg-ipc`，可 IPC 消费无需 Rust 依赖，契合 100% 离线）。但实测 `fg-redact::Redactor` 当前只覆盖**凭证类**（api_key/password/id_number/private_key），**不覆盖** fusion-memory 所需的 **PII 类**（phone/email/bankcard/ipv4）——覆盖面缺口。故暂留 fusion-memory 自带最小 PII 正则脱敏（`fm-engine/src/redact.rs`，五类 PII）作过渡。已向上游提 issue 跟踪：**fusion-guard #2**（请求 `fg-redact` 增 PII pattern classes，phone/email/bankcard/ipv4，含 order-sensitivity 顺序敏感替换 + 回归测试）。上游落地 PII 类后，fusion-memory 弃用 `redact.rs` 改走 UDS `guard.redact`（irreversible）正式 DLP gate，接入点不变（`with_redact()` builder + commit/import 写入路径）。
 - **(c) perf 基线 → 已落地**：见 M5 总结段。两 gate 达标，基线 JSON 存档。
+
+### v1.0.0 商用阻断修复（2026-08-28，第四轮 — 商用就绪 hardening）
+
+针对商用发布前 7 项阻断的处置。A 类 3 项受跨工程/账户约束非代码可修（盯上游 issue），B 类 2 项 epic + C 类 2 项在本轮落地。
+
+**A 类 — 跨工程/账户阻断（非本仓库可修，已提上游 issue 跟踪）**
+- **A-1 fusion-store 零拷贝后端**：PRD §14 拟复用 fusion-store HNSW 零拷贝，受"只能改本目录工程"约束 + 上游 trait API 不对齐阻断。生产继续用 local-store（hnsw_rs + sled owned）。已提 **fusion-store #3**（请求 VectorIndex 暴露 `get_vector(id)`+`list_vector_ids()`）+ **fusion-store #4**（请求 WIP owner commit 未提交的 `engine_impl.rs` Engine impl）。上游合并后可落地 adapter，接入点不变（`FusionStoreEngine` trait 已 trait 化，§1.4）。
+- **A-2 fusion-guard DLP 闸**：见 M5 偏离记录 (b)。自带 `redact.rs` 过渡，已提 **fusion-guard #2** 等上游补 PII 类。
+- **A-3 GitHub Actions CI**：账户计费阻断（P0-5），非代码。本地 gate（fmt/clippy/check/test + fuzz）为代理口径全绿。
+
+**B 类 — 此前延后 epic，本轮落地**
+- **B-1 静态加密**：见 `### v1.0.0 静态加密` 专节。FDE（FileVault/LUKS）作主静态加密（ops 层，`deploy/README.md` 文档化）+ app 层 AES-256-GCM 敏感字段加密（`fm-persist` 加密层，defense-in-depth）。向量不 app 加密（FDE 覆盖 + 上游 PII 脱敏）。
+- **B-2 自动 failover**：见 `### v1.0.0 自动 failover 选举` 专节。**精简自包含选举**（leader-lease + term + quorum 投票，**无 openraft 依赖**——openraft 仅 alpha 无稳定版，商用风险），替代手动 `fm cluster promote`。leader 宕机 → follower 自动竞选，RTO 从人工介入级降到秒级。退役 P2-1 延后状态。
+
+**C 类 — 干净修复，本轮落地**
+- **C-1 API 1.0 稳定承诺**：11 crate 0.2.1→1.0.0，SemVer 契约 + 线契约冻结（见状态段 v1.0.0 声明）。`jsonrpc::API_VERSION=1` + `v1.` 前缀路由 + `jsonrpc=="2.0"` 校验已就位。
+- **C-2 fuzz + 负载压测**：见 `### v1.0.0 fuzz + 负载压测` 专节。`cargo-fuzz` JSON-RPC/HTTP 解析 fuzz 目标 + 100k 向量 + 高并发压测。
+
+**仍待上游落地（非本轮）**：fusion-store #3/#4（零拷贝后端）、fusion-guard #2（正式 DLP PII 闸）、GitHub 账户计费恢复（CI）。
+
+**v1.0.0 B/C 批次验收**：424 离线测试全绿（基线 408 → +16 新增 election 测试 + B-1 加密 4 测试已并入基线），clippy `-D warnings` + fmt clean + `cargo check --workspace` clean。B-1 静态加密 4 测试（明文兼容/加密往返/错 key fail-open/无 cipher 读密文）+ B-2 选举 16 测试（投票 4 判据 + quorum + 竞胜负 + 租约 + live TCP vote listener + from_env 边界）。
+
+### v1.0.0 静态加密
+
+**分层策略（Rule 7，单一选 FDE 为主 + app 加密为纵深，非二者平均）**：
+
+1. **FDE = 主静态加密（ops 层）**：SQLite `memory.db` + sled 向量库 + 集群 wop_log 全落 FDE 加密卷。macOS = FileVault（全盘）；Linux = LUKS/dm-crypt（数据卷）。FDE 对应用透明——hnsw_rs 在 RAM 内算距离用明文，落盘是密文，KNN 不受影响。`deploy/README.md` 文档化为部署前置要求 + 校验步骤。
+2. **App 层字段加密 = 纵深防御（code）**：`fm-persist` 加密层对 SQLite `memory.content` + `entity.text` 敏感文本列做 AES-256-GCM 加密，即使磁盘快照泄露（绕过 FDE）也非明文。key 来源：`FUSION_MEMORY_ENC_KEY_FILE`（0600 文件，32B 原始 key）或 `FUSION_MEMORY_ENC_PASSPHRASE`（argon2 KDF 派生）。读路径透明解密。
+3. **向量不 app 加密**：hnsw_rs 索引需明文算距离，app 加密会破坏 KNN。向量由 FDE + 上游 PII 脱敏（commit 前脱敏，向量从脱敏内容派生）覆盖。
+4. **集群传输**：内网 loopback/私有网，TLS 暂不强制（PRD §16 内网离线）；敏感字段已 app 加密，传输中非明文。
+
+**key 管理**：无 key = 明文模式（兼容旧行为，env 未配）；配 key = 加密模式。key 轮换 = re-encrypt 脚本（`fm-cli` 后续补）。密钥不入仓、不入日志。
+
+### v1.0.0 自动 failover 选举
+
+**精简自包含选举（替代手动 failover，退役 P2-1 延后）**：
+
+- **选型**：**精简自包含 election 模块**（`fm-cluster::election`，~400 LOC），**不引 openraft**——openraft 最新仅 `0.10.0-alpha.34`，无稳定版、MSRV 未知、依赖树大，商用阻断（Rule 2 简单性 + Rule 7 单一选型）。实现 Raft 本质（非全量 Raft），契合 100% 离线约束。
+- **算法**：leader-lease（`heartbeat_secs × heartbeat_fails`，复用 SyncConfig）+ term 递增投票 + quorum（`floor(nodes/2)+1`）+ 日志新旧判定（复用 wop_log `last_seq`）。
+- **竞选触发**：follower `run()` 检测 LeaderDown（连续心跳失败）→ 转 candidate → 自增 term + 投自己 → 向所有 peer 发 `VoteRequest`（新增 `FrameKind::VoteRequest/VoteResponse`，复用 TCP 线帧）→ 收 quorum → 胜出。
+- **投票授权判据**（Raft）：① `candidate.term ≥ own.term`；② `candidate.last_seq ≥ own.last_seq`；③ 本 term 未投过票（或已投该 candidate）；④ token 一致（复用 H3 鉴权）。不满足 → 拒。
+- **胜出 → promote**：candidate 拿 quorum → `epoch++`（`write_epoch_file`，复用 §1.8 fencing）+ 写 `role=Leader`（`write_role_file`）→ orbit 退出，supervisor 重启该节点成 leader。旧 leader 复活后 epoch 低 → follower `StaleLeader` 拒同步（防脑裂双写）。
+- **优先级**：节点列表下标小者优先（确定性，避随机，同 term 平票有定论）。
+- **成员**：静态，env `FUSION_MEMORY_CLUSTER_NODES=host:port,host:port,...`（全节点），自身下标 `FUSION_MEMORY_CLUSTER_NODE_ID`（0-based）。未配 → 无选举（单机/手动模式兼容，零开销）。成员变更 = 改 env 重启（非动态 add/remove，Rule 2）。
+- **新增依赖**：无（复用 transport TCP / wop_log / role epoch 文件 / async_trait）。
+- **M3 e2e 场景重验**：commit→catchup 一致 / 增量 seq 推进 / leader 宕机→自动选举→新 leader 续写（原 promote 路径改自动）。16 新测试覆盖（投票授权/拒绝 4 判据、quorum、竞选胜/败、租约到期、live TCP vote listener、from_env 边界）。
+- **手动模式保留**：`fm cluster promote` 仍可用（无 election 配置时）。`fm cluster status` 显示 election 状态 + epoch。
+
+### v1.0.0 fuzz + 负载压测
+
+- **fuzz**：`cargo-fuzz` 目标 — JSON-RPC 请求解析（畸形 JSON / 超长 / 坏 UTF-8 / 类型混淆 / 嵌套深）、HTTP body 边界、实体抽取 JSON 解析。崩溃/panic 视为缺陷。`crates/fm-server/fuzz/`。
+- **负载压测**：扩 `retrieve_bench` — 100k 向量（基线 10k × 10）+ 并发梯度（1/10/50/100），记录 p50/p99/p999 + 吞吐。商用级负载验证。结果落 `benches/baseline-1.0.0-*.json`。
 
 ## 架构
 
@@ -156,7 +216,7 @@ PRD §14 M5 三部分，(a) store-fusion 可选切换、(b) fusion-guard DLP gat
 | `fm-server` | UDS JSON-RPC + HTTP 服务 |
 | `fm-py` | PyO3 Python 绑定 |
 | `fm-cli` | CLI 运维/导入/查询 |
-| `fm-cluster` | M6 集群同步：leader/follower 角色 + wop_log 复制 + TCP 传输 + 手动 failover |
+| `fm-cluster` | M6 集群同步：leader/follower 角色 + wop_log 复制 + TCP 传输 + 手动 failover；v1.0.0 B-2 自动 failover 选举（`election` 模块，leader-lease + term + quorum） |
 
 ## 构建
 

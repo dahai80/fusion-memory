@@ -22,6 +22,10 @@ pub enum PersistError {
     // §1.1: r2d2 连接池错误 (池满超时/连接初始化失败)。
     #[error("connection pool error: {0}")]
     Pool(String),
+
+    // v1.0.0 B-1: 静态加密错误 (key 缺失/格式错/解密失败)。
+    #[error("encryption error: {0}")]
+    Encrypt(String),
 }
 
 // §1.1: r2d2::Error → PersistError::Pool (供 Pool::builder().build()? 的 ? 转换)。
@@ -56,6 +60,8 @@ impl PersistError {
                     fm_core::MemoryError::Sqlite(e.to_string())
                 }
             }
+            // v1.0.0 B-1: 加密错误 → MemoryError::Encrypt (永久, 不可重试)。
+            PersistError::Encrypt(s) => fm_core::MemoryError::Encrypt(s),
         }
     }
 }

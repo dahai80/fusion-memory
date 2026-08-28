@@ -26,6 +26,8 @@ const POOL_GET_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct Persist {
     pool: Pool<SqliteConnectionManager>,
+    // v1.0.0 B-1: 静态加密。None = 明文模式 (兼容旧行为)。
+    cipher: Option<crate::crypto::Cipher>,
 }
 
 impl Persist {
@@ -37,8 +39,12 @@ impl Persist {
             .max_size(POOL_SIZE)
             .connection_timeout(POOL_GET_TIMEOUT)
             .build(mgr)?;
-        info!("persist opened (WAL, pool size {POOL_SIZE}, get_timeout 5s)");
-        Ok(Self { pool })
+        let cipher = crate::crypto::Cipher::from_env()?;
+        info!(
+            "persist opened (WAL, pool size {POOL_SIZE}, get_timeout 5s, encrypt={})",
+            cipher.is_some()
+        );
+        Ok(Self { pool, cipher })
     }
 
     pub fn open_in_memory() -> PersistResult<Self> {
@@ -52,7 +58,13 @@ impl Persist {
             .connection_timeout(POOL_GET_TIMEOUT)
             .build(mgr)?;
         debug!("persist opened (in-memory, pool size {POOL_SIZE}, get_timeout 5s)");
-        Ok(Self { pool })
+        Ok(Self { pool, cipher: None })
+    }
+
+    /// v1.0.0 B-1: 显式注入 cipher (测试用, 覆盖 env)。返 Self 供链式。
+    pub fn with_cipher(mut self, cipher: Option<crate::crypto::Cipher>) -> Self {
+        self.cipher = cipher;
+        self
     }
 
     fn init_conn(conn: &mut rusqlite::Connection) -> PersistResult<()> {
@@ -114,6 +126,8 @@ impl Persist {
         let mut conn = self.conn_mut()?;
         let tx = conn.transaction()?;
         let entities_json = serde_json::to_string(&item.entities)?;
+        let enc_content = crate::crypto::encrypt_field(self.cipher.as_ref(), &item.content)?;
+        let enc_entities = crate::crypto::encrypt_field(self.cipher.as_ref(), &entities_json)?;
         tx.execute(
             schema::MEMORY_ITEM_DDL_INSERT,
             params![
@@ -123,7 +137,7 @@ impl Persist {
                 item.session_id,
                 item.memory_type.as_str(),
                 item.tier.as_str(),
-                item.content,
+                enc_content,
                 item.vector_ref,
                 item.weight,
                 item.access_count as i64,
@@ -132,7 +146,7 @@ impl Persist {
                 item.provenance,
                 item.tombstone as i64,
                 item.entities_pending as i64,
-                entities_json,
+                enc_entities,
             ],
         )?;
         for e in &item.entities {
@@ -169,6 +183,8 @@ impl Persist {
         let mut conn = self.conn_mut()?;
         let tx = conn.transaction()?;
         let entities_json = serde_json::to_string(&item.entities)?;
+        let enc_content = crate::crypto::encrypt_field(self.cipher.as_ref(), &item.content)?;
+        let enc_entities = crate::crypto::encrypt_field(self.cipher.as_ref(), &entities_json)?;
         tx.execute(
             schema::MEMORY_ITEM_DDL_INSERT,
             params![
@@ -178,7 +194,7 @@ impl Persist {
                 item.session_id,
                 item.memory_type.as_str(),
                 item.tier.as_str(),
-                item.content,
+                enc_content,
                 item.vector_ref,
                 item.weight,
                 item.access_count as i64,
@@ -187,7 +203,7 @@ impl Persist {
                 item.provenance,
                 item.tombstone as i64,
                 item.entities_pending as i64,
-                entities_json,
+                enc_entities,
             ],
         )?;
         for e in &item.entities {
@@ -220,7 +236,9 @@ impl Persist {
         // §3.12: 旧版每次 prepare(SELECT * WHERE id=?) → 每请求重新解析 SQL + 建预处理句柄。
         // 改: prepare_cached 复用 Connection 缓存的预处理句柄 (单 conn 被 Mutex 持久化, 缓存跨调用有效)。
         let mut stmt = conn.prepare_cached(schema::MEMORY_ITEM_DDL_SELECT_BY_ID)?;
-        let row = stmt.query_row(params![id], row_to_memory).optional()?;
+        let row = stmt
+            .query_row(params![id], |r| row_to_memory(r, self.cipher.as_ref()))
+            .optional()?;
         Ok(row)
     }
 
@@ -229,7 +247,9 @@ impl Persist {
         let mut stmt = conn.prepare(
             "SELECT * FROM memory_item WHERE interaction_id=?1 AND tombstone=0 ORDER BY turn_idx ASC",
         )?;
-        let rows = stmt.query_map(params![interaction_id], row_to_memory)?;
+        let rows = stmt.query_map(params![interaction_id], |r| {
+            row_to_memory(r, self.cipher.as_ref())
+        })?;
         let mut out = Vec::new();
         for r in rows {
             out.push(r?);
@@ -242,7 +262,7 @@ impl Persist {
         let mut stmt = conn.prepare(
             "SELECT * FROM memory_item WHERE tombstone=0 ORDER BY created_timestamp ASC",
         )?;
-        let rows = stmt.query_map([], row_to_memory)?;
+        let rows = stmt.query_map([], |r| row_to_memory(r, self.cipher.as_ref()))?;
         let mut out = Vec::new();
         for r in rows {
             out.push(r?);
@@ -268,7 +288,9 @@ impl Persist {
             "SELECT * FROM memory_item WHERE tombstone=0 AND vector_ref IN ({placeholders})"
         );
         let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(rusqlite::params_from_iter(refs_str.iter()), row_to_memory)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(refs_str.iter()), |r| {
+            row_to_memory(r, self.cipher.as_ref())
+        })?;
         let mut out = Vec::new();
         for r in rows {
             out.push(r?);
@@ -311,7 +333,9 @@ impl Persist {
             .iter()
             .map(|s| s as &dyn rusqlite::ToSql)
             .collect();
-        let rows = stmt.query_map(params.as_slice(), row_to_memory)?;
+        let rows = stmt.query_map(params.as_slice(), |r| {
+            row_to_memory(r, self.cipher.as_ref())
+        })?;
         let mut out = Vec::new();
         for r in rows {
             out.push(r?);
@@ -366,7 +390,9 @@ impl Persist {
         let mut stmt = conn.prepare(
             "SELECT * FROM memory_item WHERE session_id=?1 AND tombstone=0 ORDER BY turn_idx ASC",
         )?;
-        let rows = stmt.query_map(params![session_id], row_to_memory)?;
+        let rows = stmt.query_map(params![session_id], |r| {
+            row_to_memory(r, self.cipher.as_ref())
+        })?;
         let mut out = Vec::new();
         for r in rows {
             out.push(r?);
@@ -692,7 +718,9 @@ ORDER BY first_hop ASC LIMIT ?3";
              AND (last_accessed_timestamp > ?1 OR created_timestamp > ?1) \
              ORDER BY created_timestamp ASC",
         )?;
-        let rows = stmt.query_map(params![since as i64], row_to_memory)?;
+        let rows = stmt.query_map(params![since as i64], |r| {
+            row_to_memory(r, self.cipher.as_ref())
+        })?;
         let mut out = Vec::new();
         for r in rows {
             out.push(r?);
@@ -704,7 +732,7 @@ ORDER BY first_hop ASC LIMIT ?3";
     pub fn list_tombstoned(&self) -> PersistResult<Vec<MemoryItem>> {
         let conn = self.conn()?;
         let mut stmt = conn.prepare("SELECT * FROM memory_item WHERE tombstone=1")?;
-        let rows = stmt.query_map([], row_to_memory)?;
+        let rows = stmt.query_map([], |r| row_to_memory(r, self.cipher.as_ref()))?;
         let mut out = Vec::new();
         for r in rows {
             out.push(r?);
@@ -859,11 +887,16 @@ const _: () = {
     // 占位：保证 entities_json 列名常量可见（避免未来误删）
 };
 
-fn row_to_memory(row: &rusqlite::Row) -> rusqlite::Result<MemoryItem> {
+fn row_to_memory(
+    row: &rusqlite::Row,
+    cipher: Option<&crate::crypto::Cipher>,
+) -> rusqlite::Result<MemoryItem> {
     let id: String = row.get("id")?;
     let memory_type_str: String = row.get("memory_type")?;
     let tier_str: String = row.get("tier")?;
-    let entities_json: String = row.get("entities_json")?;
+    let raw_entities: String = row.get("entities_json")?;
+    // v1.0.0 B-1: 解密 content + entities_json (无 cipher / 无 enc 前缀 → 原样, 兼容旧行)。
+    let entities_json = crate::crypto::decrypt_field(cipher, &raw_entities);
     // §3.2: 坏 JSON 静默成空实体 → 图边消失但源记忆仍指旧 vector_ref, consolidate 当新鲜 episodic 处理。
     // 改: 坏 JSON warn 留痕 (仍降级空 Vec 保服务连续, 不 panic), 运维可据 warn 定位损坏行。
     let entities: Vec<EntityNode> = match serde_json::from_str(&entities_json) {
@@ -906,7 +939,7 @@ fn row_to_memory(row: &rusqlite::Row) -> rusqlite::Result<MemoryItem> {
         session_id: row.get("session_id")?,
         memory_type,
         tier,
-        content: row.get("content")?,
+        content: crate::crypto::decrypt_field(cipher, &row.get::<_, String>("content")?),
         entities,
         vector_ref: row.get("vector_ref")?,
         weight: row.get("weight")?,
@@ -1377,5 +1410,92 @@ mod tests {
         p.tombstone_memory("m-tb").unwrap();
         let hit = p.audit_by_entities(&["ent-t".into()]).unwrap();
         assert!(hit.is_empty(), "tombstone 记忆不应出现在 audit");
+    }
+
+    // v1.0.0 B-1: 无 cipher (明文模式) put→get 往返不变 (向后兼容)。
+    #[test]
+    fn b1_plaintext_roundtrip_no_cipher() {
+        let p = Persist::open_in_memory().unwrap();
+        let mut m = sample_item("m-plain", "ix", 0);
+        m.content = "明文内容".into();
+        p.put_memory(&m).unwrap();
+        let got = p.get_memory("m-plain").unwrap().unwrap();
+        assert_eq!(got.content, "明文内容");
+    }
+
+    // v1.0.0 B-1: cipher 注入后, DB 存的是密文 (带 enc:v1: 前缀), 读回解密成明文。
+    #[test]
+    fn b1_cipher_encrypts_at_rest_and_decrypts_back() {
+        use crate::crypto::Cipher;
+        let key = [7u8; 32];
+        let p = Persist::open_in_memory()
+            .unwrap()
+            .with_cipher(Some(Cipher::from_raw(key)));
+        let mut m = sample_item("m-enc", "ix", 0);
+        m.content = "敏感内容".into();
+        m.entities.push(EntityNode::new(
+            "ent-x".into(),
+            "X".into(),
+            EntityType::Tech,
+        ));
+        p.put_memory(&m).unwrap();
+        // at-rest: content 列非明文, 带 enc:v1: 前缀。
+        let raw_content: String = p
+            .conn()
+            .unwrap()
+            .query_row(
+                "SELECT content FROM memory_item WHERE id=?1",
+                params!["m-enc"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(raw_content.starts_with("enc:v1:"), "应加密存储, got prefix");
+        assert!(!raw_content.contains("敏感"), "明文不得落盘");
+        // 读回自动解密。
+        let got = p.get_memory("m-enc").unwrap().unwrap();
+        assert_eq!(got.content, "敏感内容");
+        assert_eq!(got.entities.len(), 1);
+        assert_eq!(got.entities[0].name, "X");
+    }
+
+    // v1.0.0 B-1: 换 key 读旧密文 → fail-open 返原密文 (服务连续, 非 panic)。
+    #[test]
+    fn b1_wrong_key_fail_open_returns_raw() {
+        use crate::crypto::Cipher;
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("enc.db");
+        let p = Persist::open(&db)
+            .unwrap()
+            .with_cipher(Some(Cipher::from_raw([1u8; 32])));
+        let mut m = sample_item("m-k", "ix", 0);
+        m.content = "secret".into();
+        p.put_memory(&m).unwrap();
+        drop(p);
+        // 不同 key 重开同 DB。
+        let p2 = Persist::open(&db)
+            .unwrap()
+            .with_cipher(Some(Cipher::from_raw([2u8; 32])));
+        let got = p2.get_memory("m-k").unwrap().unwrap();
+        // fail-open: 不 panic, 返原密文 (非明文 secret)。
+        assert!(got.content.starts_with("enc:v1:"), "fail-open 返原密文");
+        assert_ne!(got.content, "secret", "错误 key 不得泄露明文");
+    }
+
+    // v1.0.0 B-1: 加密 DB 用无 cipher 读 → fail-open 返密文 (旧实例读新库不崩)。
+    #[test]
+    fn b1_encrypted_read_without_cipher_returns_ciphertext() {
+        use crate::crypto::Cipher;
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("enc2.db");
+        let p = Persist::open(&db)
+            .unwrap()
+            .with_cipher(Some(Cipher::from_raw([9u8; 32])));
+        let mut m = sample_item("m-mix", "ix", 0);
+        m.content = "data".into();
+        p.put_memory(&m).unwrap();
+        drop(p);
+        let p2 = Persist::open(&db).unwrap().with_cipher(None);
+        let got = p2.get_memory("m-mix").unwrap().unwrap();
+        assert!(got.content.starts_with("enc:v1:"));
     }
 }

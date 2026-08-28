@@ -6,6 +6,7 @@
 //! 手动 failover (fm-cli cluster promote)，自动选举延后。
 
 pub mod config;
+pub mod election;
 pub mod error;
 pub mod protocol;
 pub mod replay;
@@ -13,6 +14,10 @@ pub mod role;
 pub mod transport;
 
 pub use config::{ClusterConfig, SyncConfig};
+pub use election::{
+    serve_votes, Election, ElectionConfig, ElectionRuntime, ElectionState, LogSeqProvider,
+    VoteRequest, VoteResponse,
+};
 pub use error::{ClusterError, ClusterResult};
 pub use protocol::{Frame, FrameKind, Hello, SyncRequest, SyncResponse};
 pub use replay::{
