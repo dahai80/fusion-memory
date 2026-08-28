@@ -114,7 +114,7 @@ chmod 0600 /etc/fusion-memory/enc.key
 ### 构建
 
 ```bash
-docker build -t fusion-memory:1.0.0 -f deploy/Dockerfile .
+docker build -t fusion-memory:1.1.0-rc.1 -f deploy/Dockerfile .
 ```
 
 多阶段构建: builder (rust:1.87-bookworm) 编译 release 二进制并 strip; runtime (debian:bookworm-slim) 仅含二进制 + curl, 非 root (uid 1000), 镜像体积小。
@@ -127,7 +127,7 @@ docker run -d --name fm \
   -e FUSION_MEMORY_API_KEY=change-me \
   -e FUSION_MEMORY_STUB=1 \
   -v fm-data:/data \
-  fusion-memory:1.0.0
+  fusion-memory:1.1.0-rc.1
 ```
 
 ### 验证
@@ -148,7 +148,7 @@ docker run -d --name fm \
   -e FUSION_MEMORY_STUB= \
   -e FUSION_MLX_URL=http://host.docker.internal:11434/v1 \
   -v fm-data:/data \
-  fusion-memory:1.0.0
+  fusion-memory:1.1.0-rc.1
 ```
 
 注: 离线约束 — fusion-mlx 须在宿主机或内网集群, 无外网。`host.docker.internal` 仅 dev; 生产用 `--network host` 或内网 DNS。
