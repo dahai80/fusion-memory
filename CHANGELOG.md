@@ -3,6 +3,27 @@
 All notable changes to fusion-memory. Format: Keep a Changelog. SemVer 2.0.0.
 Internal path-dep private ecosystem (not on crates.io); versions tag + GitHub release.
 
+## [Unreleased]
+
+Closes two RC known limitations: store-stub naming (#2) + interim redact.rs (#3). Both from user request "现在建 store-fusion adapter ，然后换上游fg-redact" (build store-fusion adapter, then switch to upstream fg-redact).
+
+### Added
+- **store-fusion adapter** (`fm-store/src/fusion.rs`, feature `store-fusion`): real `FusionStoreEngine` impl wrapping upstream `fusion-store` fs-core `Engine` (HNSW + mmap KV). Closes RC known-limitation #2 (store-stub naming — store-fusion now a real alternative backend, not just "stub"). Distance semantics bridge: fs-core returns `distance = 1 - cos_sim`, adapter converts `similarity = 1.0 - distance` to match fm-store contract (same formula as local.rs). UFCS calls to fs-core trait (same trait name `FusionStoreEngine` in both crates). ZeroCopyBuffer mmap→owned bridge. 6 tests (kv roundtrip / vector insert+get+search / dim mismatch / search dim mismatch / delete→none / list_ids excludes deleted). **Additive, not exclusive**: coexists with local-store (local-store default + always-on; store-fusion optional, default off). Both compile together.
+- **fg-redact credentials integration** (`fm-engine/src/redact.rs`): stage-1 credential redaction delegates to upstream `fg-redact::Redactor::redact_credentials()` (PR fusion-guard#11 / issue #10). fg-redact covers 10 credential classes (JWT/private_key/oauth_bearer/api_key/conn_string/password/secret_kv/env_kv/netrc/aws_secret) that fusion-memory previously lacked. Stage-2 PII stays fusion-memory-local (phone+86/0086/email/idcard/bankcard+Luhn/IPv4/passport/IPv6/intl) — fg-redact's PII behavior is worse (idcard eaten by credit_card, long non-Luhn digits eaten by id_number, +86 phone rejected by border validator), so PII not routed through fg-redact. Closes RC known-limitation #3 interim redact.rs (credentials now upstream; PII remains local by design, documented in redact.rs module doc). 4 new tests (jwt/password/credential+pii/idcard-stays-local-not-bankcard). Idempotent: credential placeholders `[REDACTED:jwt]` have no digits → PII regex no re-match.
+
+### Changed
+- `fm-engine` re-adds `fg-redact` path dep (was removed in earlier revert).
+- `fm-store` `store-fusion` feature is now additive (not exclusive with local-store). `default = ["local-store"]`, `store-fusion = ["fs-core"]` optional.
+
+### Test counts
+- Default features: 425 → 429 (+4 credential tests in fm-engine redact).
+- `--features fm-store/store-fusion`: 435 (429 + 6 store-fusion tests).
+- Gates: fmt / clippy -D warnings / check / test all green.
+
+### Upstream status (this release closes two)
+- **fusion-guard #10 / #11** — credentials-only redact API (`redact_credentials` + `redact_with_patterns` + `CREDENTIAL_PATTERNS` const). Issue #10 filed, PR #11 implements + 8 issue10_* tests. fusion-memory consumes `redact_credentials()`. **Resolved**.
+- **fusion-store #3 / #4** — zero-copy backend. Adapter now built (consuming fs-core via path dep); still tracked for full fs-core `get_vector`/`list_vector_ids` exposure. store-stub remains default production backend.
+
 ## [1.1.0-rc.1] — 2026-08-28
 
 Release candidate for 1.1.0 commercial GA. Hard commercial blockers closed + real-tested (not paper). Soft caveats documented below — non-blocking for RC, resolve or accept before GA.
@@ -28,10 +49,10 @@ Release candidate for 1.1.0 commercial GA. Hard commercial blockers closed + rea
 ### Known limitations (RC, documented — non-blocking)
 
 1. **Perf baseline = StubEmbedder**. retrieve_bench 100k uses stub (no mlx HTTP latency). Real bge-m3 latency not measured. Index-layer perf only.
-2. **store-stub naming**. hnsw_rs + sled backend, long-term production per README, but named "stub". Documented as production backend, not temporary.
+2. **store-stub naming**. hnsw_rs + sled backend, long-term production per README, but named "stub". Documented as production backend, not temporary. **store-fusion adapter (Unreleased) now provides the real fusion-store-backed alternative — see [Unreleased].**
 3. **Upstream items (tracked, not fusion-memory code)**:
-   - fusion-store #3/#4 — zero-copy backend (fusion-memory uses store-stub)
-   - fusion-guard #2 — formal DLP PII gate (fg-redact covers credentials only; fusion-memory has interim redact.rs)
+   - fusion-store #3/#4 — zero-copy backend (fusion-memory uses store-stub as default; store-fusion adapter built in [Unreleased] consuming fs-core via path dep)
+   - fusion-guard #2 — formal DLP PII gate. **Credentials part resolved in [Unreleased]** (fusion-guard #10/#11, `redact_credentials` API consumed); PII stays fusion-memory-local by design (fg-redact PII behavior worse, see redact.rs doc). Full UDS `guard.redact` DLP gate still future.
    - GitHub Actions CI billing-blocked — ops, not code
 4. **P2-5 Persist split / P2-6 dep migration** — deferred, non-blocking.
 

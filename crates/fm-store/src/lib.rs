@@ -12,7 +12,7 @@ pub mod trait_def;
 #[cfg(feature = "local-store")]
 pub mod local;
 
-// §1.4: store-fusion 后端占位模块 (非空壳: 显式 compile_error)。
+// §1.4: store-fusion 后端 (上游 fusion-store#3 trait 对齐已落地, fs-core rev 47d5b83)。
 #[cfg(feature = "store-fusion")]
 pub mod fusion;
 
@@ -21,3 +21,6 @@ pub use trait_def::{FusionStoreEngine, ZeroCopyBuffer};
 
 #[cfg(feature = "local-store")]
 pub use local::LocalStore;
+
+#[cfg(feature = "store-fusion")]
+pub use fusion::FusionStore;

@@ -68,7 +68,7 @@ Follows the monorepo Rust pattern (see `fusion-cli` / `fusion-design`):
 
 ```bash
 cargo check --workspace                            # Compile check
-cargo test --workspace                             # All offline tests (425 cases, excludes fm-py cdylib)
+cargo test --workspace                             # All offline tests (429 cases, excludes fm-py cdylib; --features fm-store/store-fusion = 435)
 cargo test -p fm-engine --test mlx_live_extract --features mlx-live -- --include-ignored   # Single live test (needs fusion-mlx)
 cargo clippy --workspace --all-targets -- -D warnings   # Lint (warnings are errors in CI)
 cargo fmt --all --check                            # Format check
