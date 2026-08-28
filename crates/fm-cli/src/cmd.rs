@@ -232,6 +232,27 @@ async fn cluster(home: &Option<String>, sub: &ClusterCmd) -> Result<(), String> 
                 if leader.is_empty() { "(none)" } else { &leader }
             );
             println!("  sync_port:  {}", sync_port);
+            // v1.0.0 B-2: 选举状态 (自动 failover)。配 FUSION_MEMORY_CLUSTER_NODES → enabled。
+            match fm_cluster::ElectionConfig::from_env() {
+                Ok(Some(ec)) => {
+                    println!(
+                        "  election:   enabled ({} nodes, self_id={}, quorum={}, auto-failover on)",
+                        ec.nodes.len(),
+                        ec.self_id,
+                        ec.quorum()
+                    );
+                    println!("    nodes:     {}", ec.nodes.join(", "));
+                }
+                Ok(None) => {
+                    println!("  election:   disabled (no FUSION_MEMORY_CLUSTER_NODES, manual promote only)");
+                }
+                Err(e) => {
+                    println!("  election:   config error: {e}");
+                }
+            }
+            // §1.8: epoch (fencing)。读 home/epoch 文件。
+            let epoch = fm_cluster::read_epoch_file(&dir);
+            println!("  epoch:      {}", epoch);
             info!(%role, seq, "cluster status");
             Ok(())
         }

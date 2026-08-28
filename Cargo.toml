@@ -12,6 +12,7 @@ members = [
     "crates/fm-py",
     "crates/fm-cluster",
     "crates/fm-cli",
+    "crates/fm-fuzz",
 ]
 
 [workspace.package]
@@ -65,6 +66,12 @@ r2d2_sqlite = "0.35"
 # sled 1.0-alpha 的 Db/Tree 非 Sync（RefCell EBR），换稳定 0.34（Send+Sync）。Rule 7。
 sled = "0.34"
 hnsw_rs = "0.3"
+
+# 静态加密 (v1.0.0 B-1): AES-256-GCM 敏感字段加密 + argon2 口令派生 + base64 封装。
+aes-gcm = "0.10"
+argon2 = "0.5"
+base64 = "0.22"
+rand = "0.8"
 
 # CLI
 clap = { version = "4", features = ["derive", "env"] }
