@@ -10,7 +10,7 @@ Authoritative spec: `architecture/fusion-memory-prd-0825.md` (repo root `archite
 
 ## Current Status
 
-**Built — M0 through M6 landed.** Rust Cargo workspace, 11 crates (`fm-cli`/`fm-core`/`fm-embed`/`fm-engine`/`fm-graph`/`fm-persist`/`fm-py`/`fm-server`/`fm-similarity`/`fm-store`/`fm-cluster`). 425 offline tests green, regions 90.82% offline / 92.47% live. Milestone detail + PRD deviation records in `README.md`. Remaining: M5 partially done (PII redaction + perf baseline landed; store-fusion switch + guard DLP gate degraded — see README "M5 PRD 偏离记录"). M4 outward integration PRs: `fusion-cowork` #68 + `fusion-agent-studio` #247 merged; `fusion-code` #151 open.
+**Built — M0 through M6 landed. v1.1.0 Commercial GA released (tag `v1.1.0`).** Rust Cargo workspace, 12 crates (`fm-cli`/`fm-core`/`fm-embed`/`fm-engine`/`fm-fuzz`/`fm-graph`/`fm-persist`/`fm-py`/`fm-server`/`fm-similarity`/`fm-store`/`fm-cluster`). 429 offline tests green (435 with `--features fm-store/store-fusion`), regions 90.82% offline / 92.47% live. Milestone detail + PRD deviation records in `README.md`. RC known limitations all closed in 1.1.0: live perf baseline (real bge-m3), store-fusion adapter, fg-redact credentials. Remaining non-blocking: M5 store-fusion switch + guard DLP gate degraded (see README "M5 PRD 偏离记录"); PII stays fusion-memory-local pending fusion-guard #13. M4 outward integration PRs: `fusion-cowork` #68 + `fusion-agent-studio` #247 merged; `fusion-code` #151 merged / #156 open.
 
 ## Architecture (from PRD)
 
