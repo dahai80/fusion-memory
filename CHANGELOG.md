@@ -5,7 +5,9 @@ Internal path-dep private ecosystem (not on crates.io); versions tag + GitHub re
 
 ## [Unreleased]
 
-Closes two RC known limitations: store-stub naming (#2) + interim redact.rs (#3). Both from user request "现在建 store-fusion adapter ，然后换上游fg-redact" (build store-fusion adapter, then switch to upstream fg-redact).
+## [1.1.0] — 2026-08-29
+
+Commercial GA. Closes the three RC known limitations from [1.1.0-rc.1] (store-stub naming, interim redact.rs, StubEmbedder perf baseline), all from user request "现在建 store-fusion adapter ，然后换上游fg-redact" + GA path "起 fusion-mlx 测真 perf".
 
 ### Added
 - **store-fusion adapter** (`fm-store/src/fusion.rs`, feature `store-fusion`): real `FusionStoreEngine` impl wrapping upstream `fusion-store` fs-core `Engine` (HNSW + mmap KV). Closes RC known-limitation #2 (store-stub naming — store-fusion now a real alternative backend, not just "stub"). Distance semantics bridge: fs-core returns `distance = 1 - cos_sim`, adapter converts `similarity = 1.0 - distance` to match fm-store contract (same formula as local.rs). UFCS calls to fs-core trait (same trait name `FusionStoreEngine` in both crates). ZeroCopyBuffer mmap→owned bridge. 6 tests (kv roundtrip / vector insert+get+search / dim mismatch / search dim mismatch / delete→none / list_ids excludes deleted). **Additive, not exclusive**: coexists with local-store (local-store default + always-on; store-fusion optional, default off). Both compile together.
