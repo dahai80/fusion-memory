@@ -65,6 +65,7 @@ fn append_commit(source: &Persist, id: &str, seq_vec: u64) {
         format!("ix-{id}"),
         0,
         "sess-1".into(),
+        String::new(),
         fm_core::MemoryType::Episodic,
         format!("content {id}"),
         100,

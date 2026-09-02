@@ -69,4 +69,30 @@ pub trait FusionMemoryEngine: Send + Sync {
             "count not implemented for this engine".into(),
         ))
     }
+
+    // #16 多租户隔离 (fusion-gateway #150 Gap1c): 以下方法按权威租户 (gateway
+    // X-Fusion-Tenant) 作用域。默认实现退化为非租户版本 (单租户/旧 impl 向后兼容,
+    // 不破坏 v1.0 API 冻结), 生产 MemoryEngine 覆写为真租户作用域。tenant="" = 默认租户。
+
+    /// #16: 按 tenant 取单条记忆。租户不匹配 → None (跨租户不可见)。
+    /// 默认退化为 get_memory (无租户过滤)。
+    async fn get_memory_tenant(&self, id: &str, _tenant: &str) -> MemoryResult<Option<MemoryItem>> {
+        self.get_memory(id).await
+    }
+
+    /// #16: 按 tenant 软删单条。租户不匹配 → NotFound (跨租户不可删)。
+    /// 默认退化为 delete_memory (无租户过滤)。
+    async fn delete_memory_tenant(&self, id: &str, _tenant: &str) -> MemoryResult<()> {
+        self.delete_memory(id).await
+    }
+
+    /// #16: 按 tenant + scope (session_id) 批量软删。默认退化为 delete_scope。
+    async fn delete_scope_tenant(&self, scope: &str, _tenant: &str) -> MemoryResult<u64> {
+        self.delete_scope(scope).await
+    }
+
+    /// #16: 按 tenant + scope 计数。默认退化为 count。
+    async fn count_tenant(&self, scope: Option<&str>, _tenant: &str) -> MemoryResult<u64> {
+        self.count(scope).await
+    }
 }

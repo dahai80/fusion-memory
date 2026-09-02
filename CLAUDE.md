@@ -10,7 +10,7 @@ Authoritative spec: `architecture/fusion-memory-prd-0825.md` (repo root `archite
 
 ## Current Status
 
-**Built — M0 through M6 landed. v1.1.0 Commercial GA released (tag `v1.1.0`).** Rust Cargo workspace, 12 crates (`fm-cli`/`fm-core`/`fm-embed`/`fm-engine`/`fm-fuzz`/`fm-graph`/`fm-persist`/`fm-py`/`fm-server`/`fm-similarity`/`fm-store`/`fm-cluster`). 429 offline tests green (435 with `--features fm-store/store-fusion`), regions 90.82% offline / 92.47% live. Milestone detail + PRD deviation records in `README.md`. RC known limitations all closed in 1.1.0: live perf baseline (real bge-m3), store-fusion adapter, fg-redact credentials. Remaining non-blocking: M5 store-fusion switch + guard DLP gate degraded (see README "M5 PRD 偏离记录"); PII stays fusion-memory-local pending fusion-guard #13. M4 outward integration PRs: `fusion-cowork` #68 + `fusion-agent-studio` #247 merged; `fusion-code` #151 merged / #156 open.
+**Built — M0 through M6 landed. v1.2.0 released (tag `v1.2.0`, issue #16 multi-tenant isolation); v1.1.0 Commercial GA released (tag `v1.1.0`).** Rust Cargo workspace, 12 crates (`fm-cli`/`fm-core`/`fm-embed`/`fm-engine`/`fm-fuzz`/`fm-graph`/`fm-persist`/`fm-py`/`fm-server`/`fm-similarity`/`fm-store`/`fm-cluster`). 433 offline tests green (439 with `--features fm-store/store-fusion`), regions 90.82% offline / 92.47% live. Milestone detail + PRD deviation records in `README.md`. v1.2.0: multi-tenant isolation (tenant field on data, additive tenant-scoped trait methods, schema v3, gateway-origin enforcement `X-Fusion-Route`/`X-Fusion-Tenant`, config `gateway_origin_required`/`default_tenant`). RC known limitations all closed in 1.1.0: live perf baseline (real bge-m3), store-fusion adapter, fg-redact credentials. Remaining non-blocking: M5 store-fusion switch + guard DLP gate degraded (see README "M5 PRD 偏离记录"); PII stays fusion-memory-local pending fusion-guard #13. M4 outward integration PRs: `fusion-cowork` #68 + `fusion-agent-studio` #247 merged; `fusion-code` #151 merged / #156 open.
 
 ## Architecture (from PRD)
 
@@ -68,7 +68,7 @@ Follows the monorepo Rust pattern (see `fusion-cli` / `fusion-design`):
 
 ```bash
 cargo check --workspace                            # Compile check
-cargo test --workspace                             # All offline tests (429 cases, excludes fm-py cdylib; --features fm-store/store-fusion = 435)
+cargo test --workspace                             # All offline tests (433 cases, excludes fm-py cdylib; --features fm-store/store-fusion = 439)
 cargo test -p fm-engine --test mlx_live_extract --features mlx-live -- --include-ignored   # Single live test (needs fusion-mlx)
 cargo clippy --workspace --all-targets -- -D warnings   # Lint (warnings are errors in CI)
 cargo fmt --all --check                            # Format check

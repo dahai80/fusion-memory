@@ -135,6 +135,7 @@ impl Persist {
                 item.interaction_id,
                 item.turn_idx as i64,
                 item.session_id,
+                item.tenant,
                 item.memory_type.as_str(),
                 item.tier.as_str(),
                 enc_content,
@@ -192,6 +193,7 @@ impl Persist {
                 item.interaction_id,
                 item.turn_idx as i64,
                 item.session_id,
+                item.tenant,
                 item.memory_type.as_str(),
                 item.tier.as_str(),
                 enc_content,
@@ -270,6 +272,21 @@ impl Persist {
         Ok(out)
     }
 
+    /// #16: 按 tenant 列全量活记忆 (consolidate 多租户作用域扫描)。
+    /// tenant="" 即默认租户, 语义与 list_all() 等价 (旧库迁移后 tenant 列全 '')。
+    pub fn list_all_by_tenant(&self, tenant: &str) -> PersistResult<Vec<MemoryItem>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT * FROM memory_item WHERE tombstone=0 AND tenant=?1 ORDER BY created_timestamp ASC",
+        )?;
+        let rows = stmt.query_map(params![tenant], |r| row_to_memory(r, self.cipher.as_ref()))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
     /// §1.3: 按 vector_ref 集合定向查 memory_item。替代 retrieve_context 旧版 list_all 全表扫 +
     /// HashMap (10k 记忆 ≈ 2MB clone/次, 仅为查 ~10 个 KNN 命中)。走 idx_memory_vector_ref 索引,
     /// vector_ref 作 TEXT 存 (u64 的字符串形), IN(...) 谓词对 TEXT 索引同样命中。空集返空。
@@ -298,11 +315,62 @@ impl Persist {
         Ok(out)
     }
 
+    /// #16: 按 tenant 作用域的 vector_ref 定向查 (retrieve_context KNN 命中后回填记忆,
+    /// 防跨租户泄露: tenant-A 的 KNN 命中 vector_ref 不能取到 tenant-B 同 vec_ref 的记忆行)。
+    /// tenant="" 即默认租户。空 vec_refs 返空。
+    pub fn get_by_vector_refs_tenant(
+        &self,
+        vec_refs: &[u64],
+        tenant: &str,
+    ) -> PersistResult<Vec<MemoryItem>> {
+        if vec_refs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn()?;
+        let refs_str: Vec<String> = vec_refs.iter().map(|v| v.to_string()).collect();
+        // 占位: ?1..?n 为 vec_refs, ?(n+1) 为 tenant。
+        let placeholders = (0..refs_str.len())
+            .map(|i| format!("?{}", i + 1))
+            .collect::<Vec<_>>()
+            .join(",");
+        let tenant_pos = refs_str.len() + 1;
+        let sql = format!(
+            "SELECT * FROM memory_item WHERE tombstone=0 AND tenant=?{tenant_pos} AND vector_ref IN ({placeholders})"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = refs_str
+            .iter()
+            .map(|s| Box::new(s.clone()) as Box<dyn rusqlite::ToSql>)
+            .collect();
+        params_vec.push(Box::new(tenant.to_string()));
+        let params_refs: Vec<&dyn rusqlite::ToSql> =
+            params_vec.iter().map(|p| p.as_ref()).collect();
+        let rows = stmt.query_map(params_refs.as_slice(), |r| {
+            row_to_memory(r, self.cipher.as_ref())
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
     pub fn count(&self) -> PersistResult<u64> {
         let conn = self.conn()?;
         let n: i64 = conn.query_row(
             "SELECT COUNT(*) FROM memory_item WHERE tombstone=0",
             [],
+            |row| row.get(0),
+        )?;
+        Ok(n as u64)
+    }
+
+    /// #16: 按 tenant 计数 (count RPC 多租户作用域)。
+    pub fn count_by_tenant(&self, tenant: &str) -> PersistResult<u64> {
+        let conn = self.conn()?;
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM memory_item WHERE tombstone=0 AND tenant=?1",
+            params![tenant],
             |row| row.get(0),
         )?;
         Ok(n as u64)
@@ -398,6 +466,59 @@ impl Persist {
             out.push(r?);
         }
         Ok(out)
+    }
+
+    /// #16: 按 tenant + session 列记忆 (delete_scope 多租户作用域, 逐条删向量用)。
+    pub fn list_by_session_tenant(
+        &self,
+        session_id: &str,
+        tenant: &str,
+    ) -> PersistResult<Vec<MemoryItem>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT * FROM memory_item WHERE session_id=?1 AND tenant=?2 AND tombstone=0 \
+             ORDER BY turn_idx ASC",
+        )?;
+        let rows = stmt.query_map(params![session_id, tenant], |r| {
+            row_to_memory(r, self.cipher.as_ref())
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// #16: 按 tenant + session 批量软删 (delete_scope RPC 多租户作用域)。
+    pub fn delete_by_session_tenant(&self, session_id: &str, tenant: &str) -> PersistResult<u64> {
+        let conn = self.conn()?;
+        let n = conn.execute(
+            "UPDATE memory_item SET tombstone=1 WHERE session_id=?1 AND tenant=?2 AND tombstone=0",
+            params![session_id, tenant],
+        )?;
+        Ok(n as u64)
+    }
+
+    /// #16: 按 tenant + session 计数 (count RPC 多租户作用域)。
+    pub fn count_by_session_tenant(
+        &self,
+        session_id: Option<&str>,
+        tenant: &str,
+    ) -> PersistResult<u64> {
+        let conn = self.conn()?;
+        let n: i64 = match session_id {
+            Some(s) => conn.query_row(
+                "SELECT COUNT(*) FROM memory_item WHERE tombstone=0 AND tenant=?1 AND session_id=?2",
+                params![tenant, s],
+                |row| row.get(0),
+            )?,
+            None => conn.query_row(
+                "SELECT COUNT(*) FROM memory_item WHERE tombstone=0 AND tenant=?1",
+                params![tenant],
+                |row| row.get(0),
+            )?,
+        };
+        Ok(n as u64)
     }
 
     /// 按 session_id 计数 (issue #2 count 带 scope 过滤)。空 session_id → 全量 (走 count())。
@@ -937,6 +1058,7 @@ fn row_to_memory(
         interaction_id: row.get("interaction_id")?,
         turn_idx: row.get::<_, i64>("turn_idx")? as u32,
         session_id: row.get("session_id")?,
+        tenant: row.get("tenant").unwrap_or_default(),
         memory_type,
         tier,
         content: crate::crypto::decrypt_field(cipher, &row.get::<_, String>("content")?),
@@ -963,6 +1085,7 @@ mod tests {
             ix.into(),
             turn,
             "sess-1".into(),
+            String::new(),
             MemoryType::Semantic,
             format!("content-{turn}"),
             1_000 + turn as u64,
@@ -1105,6 +1228,7 @@ mod tests {
             ix.into(),
             turn,
             session.into(),
+            String::new(),
             MemoryType::Semantic,
             format!("content-{turn}"),
             1_000 + turn as u64,

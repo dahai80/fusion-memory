@@ -224,6 +224,7 @@ mod tests {
             "ix".into(),
             0,
             "s".into(),
+            String::new(),
             MemoryType::Semantic,
             "c".into(),
             100,

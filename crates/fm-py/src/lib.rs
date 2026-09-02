@@ -147,6 +147,7 @@ impl PyEngine {
             tier_filter: None,
             token_budget,
             aggregate,
+            tenant: String::new(),
         };
         let engine = self.engine.clone();
         let ctx = py
@@ -236,6 +237,7 @@ mod tests {
             tier_filter: None,
             token_budget: 100,
             aggregate: false,
+            tenant: String::new(),
         };
         assert_eq!(q.top_k, 5);
         assert!(!q.aggregate);

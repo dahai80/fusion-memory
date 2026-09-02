@@ -2,7 +2,7 @@
 
 > **[English](README.md)** | 中文
 
-> **当前版本：v1.1.0（Commercial GA）** — 商用正式发布。硬阻断项全闭环 + 真测试验证 + RC 已知限制三项全消。已知限制见 `CHANGELOG.md` "Known limitations"，非阻塞。
+> **当前版本：v1.2.0（Commercial GA）** — 多租户隔离落地（issue #16）。v1.1.0 商用正式发布：硬阻断项全闭环 + 真测试验证 + RC 已知限制三项全消。已知限制见 `CHANGELOG.md` "Known limitations"，非阻塞。
 
 Fusion 生态（"一核九端"）系统级长/短期记忆与认知图谱中枢。解决 Agent 跨 session 状态断层、重复提问、context window 爆炸，目标：越用越懂用户。
 
@@ -25,6 +25,14 @@ Fusion 生态（"一核九端"）系统级长/短期记忆与认知图谱中枢�
 - **fg-redact 凭据脱敏**（`fm-engine/src/redact.rs`）：段 1 凭据脱敏委托上游 `fg-redact::Redactor::redact_credentials()`（fusion-guard PR #11 / issue #10）。fg-redact 补 fusion-memory 原没有的 10 类凭据（JWT/private_key/oauth_bearer/api_key/conn_string/password/secret_kv/env_kv/netrc/aws_secret）。段 2 PII 仍 fusion-memory 自带（手机+86/0086/邮箱/身份证/银行卡+Luhn/IPv4/护照/IPv6/国际手机）—— fg-redact 的 PII 行为更差（身份证被 credit_card 错吞 / id_number 误吞长数字 / +86 phone 被 border 拒），故 PII 不走 fg-redact，见 redact.rs 模块文档。关闭 RC 已知限制 #3 凭据部分（凭据现走上游；PII 按设计留本地）。4 新测试（jwt / password / 凭据+PII 同段 / 身份证仍本地非 bankcard）。幂等：凭据占位 `[REDACTED:jwt]` 无数字 → PII 正则不二次匹配。
 - **测试计数**：默认 feature 425→429（+4 凭据测试）；`--features fm-store/store-fusion` 435（429 + 6 store-fusion 测试）。gate 全绿（fmt / clippy -D warnings / check / test）。
 - **上游**：fusion-guard #10/#11 凭据 API 已落地（issue 提 + PR #11 实现 + 8 issue10_* 测试），fusion-memory 消费 `redact_credentials()`。fusion-store #3/#4 仍跟踪（adapter 已建消费 fs-core path dep；store-stub 仍默认生产后端）。
+
+**多租户隔离落地（2026-09-02，issue #16）**：fusion-gateway #150 Gap1c 后端半。规范参照 fusion-model-hub#53。
+- **数据结构加 tenant 字段**（`fm-core`）：`MemoryItem.tenant`、`Interaction.tenant`（`#[serde(default)]`）、`RetrieveQuery.tenant`（`#[serde(default)]`）。租户经数据流转，不入核心 `FusionMemoryEngine` trait 方法签名——保 v1.0 API 冻结。`tenant=""` = 默认租户（单租户向后兼容）。
+- **加法式租户作用域 trait 方法**：`get_memory_tenant` / `delete_memory_tenant` / `delete_scope_tenant` / `count_tenant`——默认委托非租户变体，实现侧覆写真隔离。向后兼容。
+- **Schema v3 迁移**（`fm-persist`）：`tenant TEXT NOT NULL DEFAULT ''` 列 + `idx_memory_tenant` 索引。`pragma_table_info` 检查幂等 `ALTER TABLE`。
+- **引擎作用域**（`fm-engine`）：`MemoryEngine.tenant`（启动默认 `""`）+ `with_tenant` 构造器。commit/summarize/retrieve/consolidate 按 `self.tenant` 隔离。跨租户：get → None（不泄露存在性）、delete → NotFound、缺行 delete → Ok（保软删语义）。
+- **gateway 源强制**（`fm-server/src/tenant.rs`）：`X-Fusion-Route: gateway-decision` 头（配置 `gateway_origin_required: bool = false` 默认关 → 缺则 403）；`X-Fusion-Tenant` 权威租户（头 > `default_tenant` 配置 > ""）。HTTP `handle_rpc` + `get_memory` 派发前强制。UDS（可信本机）用默认租户。配置 env：`FUSION_MEMORY_GATEWAY_ORIGIN_REQUIRED`、`FUSION_MEMORY_DEFAULT_TENANT`。
+- **测试数**：默认特性 429→433（+4 gateway 源/租户测试 fm-server）；`--features fm-store/store-fusion` 435→439。门禁全绿（fmt / clippy -D warnings / check / test）。12 crate 版本 1.1.0→1.2.0（加法式，无破坏性变更）。
 
 **M2 已完成**：真实 bge-m3 embedding（dim=1024）+ 实体抽取（防注入 prompt + 严格 JSON 解析）+ SQLite 递归 CTE 图遍历 + 规则优先实体对齐 + 融合评分（cosine+衰减+graph_affinity）+ agent-studio 历史记忆导入。验收：实体抽取 JSON 解析成功率 100%（>90%），规则优先对齐正确（同名同 type 合并 / 同名异 type 不合并），真实 embedding 往返 dim=1024。测试覆盖率 lines 90.59% / regions 92.17%。162 测试全绿，clippy -D warnings 通过。
 

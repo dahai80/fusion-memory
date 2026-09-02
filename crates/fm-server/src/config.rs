@@ -31,6 +31,12 @@ pub struct ServerConfig {
     /// P1-5: UDS 连接级 token（可选, 多租户场景）。空 → 仅靠 sock 0600 文件权限 (向后兼容)。
     /// 配置后客户端首行须 `AUTH <token>\n` 握手, 否则后续 RPC 一律 -32004 unauthorized。
     pub uds_token: String,
+    /// #16 多租户: 强制 gateway 源。true → HTTP /v1/* 须带 X-Fusion-Route: gateway-decision,
+    /// 否则 403 (挡直连端口绕过 gateway 租户派生)。默认 false (单租户 dev / 直连 CLI 不破)。
+    pub gateway_origin_required: bool,
+    /// #16 多租户: 默认租户。无 X-Fusion-Tenant 头时用此值 (单租户部署可配固定租户名)。
+    /// 空 = 默认租户 (向后兼容, 命中旧库 tenant='')。引擎级 + 请求级回退值。
+    pub default_tenant: String,
 }
 
 /// P1-8: TOML 配置文件镜像。全字段可选 — 仅出现的字段覆盖默认。
@@ -49,6 +55,10 @@ pub struct ConfigFile {
     pub uds_token: Option<String>,
     /// P1-8: 读此文件内容作 uds_token (推荐)。
     pub uds_token_file: Option<String>,
+    /// #16: 强制 gateway 源 (TOML 镜像)。
+    pub gateway_origin_required: Option<bool>,
+    /// #16: 默认租户 (TOML 镜像)。
+    pub default_tenant: Option<String>,
 }
 
 /// P1-8: 默认配置文件路径。env FM_CONFIG 显式指定, 否则 data_dir/fusion-memory.toml。
@@ -93,6 +103,8 @@ impl Default for ServerConfig {
             dim: 1024,
             uds_enabled: true,
             uds_token: String::new(),
+            gateway_origin_required: false,
+            default_tenant: String::new(),
         }
     }
 }
@@ -184,6 +196,12 @@ impl ServerConfig {
         if let Some(t) = &f.uds_token {
             self.uds_token = t.clone();
         }
+        if let Some(g) = f.gateway_origin_required {
+            self.gateway_origin_required = g;
+        }
+        if let Some(t) = &f.default_tenant {
+            self.default_tenant = t.clone();
+        }
         // secret_file 路径暂存到临时字段? 不 — ConfigFile 不持有运行态。
         // 改: 在 fill_secrets_from_files 时无法再拿到路径 (ServerConfig 无 path 字段)。
         // 故此处直接读 secret_file 填密钥 (文件字段优先级 < env, env 后续覆盖)。
@@ -231,6 +249,19 @@ impl ServerConfig {
         }
         if let Ok(v) = std::env::var("FUSION_MEMORY_UDS_TOKEN") {
             self.uds_token = v;
+        }
+        if let Ok(v) = std::env::var("FUSION_MEMORY_GATEWAY_ORIGIN_REQUIRED") {
+            match v.parse::<bool>() {
+                Ok(b) => self.gateway_origin_required = b,
+                Err(e) => warn!(
+                    raw = %v,
+                    error = %e,
+                    "FUSION_MEMORY_GATEWAY_ORIGIN_REQUIRED 坏值 (期望 true/false), 回退默认"
+                ),
+            }
+        }
+        if let Ok(v) = std::env::var("FUSION_MEMORY_DEFAULT_TENANT") {
+            self.default_tenant = v;
         }
         if let Ok(v) = std::env::var("FUSION_MEMORY_DIM") {
             match v.parse::<usize>() {

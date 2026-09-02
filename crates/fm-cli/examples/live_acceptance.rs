@@ -60,6 +60,7 @@ fn main() {
         "ix".into(),
         0,
         "s".into(),
+        String::new(),
         MemoryType::Episodic,
         "c".into(),
         1,

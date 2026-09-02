@@ -38,6 +38,10 @@ pub struct HttpState {
     pub api_key: Arc<String>,
     /// P0-2: HTTP 请求计数/延迟/错误率指标。
     pub metrics: Arc<HttpMetrics>,
+    /// #16: 强制 gateway 源 (X-Fusion-Route: gateway-decision), 缺 → 403。
+    pub gateway_origin_required: bool,
+    /// #16: 无 X-Fusion-Tenant 时的回退租户 (空 = 默认租户)。
+    pub default_tenant: Arc<String>,
 }
 
 /// 建 axum 路由。
@@ -122,6 +126,21 @@ async fn handle_rpc(
         st.metrics.incr_error();
         return resp;
     }
+    // #16: gateway 源校验 + 权威租户提取 (X-Fusion-Tenant > default_tenant > "")。
+    let tenant = match crate::tenant::check_gateway_origin(
+        &headers,
+        st.gateway_origin_required,
+        &st.default_tenant,
+        false,
+        "/v1/memory",
+    ) {
+        Ok(t) => t,
+        Err((code, body)) => {
+            st.metrics.incr_total();
+            st.metrics.incr_error();
+            return (code, body).into_response();
+        }
+    };
     let rpc: RpcRequest = match serde_json::from_value(req) {
         Ok(r) => r,
         Err(e) => {
@@ -138,7 +157,7 @@ async fn handle_rpc(
     };
     let method = rpc.method.clone();
     let start = std::time::Instant::now();
-    let resp: RpcResponse = dispatch(rpc, &st.engine).await;
+    let resp: RpcResponse = dispatch(rpc, &st.engine, &tenant).await;
     let elapsed = start.elapsed().as_secs_f64();
     st.metrics.incr_total();
     st.metrics.observe_duration(&method, elapsed);
@@ -184,6 +203,21 @@ async fn get_memory(
         st.metrics.incr_error();
         return resp;
     }
+    // #16: GET 路径同样做 gateway 源校验 + 租户提取。
+    let tenant = match crate::tenant::check_gateway_origin(
+        &headers,
+        st.gateway_origin_required,
+        &st.default_tenant,
+        false,
+        "/v1/memory/:id",
+    ) {
+        Ok(t) => t,
+        Err((code, body)) => {
+            st.metrics.incr_total();
+            st.metrics.incr_error();
+            return (code, body).into_response();
+        }
+    };
     let rpc = RpcRequest {
         jsonrpc: "2.0".into(),
         method: "get".into(),
@@ -191,7 +225,7 @@ async fn get_memory(
         id: Value::from(0i64),
     };
     let start = std::time::Instant::now();
-    let resp = dispatch(rpc, &st.engine).await;
+    let resp = dispatch(rpc, &st.engine, &tenant).await;
     st.metrics
         .observe_duration("get", start.elapsed().as_secs_f64());
     st.metrics.incr_total();
@@ -301,6 +335,8 @@ mod tests {
             engine: EngineHandle::from_concrete(eng),
             api_key: Arc::new(api_key.into()),
             metrics: crate::metrics::HttpMetrics::new(),
+            gateway_origin_required: false,
+            default_tenant: Arc::new(String::new()),
         };
         (st, committed)
     }
@@ -654,6 +690,8 @@ mod tests {
             engine: EngineHandle::from_concrete(SickEngine),
             api_key: Arc::new("sekret".into()),
             metrics: crate::metrics::HttpMetrics::new(),
+            gateway_origin_required: false,
+            default_tenant: Arc::new(String::new()),
         };
         let app = app(st);
         let r = Request::builder()
@@ -712,11 +750,171 @@ mod tests {
             engine: EngineHandle::from_concrete(NotFoundEngine),
             api_key: Arc::new("sekret".into()),
             metrics: crate::metrics::HttpMetrics::new(),
+            gateway_origin_required: false,
+            default_tenant: Arc::new(String::new()),
         };
         let app = app(st);
         let body = r#"{"jsonrpc":"2.0","method":"retrieve","params":{"text":"hi"},"id":1}"#;
         let (code, body) = req(&app, "/v1/memory/retrieve", body, Some("Bearer sekret")).await;
         assert_eq!(code, StatusCode::NOT_FOUND);
         assert!(body.contains("-32001"), "body={body}");
+    }
+
+    // #16: gateway 源强制 — gateway_origin_required=true 且缺 X-Fusion-Route → 403。
+    #[tokio::test]
+    async fn gateway_origin_required_rejects_missing_route() {
+        let (st, _) = test_state("sekret");
+        let st = HttpState {
+            gateway_origin_required: true,
+            ..st
+        };
+        let app = app(st);
+        let body = r#"{"jsonrpc":"2.0","method":"count","params":{},"id":1}"#;
+        let (code, b) = req(&app, "/v1/memory/count", body, Some("Bearer sekret")).await;
+        assert_eq!(code, StatusCode::FORBIDDEN, "{b}");
+        assert!(b.contains("gateway-origin required"), "body={b}");
+    }
+
+    // #16: 带正确 X-Fusion-Route: gateway-decision → 放行 (仍过 Bearer)。
+    #[tokio::test]
+    async fn gateway_origin_required_accepts_valid_route() {
+        let (st, _) = test_state("sekret");
+        let st = HttpState {
+            gateway_origin_required: true,
+            ..st
+        };
+        let app = app(st);
+        let body = r#"{"jsonrpc":"2.0","method":"count","params":{},"id":1}"#;
+        let mut b = Request::builder().method("POST").uri("/v1/memory/count");
+        b = b.header("authorization", "Bearer sekret");
+        b = b.header("X-Fusion-Route", "gateway-decision");
+        b = b.header("content-type", "application/json");
+        let r = b.body(Body::from(body.to_string())).unwrap();
+        let resp = tower::ServiceExt::oneshot(app.clone(), r).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // #16: gateway_origin_required=false (默认) → 无 X-Fusion-Route 也放行 (向后兼容)。
+    #[tokio::test]
+    async fn gateway_origin_not_required_passes_without_route() {
+        let (st, _) = test_state("sekret");
+        // test_state 默认 gateway_origin_required=false
+        let app = app(st);
+        let body = r#"{"jsonrpc":"2.0","method":"count","params":{},"id":1}"#;
+        let (code, _) = req(&app, "/v1/memory/count", body, Some("Bearer sekret")).await;
+        assert_eq!(code, StatusCode::OK);
+    }
+
+    // #16: 权威租户头 X-Fusion-Tenant 透传 — cross-tenant get → NotFound (stub override)。
+    #[tokio::test]
+    async fn tenant_header_enforces_cross_tenant_isolation() {
+        // tenant-aware stub: item m0 属 tenant "acme", 跨租户 get → None。
+        struct TenantStub;
+        #[async_trait::async_trait]
+        impl fm_core::FusionMemoryEngine for TenantStub {
+            async fn commit_episodic_memory(
+                &self,
+                _: &str,
+                _: &fm_core::Interaction,
+            ) -> fm_core::MemoryResult<Vec<fm_core::MemoryId>> {
+                Ok(vec![])
+            }
+            async fn retrieve_context(
+                &self,
+                _: &fm_core::RetrieveQuery,
+            ) -> fm_core::MemoryResult<fm_core::FormattedContext> {
+                Ok(fm_core::FormattedContext {
+                    blocks: vec![],
+                    total_tokens: 0,
+                    stale_read: false,
+                    last_sync_at: 0,
+                })
+            }
+            async fn consolidate_memories(
+                &self,
+            ) -> fm_core::MemoryResult<fm_core::ConsolidationReport> {
+                Ok(fm_core::ConsolidationReport::default())
+            }
+            async fn get_memory(
+                &self,
+                _: &str,
+            ) -> fm_core::MemoryResult<Option<fm_core::MemoryItem>> {
+                Ok(None)
+            }
+            async fn delete_memory(&self, _: &str) -> fm_core::MemoryResult<()> {
+                Ok(())
+            }
+            async fn delete_scope(&self, _: &str) -> fm_core::MemoryResult<u64> {
+                Ok(0)
+            }
+            async fn count(&self, _: Option<&str>) -> fm_core::MemoryResult<u64> {
+                Ok(0)
+            }
+            async fn audit_memory_access(
+                &self,
+                _: &[String],
+            ) -> fm_core::MemoryResult<Vec<fm_core::MemoryItem>> {
+                Ok(vec![])
+            }
+            // #16 覆写: item m0 属 tenant "acme", 跨租户请求 → None (不可见)。
+            async fn get_memory_tenant(
+                &self,
+                id: &str,
+                tenant: &str,
+            ) -> fm_core::MemoryResult<Option<fm_core::MemoryItem>> {
+                if id != "m0" {
+                    return Ok(None);
+                }
+                let item = fm_core::MemoryItem::new_turn_skeleton(
+                    "m0".into(),
+                    "ix0".into(),
+                    0,
+                    "s".into(),
+                    "acme".into(),
+                    fm_core::MemoryType::Episodic,
+                    "secret".into(),
+                    1,
+                );
+                if !tenant.is_empty() && tenant != "acme" {
+                    return Ok(None);
+                }
+                Ok(Some(item))
+            }
+        }
+        let st = HttpState {
+            engine: EngineHandle::from_concrete(TenantStub),
+            api_key: Arc::new("sekret".into()),
+            metrics: crate::metrics::HttpMetrics::new(),
+            gateway_origin_required: false,
+            default_tenant: Arc::new(String::new()),
+        };
+        let app = app(st);
+
+        // 本租户 (X-Fusion-Tenant: acme) → 200 + result 含 m0
+        let r = Request::builder()
+            .method("GET")
+            .uri("/v1/memory/m0")
+            .header("authorization", "Bearer sekret")
+            .header("X-Fusion-Tenant", "acme")
+            .body(Body::empty())
+            .unwrap();
+        let resp = tower::ServiceExt::oneshot(app.clone(), r).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // 跨租户 (X-Fusion-Tenant: other) → result null (不可见, 不泄露存在性)
+        let r = Request::builder()
+            .method("GET")
+            .uri("/v1/memory/m0")
+            .header("authorization", "Bearer sekret")
+            .header("X-Fusion-Tenant", "other")
+            .body(Body::empty())
+            .unwrap();
+        let resp = tower::ServiceExt::oneshot(app, r).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(v["result"].is_null(), "cross-tenant must be null, got {v}");
     }
 }

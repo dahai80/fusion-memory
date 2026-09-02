@@ -486,6 +486,7 @@ mod tests {
         let ix = Interaction {
             id: ix.into(),
             session_id: "s".into(),
+            tenant: String::new(),
             turns: vec![Turn {
                 turn_idx: 0,
                 user_message: "hello rust".into(),
@@ -540,6 +541,7 @@ mod tests {
             let ix = Interaction {
                 id: format!("ix-bulk-{i}"),
                 session_id: "bulk".into(),
+                tenant: String::new(),
                 turns: vec![
                     Turn {
                         turn_idx: 0,
@@ -677,6 +679,7 @@ mod tests {
             format!("ix-{id}"),
             0,
             "sess-1".into(),
+            String::new(),
             MemoryType::Semantic,
             content.into(),
             now,
@@ -941,6 +944,7 @@ mod tests {
             let ix = Interaction {
                 id: "ix-dst".into(),
                 session_id: "s".into(),
+                tenant: String::new(),
                 turns: vec![Turn {
                     turn_idx: 0,
                     user_message: "dst only content".into(),

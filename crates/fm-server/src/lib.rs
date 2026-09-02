@@ -11,6 +11,7 @@ pub mod engine_handle;
 pub mod http;
 pub mod jsonrpc;
 pub mod metrics;
+pub mod tenant;
 pub mod uds;
 
 use std::sync::Arc;
@@ -81,6 +82,8 @@ pub async fn serve(cfg: ServerConfig, opts: ServeOpts) -> Result<(), String> {
                 engine: h,
                 api_key,
                 metrics,
+                gateway_origin_required: cfg.gateway_origin_required,
+                default_tenant: Arc::new(cfg.default_tenant.clone()),
             };
             http::serve(state, port, orx).await
         });
