@@ -12,6 +12,9 @@ pub struct RetrieveQuery {
     /// turn 级 top_k（聚合前）。
     pub top_k: usize,
     pub session_id: Option<String>,
+    /// #16 多租户: 检索作用域租户。空 = 默认租户 (单租户向后兼容)。
+    #[serde(default)]
+    pub tenant: String,
     pub tier_filter: Option<Vec<MemoryTier>>,
     /// 压缩目标 token 数（Qwen tokenizer 实算，C4 修正）。
     pub token_budget: usize,
@@ -25,6 +28,7 @@ impl RetrieveQuery {
             text: text.into(),
             top_k,
             session_id: None,
+            tenant: String::new(),
             tier_filter: None,
             token_budget,
             aggregate: true,

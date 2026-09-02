@@ -152,7 +152,7 @@ async fn handle_conn(stream: UnixStream, engine: EngineHandle, uds_token: Arc<St
                     continue;
                 }
                 let resp = match parse_line(trimmed) {
-                    Some(req) => dispatch(req, &engine).await,
+                    Some(req) => dispatch(req, &engine, "").await,
                     None => RpcResponse {
                         jsonrpc: "2.0".into(),
                         result: None,

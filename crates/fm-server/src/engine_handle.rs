@@ -87,6 +87,7 @@ mod tests {
         let ix = Interaction {
             id: "ix".into(),
             session_id: "s".into(),
+            tenant: String::new(),
             turns: vec![],
             timestamp: 0,
             metadata: Default::default(),

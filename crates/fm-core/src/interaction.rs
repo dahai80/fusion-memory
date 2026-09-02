@@ -7,6 +7,10 @@ use serde::{Deserialize, Serialize};
 pub struct Interaction {
     pub id: String,
     pub session_id: String,
+    /// #16 多租户: 权威租户 (gateway X-Fusion-Tenant)。空 = 默认租户。
+    /// 默认走 serde (向后兼容旧 JSON 无此字段 → None → 解序化回空)。
+    #[serde(default)]
+    pub tenant: String,
     pub turns: Vec<Turn>,
     pub timestamp: u64,
     /// 消费方附加元数据，schema 约束见 InteractionMetadata（PRD §5.4.1）。
@@ -83,6 +87,7 @@ mod tests {
         let ix = Interaction {
             id: "ix".into(),
             session_id: "s".into(),
+            tenant: String::new(),
             turns: vec![],
             timestamp: 0,
             metadata: serde_json::json!({"project_path": "/p"}),

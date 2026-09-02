@@ -126,7 +126,7 @@ pub const API_VERSION: u32 = 1;
 /// §3.8: dispatch 取 owned RpcRequest, 各 handler 取 owned params, 消除 `req.params.clone()` 深克隆。
 /// 旧版 8 handler 全 `serde_json::from_value(req.params.clone())` — 已反序列化的 params 再深克隆整树再解析。
 /// id 仍 clone 进响应 (Value 多为小整数/字符串, 克隆廉价, 响应需保留 id 不可避免)。
-pub async fn dispatch(req: RpcRequest, engine: &EngineHandle) -> RpcResponse {
+pub async fn dispatch(req: RpcRequest, engine: &EngineHandle, tenant: &str) -> RpcResponse {
     // P2-4: jsonrpc 版本校验。非 "2.0" → -32600 invalid_request (spec), 旧版静默吞 (字段 _ 丢弃)。
     if req.jsonrpc != "2.0" {
         warn!(jsonrpc = %req.jsonrpc, "rpc rejected: jsonrpc field not 2.0");
@@ -155,16 +155,16 @@ pub async fn dispatch(req: RpcRequest, engine: &EngineHandle) -> RpcResponse {
     };
     debug!(method = %method, "rpc dispatch");
     let res: Result<Value, RpcError> = match method.as_str() {
-        "commit" => commit(params, engine).await,
-        "retrieve" => retrieve(params, engine).await,
+        "commit" => commit(params, engine, tenant).await,
+        "retrieve" => retrieve(params, engine, tenant).await,
         // issue #1/#4: fusion-event 契约别名 (text-in, fused shape out)。
-        "memory.retrieve_context" => retrieve_context_contract(params, engine).await,
+        "memory.retrieve_context" => retrieve_context_contract(params, engine, tenant).await,
         "consolidate" => consolidate(engine).await,
-        "get" => get(params, engine).await,
-        "delete" => delete(params, engine).await,
+        "get" => get(params, engine, tenant).await,
+        "delete" => delete(params, engine, tenant).await,
         // issue #2: fusion-agent-studio adapter 契约 (scope 批量删 + 计数)。
-        "delete_scope" => delete_scope(params, engine).await,
-        "count" => count(params, engine).await,
+        "delete_scope" => delete_scope(params, engine, tenant).await,
+        "count" => count(params, engine, tenant).await,
         "audit" => audit(params, engine).await,
         "health" => Ok(Value::String("ok".into())),
         // P2-4: version 方法 — 返当前 api_version 供客户端协商。
@@ -229,9 +229,14 @@ struct CommitParams {
     interaction: Interaction,
 }
 
-async fn commit(params: Value, engine: &EngineHandle) -> Result<Value, RpcError> {
-    let p: CommitParams =
+async fn commit(params: Value, engine: &EngineHandle, tenant: &str) -> Result<Value, RpcError> {
+    let mut p: CommitParams =
         serde_json::from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+    // #16: 权威租户取自请求 (gateway X-Fusion-Tenant), 覆盖 interaction 内任何客户端租户值。
+    // 空 tenant = 默认租户 (单租户向后兼容)。
+    if !tenant.is_empty() {
+        p.interaction.tenant = tenant.to_string();
+    }
     // P1-1: 返回详细结果 (memory_ids + failed_turns), 客户端可感知失败 turn 并重试。
     // 旧契约 result: ["id1","id2"] (纯数组) → 改 result: {"memory_ids":[...],"failed_turns":[...]}。
     // 消费方契约测试仅断言 contains "result"/[/",故宽松断言不破; 新增字段 failed_turns。
@@ -266,13 +271,15 @@ fn default_true() -> bool {
     true
 }
 
-async fn retrieve(params: Value, engine: &EngineHandle) -> Result<Value, RpcError> {
+async fn retrieve(params: Value, engine: &EngineHandle, tenant: &str) -> Result<Value, RpcError> {
     let p: RetrieveParams =
         serde_json::from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
     let q = RetrieveQuery {
         text: p.text,
         top_k: p.top_k,
         session_id: p.session_id,
+        // #16: 权威租户作用域检索。
+        tenant: tenant.to_string(),
         tier_filter: None,
         token_budget: p.token_budget,
         aggregate: p.aggregate,
@@ -298,11 +305,12 @@ struct GetParams {
     id: String,
 }
 
-async fn get(params: Value, engine: &EngineHandle) -> Result<Value, RpcError> {
+async fn get(params: Value, engine: &EngineHandle, tenant: &str) -> Result<Value, RpcError> {
     let p: GetParams =
         serde_json::from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+    // #16: 按 tenant 取, 跨租户 → None。
     let m: Option<MemoryItem> = engine
-        .get_memory(&p.id)
+        .get_memory_tenant(&p.id, tenant)
         .await
         .map_err(|e| RpcError::from_engine(&e))?;
     serde_json::to_value(m).map_err(|e| RpcError::internal(e.to_string()))
@@ -316,7 +324,7 @@ struct DeleteParams {
     confirm: bool,
 }
 
-async fn delete(params: Value, engine: &EngineHandle) -> Result<Value, RpcError> {
+async fn delete(params: Value, engine: &EngineHandle, tenant: &str) -> Result<Value, RpcError> {
     let p: DeleteParams =
         serde_json::from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
     if !p.confirm {
@@ -324,8 +332,9 @@ async fn delete(params: Value, engine: &EngineHandle) -> Result<Value, RpcError>
             "delete requires confirm=true (B5 二次确认)",
         ));
     }
+    // #16: 按 tenant 删, 跨租户 → NotFound。
     engine
-        .delete_memory(&p.id)
+        .delete_memory_tenant(&p.id, tenant)
         .await
         .map_err(|e| RpcError::from_engine(&e))?;
     Ok(Value::String("deleted".into()))
@@ -355,7 +364,11 @@ struct DeleteScopeParams {
     confirm: bool,
 }
 
-async fn delete_scope(params: Value, engine: &EngineHandle) -> Result<Value, RpcError> {
+async fn delete_scope(
+    params: Value,
+    engine: &EngineHandle,
+    tenant: &str,
+) -> Result<Value, RpcError> {
     let p: DeleteScopeParams =
         serde_json::from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
     if !p.confirm {
@@ -363,8 +376,9 @@ async fn delete_scope(params: Value, engine: &EngineHandle) -> Result<Value, Rpc
             "delete_scope requires confirm=true (B5 二次确认)",
         ));
     }
+    // #16: 按 tenant + scope 删, 跨租户同 session 不误删。
     let n = engine
-        .delete_scope(&p.scope)
+        .delete_scope_tenant(&p.scope, tenant)
         .await
         .map_err(|e| RpcError::from_engine(&e))?;
     serde_json::to_value(serde_json::json!({"deleted_count": n}))
@@ -378,11 +392,12 @@ struct CountParams {
     scope: Option<String>,
 }
 
-async fn count(params: Value, engine: &EngineHandle) -> Result<Value, RpcError> {
+async fn count(params: Value, engine: &EngineHandle, tenant: &str) -> Result<Value, RpcError> {
     let p: CountParams =
         serde_json::from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+    // #16: 按 tenant + scope 计数, 跨租户不可见。
     let n = engine
-        .count(p.scope.as_deref())
+        .count_tenant(p.scope.as_deref(), tenant)
         .await
         .map_err(|e| RpcError::from_engine(&e))?;
     serde_json::to_value(serde_json::json!({"count": n}))
@@ -408,6 +423,7 @@ struct RetrieveContextContractParams {
 async fn retrieve_context_contract(
     params: Value,
     engine: &EngineHandle,
+    tenant: &str,
 ) -> Result<Value, RpcError> {
     let p: RetrieveContextContractParams =
         serde_json::from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
@@ -416,6 +432,8 @@ async fn retrieve_context_contract(
         text: p.query,
         top_k: p.top_k,
         session_id: None,
+        // #16: 权威租户作用域检索。
+        tenant: tenant.to_string(),
         tier_filter: None,
         token_budget: default_budget(),
         aggregate: true,
@@ -577,6 +595,7 @@ mod tests {
                     "ix0".into(),
                     0,
                     "s".into(),
+                    String::new(),
                     fm_core::MemoryType::Episodic,
                     "content".into(),
                     1,
@@ -626,13 +645,13 @@ mod tests {
     }
 
     async fn dispatch_ok(req: &RpcRequest, eng: &EngineHandle) -> Value {
-        let resp = dispatch(req.clone(), eng).await;
+        let resp = dispatch(req.clone(), eng, "").await;
         assert!(resp.error.is_none(), "unexpected error: {:?}", resp.error);
         resp.result.expect("missing result")
     }
 
     async fn dispatch_err(req: &RpcRequest, eng: &EngineHandle) -> RpcError {
-        let resp = dispatch(req.clone(), eng).await;
+        let resp = dispatch(req.clone(), eng, "").await;
         resp.error.expect("expected error, got result")
     }
 
@@ -826,6 +845,7 @@ mod tests {
         let resp = dispatch(
             rpc_with_version("1.0", "health", serde_json::json!({}), 1),
             &eng,
+            "",
         )
         .await;
         let err = resp.error.expect("non-2.0 应被拒");
@@ -840,6 +860,7 @@ mod tests {
         let resp = dispatch(
             rpc_with_version("2.0", "v1.health", serde_json::json!({}), 2),
             &eng,
+            "",
         )
         .await;
         assert!(resp.error.is_none(), "v1. 前缀应路由成功");

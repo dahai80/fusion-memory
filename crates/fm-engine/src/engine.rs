@@ -52,6 +52,10 @@ pub struct MemoryEngine {
     /// §2.5: 最近一次成功同步 leader 的时间戳 (ms)。follower 由 cluster 层更新;
     /// standalone/leader 恒 0。retrieve 写入 FormattedContext 供消费方算 staleness。
     last_sync_at: std::sync::atomic::AtomicU64,
+    /// #16 多租户隔离: 引擎级默认租户。commit 路径权威租户取自 interaction.tenant
+    /// (gateway X-Fusion-Tenant), 此字段用于无 interaction 的内部路径 (summarize/consolidate/
+    /// retrieve/scope/count)。空 = 默认租户 (单租户向后兼容)。fm-server 按请求租户重建引擎。
+    tenant: String,
 }
 
 impl MemoryEngine {
@@ -71,7 +75,20 @@ impl MemoryEngine {
             consolidate_lock: tokio::sync::Mutex::new(()),
             stale_flag: std::sync::atomic::AtomicBool::new(false),
             last_sync_at: std::sync::atomic::AtomicU64::new(0),
+            tenant: String::new(),
         }
+    }
+
+    /// #16 多租户: 注入引擎级默认租户。commit 路径仍以 interaction.tenant 为权威,
+    /// 此值覆盖 retrieve/consolidate/scope/count 等无 interaction 路径的租户作用域。
+    pub fn with_tenant(mut self, tenant: impl Into<String>) -> Self {
+        self.tenant = tenant.into();
+        self
+    }
+
+    /// #16: 读引擎当前租户。
+    pub fn tenant(&self) -> &str {
+        &self.tenant
     }
 
     /// 注入实体抽取器 (生产用 MlxEntityExtractor)。不注入则 entities 永远 pending。
@@ -215,7 +232,11 @@ impl MemoryEngine {
             .collect();
         // P3: 旧版在 KNN 内层循环对每个候选 vector_id 都 list_all 全表扫 + 字符串反查 → O(S×KNN×N)。
         // 改: 循环外一次性建 vector_id → MemoryItem 索引, 内层 O(1) 查。
-        let all = self.persist.list_all().map_err(|e| e.to_memory())?;
+        // #16: 按 self.tenant 限定, 跨租户不参与合并。
+        let all = self
+            .persist
+            .list_all_by_tenant(&self.tenant)
+            .map_err(|e| e.to_memory())?;
         let by_vec_ref: std::collections::HashMap<u64, &MemoryItem> = all
             .iter()
             .filter_map(|m| m.vector_ref.parse::<u64>().ok().map(|vr| (vr, m)))
@@ -377,6 +398,7 @@ impl MemoryEngine {
                 format!("summary-{sess}"),
                 0,
                 sess.clone(),
+                self.tenant.clone(),
                 MemoryType::Semantic,
                 summary,
                 at,
@@ -417,7 +439,10 @@ impl MemoryEngine {
         at: u64,
         failures: &mut Vec<ConsolidationFailure>,
     ) -> fm_core::MemoryResult<usize> {
-        let sqlite_all = self.persist.list_all().map_err(|e| e.to_memory())?;
+        let sqlite_all = self
+            .persist
+            .list_all_by_tenant(&self.tenant)
+            .map_err(|e| e.to_memory())?;
         // 正向: SQLite→store 悬空 (SQLite 有 vector_ref 但 store 无向量)。
         let mut reconciled = 0usize;
         // SQLite 已知 vector_ref 集合, 供反向孤儿扫描对照。
@@ -563,9 +588,10 @@ impl MemoryEngine {
     /// 坏 vector_ref 不阻断 (warn 跳过, reconcile 兜底)。非事务跨库 (H1 边界: 三库无分布式事务),
     /// 失败逐条记 warn, 已删的不回滚 (软删幂等, 重试安全)。confirm 由 RPC 层校验, 此处不判。
     pub fn delete_scope(&self, session_id: &str) -> fm_core::MemoryResult<u64> {
+        // #16: 按 self.tenant 限定, 跨租户同 session 不误删。
         let items = self
             .persist
-            .list_by_session(session_id)
+            .list_by_session_tenant(session_id, &self.tenant)
             .map_err(|e| e.to_memory())?;
         let mut deleted = 0u64;
         for m in &items {
@@ -597,8 +623,9 @@ impl MemoryEngine {
 
     /// 计数 (issue #2 count RPC)。None → 全量, Some(scope) → 按 session_id 过滤。
     pub fn count(&self, scope: Option<&str>) -> fm_core::MemoryResult<u64> {
+        // #16: 按 self.tenant 计数, 跨租户不可见。
         self.persist
-            .count_by_session(scope)
+            .count_by_session_tenant(scope, &self.tenant)
             .map_err(|e| e.to_memory())
     }
 
@@ -631,6 +658,7 @@ impl MemoryEngine {
                 interaction.id.clone(),
                 turn.turn_idx,
                 session_id.to_string(),
+                interaction.tenant.clone(),
                 MemoryType::Episodic,
                 content.clone(),
                 now,
@@ -849,9 +877,10 @@ impl fm_core::FusionMemoryEngine for MemoryEngine {
         // §1.3: 定向查 KNN 命中 vec_id 对应的 memory_item, 走 idx_memory_vector_ref 索引。
         // 旧版 list_all 全表扫 + HashMap (10k 记忆 ≈ 2MB clone/次) 仅为查 ~10 个 KNN 命中。
         let knn_vec_ids: Vec<u64> = knn.iter().map(|(vid, _)| *vid).collect();
+        // #16: 按 query.tenant 定向查 KNN 命中, 防跨租户泄漏 (tenant="" = 默认租户, 命中旧库行)。
         let hits = self
             .persist
-            .get_by_vector_refs(&knn_vec_ids)
+            .get_by_vector_refs_tenant(&knn_vec_ids, &query.tenant)
             .map_err(|e| e.to_memory())?;
         let mut by_vec_ref: std::collections::HashMap<u64, MemoryItem> =
             std::collections::HashMap::new();
@@ -1200,6 +1229,83 @@ impl fm_core::FusionMemoryEngine for MemoryEngine {
         MemoryEngine::count(self, scope)
     }
 
+    // #16 多租户: 权威租户作用域覆写。tenant="" = 默认租户 (命中旧库行)。
+    // 跨租户: get → None, delete/delete_scope → NotFound/0, count → 仅本租户。
+    async fn get_memory_tenant(
+        &self,
+        id: &str,
+        tenant: &str,
+    ) -> fm_core::MemoryResult<Option<MemoryItem>> {
+        let Some(item) = self.persist.get_memory(id).map_err(|e| e.to_memory())? else {
+            return Ok(None);
+        };
+        // 租户不匹配 → 不可见 (返 None, 不泄露存在性)。
+        if !tenant.is_empty() && item.tenant != tenant {
+            warn!(id, req_tenant = %tenant, item_tenant = %item.tenant, "get_memory_tenant: cross-tenant denied");
+            return Ok(None);
+        }
+        Ok(Some(item))
+    }
+
+    async fn delete_memory_tenant(&self, id: &str, tenant: &str) -> fm_core::MemoryResult<()> {
+        // 先按租户校验存在性, 跨租户 → NotFound。
+        let item = self.persist.get_memory(id).map_err(|e| e.to_memory())?;
+        match item {
+            Some(m) if !tenant.is_empty() && m.tenant != tenant => {
+                warn!(id, req_tenant = %tenant, item_tenant = %m.tenant, "delete_memory_tenant: cross-tenant denied");
+                return Err(fm_core::MemoryError::NotFound(format!(
+                    "memory {id} not in tenant {tenant}"
+                )));
+            }
+            // 行不存在 → 沿用旧 delete_memory 软删语义 (Ok), 不造 NotFound 破向后兼容。
+            None => {}
+            _ => {}
+        }
+        // 校验通过, 走原 delete_memory (清向量 + tombstone + wop + audit)。
+        self.delete_memory(id).await
+    }
+
+    async fn delete_scope_tenant(&self, scope: &str, tenant: &str) -> fm_core::MemoryResult<u64> {
+        // 用临时租户作用域删: 原有 delete_scope 用 self.tenant, 此处需按请求租户。
+        // 直接调 persist.list_by_session_tenant + 逐条删, 复用 delete_scope 逻辑但按 tenant。
+        let items = self
+            .persist
+            .list_by_session_tenant(scope, tenant)
+            .map_err(|e| e.to_memory())?;
+        let mut deleted = 0u64;
+        for m in &items {
+            match m.vector_ref.parse::<u64>() {
+                Ok(vec_id) => {
+                    if let Err(e) = self.store.delete_vector(vec_id) {
+                        warn!(id = %m.id, error = %e, "delete_scope_tenant: store delete_vector failed, tombstone still proceeds");
+                    }
+                }
+                Err(_) => {
+                    warn!(id = %m.id, vector_ref = %m.vector_ref, "delete_scope_tenant: bad vector_ref, ghost vector may remain (reconcile cleans)");
+                }
+            }
+            if let Err(e) = self.persist.tombstone_memory(&m.id) {
+                warn!(id = %m.id, error = %e, "delete_scope_tenant: tombstone_memory failed, skip");
+                continue;
+            }
+            deleted += 1;
+        }
+        if deleted > 0 {
+            let now = Self::now_ms();
+            self.persist
+                .append_wop("delete_scope", scope, now)
+                .map_err(|e| e.to_memory())?;
+        }
+        info!(session = scope, tenant = %tenant, deleted, "delete_scope_tenant done");
+        Ok(deleted)
+    }
+
+    async fn count_tenant(&self, scope: Option<&str>, tenant: &str) -> fm_core::MemoryResult<u64> {
+        self.persist
+            .count_by_session_tenant(scope, tenant)
+            .map_err(|e| e.to_memory())
+    }
+
     async fn audit_memory_access(
         &self,
         entity_ids: &[String],
@@ -1264,6 +1370,7 @@ mod tests {
         Interaction {
             id: ix_id.into(),
             session_id: "sess-1".into(),
+            tenant: String::new(),
             turns: t,
             timestamp: 1000,
             metadata: serde_json::json!({}),
@@ -1344,6 +1451,7 @@ mod tests {
         let ix = Interaction {
             id: "ix-flaky".into(),
             session_id: "sess-1".into(),
+            tenant: String::new(),
             turns: vec![
                 Turn {
                     turn_idx: 0,
@@ -1417,6 +1525,7 @@ mod tests {
         let ix = Interaction {
             id: "ix-detailed".into(),
             session_id: "sess-1".into(),
+            tenant: String::new(),
             turns: vec![
                 Turn {
                     turn_idx: 0,
@@ -1486,6 +1595,7 @@ mod tests {
         let ix = Interaction {
             id: "ix-allfail".into(),
             session_id: "sess-1".into(),
+            tenant: String::new(),
             turns: vec![Turn {
                 turn_idx: 0,
                 user_message: "x".into(),
@@ -1527,6 +1637,7 @@ mod tests {
         let b = Interaction {
             id: "ix-b".into(),
             session_id: "sess-1".into(),
+            tenant: String::new(),
             turns: vec![Turn {
                 turn_idx: 0,
                 user_message: "rust cargo build error".into(),
@@ -1724,6 +1835,7 @@ mod tests {
             format!("ix-{id}"),
             0,
             "sess-1".into(),
+            String::new(),
             MemoryType::Semantic,
             content.into(),
             now,
@@ -1807,6 +1919,7 @@ mod tests {
             text: "sample query".into(),
             top_k: 5,
             session_id: None,
+            tenant: String::new(),
             tier_filter: None,
             token_budget: 1024,
             aggregate: false,
@@ -2031,6 +2144,7 @@ mod tests {
             "ix".into(),
             0,
             "s".into(),
+            String::new(),
             MemoryType::Episodic,
             "ca".into(),
             100,
@@ -2158,6 +2272,7 @@ mod tests {
             "ix-rep".into(),
             0,
             "sess-rep".into(),
+            String::new(),
             MemoryType::Episodic,
             "replay content".into(),
             100,
@@ -2194,6 +2309,7 @@ mod tests {
         let ix = Interaction {
             id: "ix-pii".into(),
             session_id: "sess-1".into(),
+            tenant: String::new(),
             turns: vec![Turn {
                 turn_idx: 0,
                 user_message: "my phone is 13912345678 call me".into(),
@@ -2218,6 +2334,7 @@ mod tests {
         let ix = Interaction {
             id: "ix-raw".into(),
             session_id: "sess-1".into(),
+            tenant: String::new(),
             turns: vec![Turn {
                 turn_idx: 0,
                 user_message: "my phone is 13912345678 call me".into(),

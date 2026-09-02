@@ -46,6 +46,7 @@ async fn live_build_real_engine_retrieve() {
         text: "rust long term memory".into(),
         top_k: 3,
         session_id: None,
+        tenant: String::new(),
         tier_filter: None,
         token_budget: 256,
         aggregate: false,

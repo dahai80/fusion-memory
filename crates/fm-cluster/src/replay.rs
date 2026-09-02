@@ -302,6 +302,7 @@ mod tests {
             "int-1".into(),
             0,
             "sess-1".into(),
+            String::new(),
             MemoryType::Episodic,
             "hello world".into(),
             100,

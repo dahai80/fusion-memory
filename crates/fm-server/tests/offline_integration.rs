@@ -27,6 +27,8 @@ fn stub_state() -> HttpState {
         engine,
         api_key: Arc::new("test-key".into()),
         metrics: fm_server::metrics::HttpMetrics::new(),
+        gateway_origin_required: false,
+        default_tenant: Arc::new(String::new()),
     }
 }
 

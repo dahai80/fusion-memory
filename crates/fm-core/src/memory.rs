@@ -92,6 +92,9 @@ pub struct MemoryItem {
     pub interaction_id: String,
     pub turn_idx: u32,
     pub session_id: String,
+    /// #16 多租户隔离: 权威租户标识 (来自 gateway X-Fusion-Tenant)。
+    /// 空 = 默认租户 (单租户向后兼容, 旧库迁移后 tenant 列 DEFAULT '')。
+    pub tenant: String,
     pub memory_type: MemoryType,
     pub tier: MemoryTier,
     pub content: String,
@@ -114,6 +117,7 @@ impl MemoryItem {
         interaction_id: String,
         turn_idx: u32,
         session_id: String,
+        tenant: String,
         memory_type: MemoryType,
         content: String,
         created_timestamp: u64,
@@ -123,6 +127,7 @@ impl MemoryItem {
             interaction_id,
             turn_idx,
             session_id,
+            tenant,
             memory_type,
             tier: MemoryTier::Working,
             content,
@@ -171,6 +176,7 @@ mod tests {
             "ix".into(),
             0,
             "s".into(),
+            String::new(),
             MemoryType::Semantic,
             "hi".into(),
             1000,

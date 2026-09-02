@@ -5,6 +5,27 @@ Internal path-dep private ecosystem (not on crates.io); versions tag + GitHub re
 
 ## [Unreleased]
 
+## [1.2.0] — 2026-09-02
+
+Multi-tenant isolation (issue #16). Backend half of fusion-gateway #150 Gap1c. Canonical pattern follows fusion-model-hub#53. Single-tenant backward compatible (tenant="" = default tenant).
+
+### Added
+- **Tenant field on data structures** (`fm-core`): `MemoryItem.tenant`, `Interaction.tenant` (`#[serde(default)]`), `RetrieveQuery.tenant` (`#[serde(default)]`). Tenant flows through data, NOT through core `FusionMemoryEngine` trait method signatures — preserves v1.0 API freeze.
+- **Additive tenant-scoped trait methods** (`fm-core::FusionMemoryEngine`): `get_memory_tenant` / `delete_memory_tenant` / `delete_scope_tenant` / `count_tenant` — default-delegate to non-tenant variants. Backward compatible; impls override for real scoping.
+- **Schema v3 migration** (`fm-persist`): `tenant TEXT NOT NULL DEFAULT ''` column + `idx_memory_tenant` index. Idempotent `ALTER TABLE` via `pragma_table_info` check. SCHEMA_VERSION 2 → 3.
+- **Tenant-scoped store queries** (`fm-persist/src/store.rs`): `list_all_by_tenant`, `get_by_vector_refs_tenant`, `count_by_tenant`, `delete_by_session_tenant`, `count_by_session_tenant`, `list_by_session_tenant`. Original methods kept intact.
+- **Engine tenant scoping** (`fm-engine`): `MemoryEngine.tenant` field (startup default, `""`), `with_tenant` builder. commit/summarize/retrieve/consolidate all scope by `self.tenant`. Trait overrides: cross-tenant get → None (no existence leak), cross-tenant delete → NotFound, missing-row delete → Ok (preserves soft-delete semantics).
+- **Gateway-origin enforcement + tenant extraction** (`fm-server/src/tenant.rs`): `X-Fusion-Route: gateway-decision` header (config `gateway_origin_required: bool = false` default off); `X-Fusion-Tenant` authoritative tenant (priority: header > `default_tenant` config > ""). HTTP `handle_rpc` + `get_memory` call `check_gateway_origin` before dispatch. UDS (trusted-local) uses default tenant. Config env: `FUSION_MEMORY_GATEWAY_ORIGIN_REQUIRED`, `FUSION_MEMORY_DEFAULT_TENANT`.
+- 4 new tests in `fm-server/src/http.rs`: gateway-origin required rejects missing route (403), accepts valid route, not-required passes, cross-tenant get isolation (X-Fusion-Tenant: other → result null).
+
+### Changed
+- Version bump all 12 crates `1.1.0` → `1.2.0` (additive API — new fields/methods have defaults; no breaking change to existing callers).
+
+### Test counts
+- Default features: 429 → 433 (+4 gateway-origin/tenant tests in fm-server).
+- `--features fm-store/store-fusion`: 435 → 439.
+- Gates: fmt / clippy -D warnings / check / test all green.
+
 ## [1.1.0] — 2026-08-29
 
 Commercial GA. Closes the three RC known limitations from [1.1.0-rc.1] (store-stub naming, interim redact.rs, StubEmbedder perf baseline), all from user request "现在建 store-fusion adapter ，然后换上游fg-redact" + GA path "起 fusion-mlx 测真 perf".

@@ -276,6 +276,7 @@ pub async fn run_import(engine: &MemoryEngine, source_db: &str) -> Result<Import
             interaction_id: format!("studio-{}", row.id),
             turn_idx: 0,
             session_id: "import-agent-studio".to_string(),
+            tenant: String::new(),
             memory_type,
             tier,
             content: content.to_string(),
