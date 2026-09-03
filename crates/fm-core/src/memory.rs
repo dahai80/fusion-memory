@@ -112,6 +112,7 @@ pub struct MemoryItem {
 impl MemoryItem {
     /// 构造 turn 级骨架（commit 同步快路径用，PRD §6.3）。
     /// vector_ref 置空，entities_pending=true，待异步回填。
+    #[allow(clippy::too_many_arguments)]
     pub fn new_turn_skeleton(
         id: String,
         interaction_id: String,

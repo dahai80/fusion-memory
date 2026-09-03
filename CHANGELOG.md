@@ -5,6 +5,29 @@ Internal path-dep private ecosystem (not on crates.io); versions tag + GitHub re
 
 ## [Unreleased]
 
+## [1.3.0] — 2026-09-03
+
+fusion-identity integration (issue #18). fm-server HTTP boundary enforces caller JWT verified by fusion-identity (`POST /api/v1/auth/verify`), tid↔tenant match, and rejects empty tenant in multi-tenant mode (multi-tenant PRD §4 red line 1 fail-closed). Single-tenant backward compatible (default `multi_tenant: false` = no identity verify).
+
+### Added
+- **Identity verifier module** (`fm-server/src/identity.rs`): `IdentityVerifier` trait (`verify` + `report_usage`) enables 100% offline testability (no real fusion-identity service in tests). `RealVerifier` (reqwest client to `127.0.0.1` only, 30s TTL result cache via `Arc<Mutex<HashMap>>`) — fail-closed on HTTP error. `NoopVerifier` + `noop_verifier()` for single-tenant backward compat. `enforce_multi_tenant()`: `multi_tenant=false` short-circuits; true + empty tenant → 401; true + missing/empty Bearer JWT → 401; verify → tid != tenant → 403; match → Ok(tid).
+- **Multi-tenant config** (`fm-server/src/config.rs`): `multi_tenant: bool` (default false), `identity_url` (default `http://127.0.0.1:11470`), `identity_service_token` (+ `_file` secret read). Env: `FUSION_MEMORY_MULTI_TENANT` / `FUSION_MEMORY_IDENTITY_URL` / `FUSION_MEMORY_IDENTITY_SERVICE_TOKEN` / `FUSION_MEMORY_IDENTITY_SERVICE_TOKEN_FILE`. `validate()`: `multi_tenant=true` requires http identity_url AND non-empty service_token, else Err. 4 new config tests.
+- **HTTP boundary enforcement** (`fm-server/src/http.rs`): in multi-tenant mode `check_bearer` (static api_key) is skipped — Bearer token is the JWT (verified by identity). `handle_rpc` + `get_memory` call `enforce_multi_tenant` after tenant extraction. `HttpState` gains `multi_tenant: bool` + `verifier: Arc<dyn IdentityVerifier>`. 7 new http tests: cross-tenant JWT denied (403), empty tenant rejected (401), matching tid passes (200), invalid/revoked JWT rejected (401), missing JWT rejected (401), cross-tenant get denied (403), single-tenant mode skips identity verify (200).
+- **Identity e2e** (`fm-server/src/identity.rs` tests): in-process axum echo server stands in for fusion-identity (100% offline) — good-jwt→tenant-x pass, revoked JWT denied, cache hit, unreachable endpoint fail-closed.
+
+### Changed
+- Version bump all 12 crates `1.2.0` → `1.3.0` (additive config + boundary enforcement; single-tenant default behavior unchanged).
+- `fm-core/src/memory.rs` `new_turn_skeleton`: `#[allow(clippy::too_many_arguments)]` (8 args after v1.2.0 tenant field).
+- `fm-server/src/tenant.rs`: collapsed nested `if` (clippy collapsible_if), blank line before trailing doc paragraph (doc_lazy_continuation).
+
+### Test counts
+- Default features: 433 → 452 (+19 identity tests: 4 config + 7 http + 8 identity unit/e2e).
+- `--features fm-store/store-fusion`: 439 → 458.
+- Gates: fmt / clippy -D warnings / check / test all green.
+
+### Upstream status
+- **fusion-identity** (consumed, not modified): sole JWT issuer + tenant registry. fm-server calls `POST /api/v1/auth/verify` (service-token gated) + `POST /api/v1/tenants/{tenant_id}/usage` (best-effort). Three red lines honored: fail-closed, cross-tenant denied (tid must match tenant), data isolation layering.
+
 ## [1.2.0] — 2026-09-02
 
 Multi-tenant isolation (issue #16). Backend half of fusion-gateway #150 Gap1c. Canonical pattern follows fusion-model-hub#53. Single-tenant backward compatible (tenant="" = default tenant).

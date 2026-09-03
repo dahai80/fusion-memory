@@ -37,6 +37,13 @@ pub struct ServerConfig {
     /// #16 多租户: 默认租户。无 X-Fusion-Tenant 头时用此值 (单租户部署可配固定租户名)。
     /// 空 = 默认租户 (向后兼容, 命中旧库 tenant='')。引擎级 + 请求级回退值。
     pub default_tenant: String,
+    /// #18: 多租户模式开关。true → fm-server HTTP 边界验 caller JWT (fusion-identity /verify),
+    /// 强制 tid==请求 tenant, 拒空 tenant (red line 1/2)。false (默认) → 不验 identity, 向后兼容。
+    pub multi_tenant: bool,
+    /// #18: fusion-identity base URL (默认 http://127.0.0.1:11470, PRD C8 仅 127.0.0.1)。
+    pub identity_url: String,
+    /// #18: fusion-identity service token (gate /verify + /usage)。多租户模式必配。
+    pub identity_service_token: String,
 }
 
 /// P1-8: TOML 配置文件镜像。全字段可选 — 仅出现的字段覆盖默认。
@@ -59,6 +66,14 @@ pub struct ConfigFile {
     pub gateway_origin_required: Option<bool>,
     /// #16: 默认租户 (TOML 镜像)。
     pub default_tenant: Option<String>,
+    /// #18: 多租户模式 (TOML 镜像)。
+    pub multi_tenant: Option<bool>,
+    /// #18: fusion-identity base URL (TOML 镜像)。
+    pub identity_url: Option<String>,
+    /// #18: fusion-identity service token 明文 (优先用 identity_service_token_file)。
+    pub identity_service_token: Option<String>,
+    /// #18: 读此文件内容作 identity_service_token (推荐, 文件权限 0600)。
+    pub identity_service_token_file: Option<String>,
 }
 
 /// P1-8: 默认配置文件路径。env FM_CONFIG 显式指定, 否则 data_dir/fusion-memory.toml。
@@ -105,6 +120,9 @@ impl Default for ServerConfig {
             uds_token: String::new(),
             gateway_origin_required: false,
             default_tenant: String::new(),
+            multi_tenant: false,
+            identity_url: "http://127.0.0.1:11470".into(),
+            identity_service_token: String::new(),
         }
     }
 }
@@ -202,6 +220,15 @@ impl ServerConfig {
         if let Some(t) = &f.default_tenant {
             self.default_tenant = t.clone();
         }
+        if let Some(m) = f.multi_tenant {
+            self.multi_tenant = m;
+        }
+        if let Some(u) = &f.identity_url {
+            self.identity_url = u.clone();
+        }
+        if let Some(t) = &f.identity_service_token {
+            self.identity_service_token = t.clone();
+        }
         // secret_file 路径暂存到临时字段? 不 — ConfigFile 不持有运行态。
         // 改: 在 fill_secrets_from_files 时无法再拿到路径 (ServerConfig 无 path 字段)。
         // 故此处直接读 secret_file 填密钥 (文件字段优先级 < env, env 后续覆盖)。
@@ -216,6 +243,13 @@ impl ServerConfig {
             if self.uds_token.is_empty() {
                 if let Some(v) = read_secret_file("uds_token", p) {
                     self.uds_token = v;
+                }
+            }
+        }
+        if let Some(p) = &f.identity_service_token_file {
+            if self.identity_service_token.is_empty() {
+                if let Some(v) = read_secret_file("identity_service_token", p) {
+                    self.identity_service_token = v;
                 }
             }
         }
@@ -263,6 +297,22 @@ impl ServerConfig {
         if let Ok(v) = std::env::var("FUSION_MEMORY_DEFAULT_TENANT") {
             self.default_tenant = v;
         }
+        if let Ok(v) = std::env::var("FUSION_MEMORY_MULTI_TENANT") {
+            match v.parse::<bool>() {
+                Ok(b) => self.multi_tenant = b,
+                Err(e) => warn!(
+                    raw = %v,
+                    error = %e,
+                    "FUSION_MEMORY_MULTI_TENANT 坏值 (期望 true/false), 回退默认"
+                ),
+            }
+        }
+        if let Ok(v) = std::env::var("FUSION_MEMORY_IDENTITY_URL") {
+            self.identity_url = v;
+        }
+        if let Ok(v) = std::env::var("FUSION_MEMORY_IDENTITY_SERVICE_TOKEN") {
+            self.identity_service_token = v;
+        }
         if let Ok(v) = std::env::var("FUSION_MEMORY_DIM") {
             match v.parse::<usize>() {
                 Ok(d) if d > 0 => self.dim = d,
@@ -299,6 +349,13 @@ impl ServerConfig {
                 }
             }
         }
+        if self.identity_service_token.is_empty() {
+            if let Ok(p) = std::env::var("FUSION_MEMORY_IDENTITY_SERVICE_TOKEN_FILE") {
+                if let Some(v) = read_secret_file("identity_service_token", &p) {
+                    self.identity_service_token = v;
+                }
+            }
+        }
     }
 
     /// P1-8: 启动校验。坏配置 fail-visible 返回 Err, main 据此 exit(1) 不裸跑。
@@ -321,6 +378,20 @@ impl ServerConfig {
                 "http_port={} 开但 api_key 未配 (B5 拒启 HTTP)。配 FUSION_MEMORY_API_KEY 或 api_key_file, 或关 HTTP (http_port=0)",
                 self.http_port
             ));
+        }
+        // #18: multi_tenant 模式须配 identity_service_token + HTTP 开 (identity 验只在 HTTP 边界)。
+        if self.multi_tenant {
+            if !self.http_ok() {
+                return Err(
+                    "multi_tenant=true 须开 HTTP (identity 验在 HTTP 边界, UDS 本机可信免验)"
+                        .into(),
+                );
+            }
+            if self.identity_service_token.is_empty() {
+                return Err(
+                    "multi_tenant=true 须配 FUSION_MEMORY_IDENTITY_SERVICE_TOKEN 或 identity_service_token_file".into(),
+                );
+            }
         }
         Ok(())
     }
@@ -535,5 +606,87 @@ mod tests {
         assert_eq!(c.http_port, 11435); // 默认
         std::env::remove_var("FM_CONFIG");
         std::env::remove_var("FUSION_MEMORY_DIM");
+    }
+
+    // ---- #18: 多租户 identity 配置 ----
+
+    #[test]
+    fn defaults_multi_tenant_off() {
+        let c = ServerConfig::default();
+        assert!(!c.multi_tenant);
+        assert_eq!(c.identity_url, "http://127.0.0.1:11470");
+        assert!(c.identity_service_token.is_empty());
+    }
+
+    #[test]
+    fn validate_multi_tenant_requires_token_and_http() {
+        // multi_tenant=true 但无 identity_service_token → Err
+        let c = ServerConfig {
+            multi_tenant: true,
+            http_port: 11435,
+            api_key: "k".into(),
+            ..Default::default()
+        };
+        assert!(c.validate().is_err());
+
+        // 配了 token 但 HTTP 关 → Err
+        let c = ServerConfig {
+            multi_tenant: true,
+            http_port: 0,
+            identity_service_token: "tok".into(),
+            ..Default::default()
+        };
+        assert!(c.validate().is_err());
+
+        // 都配齐 → Ok
+        let c = ServerConfig {
+            multi_tenant: true,
+            http_port: 11435,
+            api_key: "k".into(),
+            identity_service_token: "tok".into(),
+            ..Default::default()
+        };
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn env_overrides_identity_config() {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("FUSION_MEMORY_MULTI_TENANT", "true");
+        std::env::set_var("FUSION_MEMORY_IDENTITY_URL", "http://127.0.0.1:9999");
+        std::env::set_var("FUSION_MEMORY_IDENTITY_SERVICE_TOKEN", "env-svc-tok");
+        let c = ServerConfig::from_env();
+        assert!(c.multi_tenant);
+        assert_eq!(c.identity_url, "http://127.0.0.1:9999");
+        assert_eq!(c.identity_service_token, "env-svc-tok");
+        std::env::remove_var("FUSION_MEMORY_MULTI_TENANT");
+        std::env::remove_var("FUSION_MEMORY_IDENTITY_URL");
+        std::env::remove_var("FUSION_MEMORY_IDENTITY_SERVICE_TOKEN");
+    }
+
+    #[test]
+    fn identity_secret_file_read() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let key_file = dir.path().join("id.key");
+        std::fs::write(&key_file, "id-secret\n").unwrap();
+        let toml_path = dir.path().join("fm.toml");
+        std::fs::write(
+            &toml_path,
+            format!(
+                "multi_tenant = true\nhttp_port = 11435\napi_key = \"k\"\nidentity_service_token_file = \"{}\"\n",
+                key_file.display()
+            ),
+        )
+        .unwrap();
+        std::env::set_var("FM_CONFIG", &toml_path);
+        std::env::remove_var("FUSION_MEMORY_IDENTITY_SERVICE_TOKEN");
+        std::env::remove_var("FUSION_MEMORY_API_KEY");
+        std::env::remove_var("FUSION_MEMORY_HTTP_PORT");
+        std::env::remove_var("FUSION_MEMORY_MULTI_TENANT");
+        let c = ServerConfig::from_file_or_env();
+        assert_eq!(c.identity_service_token, "id-secret");
+        assert!(c.multi_tenant);
+        std::env::remove_var("FM_CONFIG");
     }
 }

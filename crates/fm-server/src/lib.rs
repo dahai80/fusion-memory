@@ -9,6 +9,7 @@ pub mod config;
 pub mod engine_builder;
 pub mod engine_handle;
 pub mod http;
+pub mod identity;
 pub mod jsonrpc;
 pub mod metrics;
 pub mod tenant;
@@ -78,12 +79,22 @@ pub async fn serve(cfg: ServerConfig, opts: ServeOpts) -> Result<(), String> {
             let _ = otx.send(());
         });
         set.spawn(async move {
+            let verifier: Arc<dyn identity::IdentityVerifier> = if cfg.multi_tenant {
+                Arc::new(identity::RealVerifier::new(
+                    cfg.identity_url.clone(),
+                    cfg.identity_service_token.clone(),
+                ))
+            } else {
+                identity::noop_verifier()
+            };
             let state = http::HttpState {
                 engine: h,
                 api_key,
                 metrics,
                 gateway_origin_required: cfg.gateway_origin_required,
                 default_tenant: Arc::new(cfg.default_tenant.clone()),
+                multi_tenant: cfg.multi_tenant,
+                verifier,
             };
             http::serve(state, port, orx).await
         });
