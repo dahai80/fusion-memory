@@ -2,7 +2,7 @@
 
 > **[English](README.md)** | 中文
 
-> **当前版本：v1.2.0（Commercial GA）** — 多租户隔离落地（issue #16）。v1.1.0 商用正式发布：硬阻断项全闭环 + 真测试验证 + RC 已知限制三项全消。已知限制见 `CHANGELOG.md` "Known limitations"，非阻塞。
+> **当前版本：v1.3.0（Commercial GA）** — fusion-identity 集成落地（issue #18）：fm-server 边界强制校验调用方 JWT、tid↔tenant 匹配、多租户模式下空租户拒绝。v1.2.0 多租户隔离落地（issue #16）。已知限制见 `CHANGELOG.md` "Known limitations"，非阻塞。
 
 Fusion 生态（"一核九端"）系统级长/短期记忆与认知图谱中枢。解决 Agent 跨 session 状态断层、重复提问、context window 爆炸，目标：越用越懂用户。
 
@@ -33,6 +33,13 @@ Fusion 生态（"一核九端"）系统级长/短期记忆与认知图谱中枢�
 - **引擎作用域**（`fm-engine`）：`MemoryEngine.tenant`（启动默认 `""`）+ `with_tenant` 构造器。commit/summarize/retrieve/consolidate 按 `self.tenant` 隔离。跨租户：get → None（不泄露存在性）、delete → NotFound、缺行 delete → Ok（保软删语义）。
 - **gateway 源强制**（`fm-server/src/tenant.rs`）：`X-Fusion-Route: gateway-decision` 头（配置 `gateway_origin_required: bool = false` 默认关 → 缺则 403）；`X-Fusion-Tenant` 权威租户（头 > `default_tenant` 配置 > ""）。HTTP `handle_rpc` + `get_memory` 派发前强制。UDS（可信本机）用默认租户。配置 env：`FUSION_MEMORY_GATEWAY_ORIGIN_REQUIRED`、`FUSION_MEMORY_DEFAULT_TENANT`。
 - **测试数**：默认特性 429→433（+4 gateway 源/租户测试 fm-server）；`--features fm-store/store-fusion` 435→439。门禁全绿（fmt / clippy -D warnings / check / test）。12 crate 版本 1.1.0→1.2.0（加法式，无破坏性变更）。
+
+**fusion-identity 集成落地（2026-09-03，issue #18）**：fm-server HTTP 边界强制校验调用方 JWT（由 fusion-identity `POST /api/v1/auth/verify` 校验）、tid↔tenant 匹配、多租户模式下空租户拒绝（多租户 PRD §4 红线 1 fail-closed）。单租户向后兼容（默认 `multi_tenant: false` = 不做 identity 校验）。
+- **identity 校验器**（`fm-server/src/identity.rs`）：`IdentityVerifier` trait（`verify` + `report_usage`）保 100% 离线可测。`RealVerifier`（reqwest 仅连 `127.0.0.1`，30s TTL 结果缓存）——HTTP 出错 fail-closed。`NoopVerifier` 供单租户向后兼容。`enforce_multi_tenant`：`multi_tenant=false` 短路；true + 空租户 → 401；缺 Bearer JWT → 401；校验后 tid != tenant → 403；匹配 → Ok(tid)。
+- **配置**（`fm-server/src/config.rs`）：`multi_tenant: bool`（默认 false）、`identity_url`（默认 `http://127.0.0.1:11470`）、`identity_service_token`（+ `_file` 密钥读取）。env：`FUSION_MEMORY_MULTI_TENANT` / `FUSION_MEMORY_IDENTITY_URL` / `FUSION_MEMORY_IDENTITY_SERVICE_TOKEN` / `FUSION_MEMORY_IDENTITY_SERVICE_TOKEN_FILE`。`validate()`：`multi_tenant=true` 须 http identity_url 且非空 service_token。
+- **HTTP 边界**（`fm-server/src/http.rs`）：多租户模式下跳过 `check_bearer`（静态 api_key）——Bearer 即 JWT（由 identity 校验）。`handle_rpc` + `get_memory` 在租户提取后调 `enforce_multi_tenant`。
+- **测试数**：默认特性 433→452（+19 identity 测试：4 config + 7 http + 8 identity 单元/e2e）；`--features fm-store/store-fusion` 439→458。门禁全绿（fmt / clippy -D warnings / check / test）。12 crate 版本 1.2.0→1.3.0（加法式，无破坏性变更）。
+- **上游**：fusion-identity 消费（不修改）——唯一 JWT 签发方 + 租户注册表。fm-server 调 `POST /api/v1/auth/verify`（service-token 守卫）+ `POST /api/v1/tenants/{tenant_id}/usage`（best-effort）。三条红线遵守：fail-closed、跨租户拒绝、数据隔离分层。
 
 **M2 已完成**：真实 bge-m3 embedding（dim=1024）+ 实体抽取（防注入 prompt + 严格 JSON 解析）+ SQLite 递归 CTE 图遍历 + 规则优先实体对齐 + 融合评分（cosine+衰减+graph_affinity）+ agent-studio 历史记忆导入。验收：实体抽取 JSON 解析成功率 100%（>90%），规则优先对齐正确（同名同 type 合并 / 同名异 type 不合并），真实 embedding 往返 dim=1024。测试覆盖率 lines 90.59% / regions 92.17%。162 测试全绿，clippy -D warnings 通过。
 

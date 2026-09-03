@@ -1,6 +1,6 @@
 [package]
 name = "fm-server"
-version = "1.2.0"
+version = "1.3.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -25,6 +25,8 @@ axum = { workspace = true }
 tower = { workspace = true }
 tower-http = { workspace = true }
 tracing-subscriber = { workspace = true }
+# #18: fusion-identity HTTP verify client (127.0.0.1 only, offline)。
+reqwest = { workspace = true }
 
 [features]
 # 真实模型集成测试 (需起 fusion-mlx 加载 bge-m3 + Qwen3.5-9B-4bit)

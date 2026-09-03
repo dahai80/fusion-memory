@@ -40,6 +40,8 @@ fn stub_state() -> HttpState {
         metrics: fm_server::metrics::HttpMetrics::new(),
         gateway_origin_required: false,
         default_tenant: Arc::new(String::new()),
+        multi_tenant: false,
+        verifier: fm_server::identity::noop_verifier(),
     }
 }
 
