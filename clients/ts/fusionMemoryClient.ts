@@ -103,8 +103,13 @@ async function rpc<T>(method: string, params: Record<string, unknown>): Promise<
 export async function commitEpisodicMemory(
     sessionId: string,
     interaction: Interaction,
+    namespace?: string,
+    namespaceKey?: string,
 ): Promise<string[]> {
-    return rpc<string[]>('commit', { session_id: sessionId, interaction })
+    const params: Record<string, unknown> = { session_id: sessionId, interaction }
+    if (namespace) params.namespace = namespace
+    if (namespaceKey) params.namespace_key = namespaceKey
+    return rpc<string[]>('commit', params)
 }
 
 export async function retrieveContext(
@@ -112,17 +117,28 @@ export async function retrieveContext(
     topK = 10,
     tokenBudget = 4096,
     aggregate = true,
+    namespace?: string,
+    namespaceKey?: string,
 ): Promise<FormattedContext> {
-    return rpc<FormattedContext>('retrieve', {
+    const params: Record<string, unknown> = {
         text,
         top_k: topK,
         token_budget: tokenBudget,
         aggregate,
-    })
+    }
+    if (namespace) params.namespace = namespace
+    if (namespaceKey) params.namespace_key = namespaceKey
+    return rpc<FormattedContext>('retrieve', params)
 }
 
-export async function consolidateMemories(): Promise<ConsolidationReport> {
-    return rpc<ConsolidationReport>('consolidate', {})
+export async function consolidateMemories(
+    namespace?: string,
+    namespaceKey?: string,
+): Promise<ConsolidationReport> {
+    const params: Record<string, unknown> = {}
+    if (namespace) params.namespace = namespace
+    if (namespaceKey) params.namespace_key = namespaceKey
+    return rpc<ConsolidationReport>('consolidate', params)
 }
 
 export async function getMemory(id: string): Promise<unknown> {

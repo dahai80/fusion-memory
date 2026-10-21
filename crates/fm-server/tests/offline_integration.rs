@@ -99,6 +99,80 @@ async fn http_commit_retrieve_consolidate_roundtrip() {
     assert_eq!(code, 200, "get body={body}");
 }
 
+// issue #21: 真链路作用域隔离 — project 检索只见 project+user, local 不串, 空 = 全量。
+#[tokio::test]
+async fn http_namespace_scoping_roundtrip() {
+    let st = stub_state();
+    let app = fm_server::http::app(st);
+    for (ix, ns, key) in [
+        ("ix-proj", "project", "/p1"),
+        ("ix-user", "user", "u1"),
+        ("ix-local", "local", "m1"),
+    ] {
+        let body = format!(
+            r#"{{"jsonrpc":"2.0","method":"commit","params":{{"session_id":"s1","namespace":"{ns}","namespace_key":"{key}","interaction":{{"id":"{ix}","session_id":"s1","turns":[{{"turn_idx":0,"user_message":"rust sqlite btree memory","assistant_message":"r","tool_calls":[]}}],"timestamp":1,"metadata":{{}}}}}},"id":1}}"#
+        );
+        let (code, resp) = post(&app, "/v1/memory/commit", &body, Some("Bearer test-key")).await;
+        assert_eq!(code, 200, "commit {ix} resp={resp}");
+    }
+    let retrieve = |ns: &str, key: &str, id: i64| {
+        format!(
+            r#"{{"jsonrpc":"2.0","method":"retrieve","params":{{"text":"rust sqlite","top_k":20,"namespace":"{ns}","namespace_key":"{key}"}},"id":{id}}}"#
+        )
+    };
+    let ids = |body: &str| -> Vec<String> {
+        let v: serde_json::Value = serde_json::from_str(body).unwrap();
+        let mut xs: Vec<String> = v["result"]["blocks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|b| b["interaction_id"].as_str().unwrap().to_string())
+            .collect();
+        xs.sort();
+        xs
+    };
+    let (code, body) = post(
+        &app,
+        "/v1/memory/retrieve",
+        &retrieve("project", "/p1", 2),
+        Some("Bearer test-key"),
+    )
+    .await;
+    assert_eq!(code, 200, "body={body}");
+    assert_eq!(
+        ids(&body),
+        vec!["ix-proj".to_string(), "ix-user".to_string()]
+    );
+
+    let (_, body) = post(
+        &app,
+        "/v1/memory/retrieve",
+        &retrieve("local", "m1", 3),
+        Some("Bearer test-key"),
+    )
+    .await;
+    assert_eq!(ids(&body), vec!["ix-local".to_string()]);
+
+    let (_, body) = post(
+        &app,
+        "/v1/memory/retrieve",
+        &retrieve("", "", 4),
+        Some("Bearer test-key"),
+    )
+    .await;
+    assert_eq!(ids(&body).len(), 3);
+
+    // 非法 namespace → invalid_params → HTTP 400
+    let (code, body) = post(
+        &app,
+        "/v1/memory/retrieve",
+        &retrieve("bogus", "k", 5),
+        Some("Bearer test-key"),
+    )
+    .await;
+    assert_eq!(code, 400, "body={body}");
+}
+
 #[tokio::test]
 async fn http_auth_enforced_on_real_engine() {
     // 真 engine 路径鉴权: 无 token → 401

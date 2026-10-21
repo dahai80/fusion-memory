@@ -2,7 +2,7 @@
 
 > **English** | **[中文](README_CN.md)**
 
-> **Current version: v1.3.0 (Commercial GA)** — fusion-identity integration landed (issue #18): fm-server boundary enforces caller JWT, tid↔tenant match, empty-tenant rejection in multi-tenant mode. v1.2.0 multi-tenant isolation landed (issue #16). Known limitations in `CHANGELOG.md` "Known limitations", non-blocking.
+> **Current version: v1.4.0** — scoped memory namespaces landed (issue #21): `user` / `project` / `local` visibility tiers on commit, retrieve, and consolidation (tenant-orthogonal, fully additive). v1.3.0 fusion-identity integration (issue #18) and v1.2.0 multi-tenant isolation (issue #16) landed earlier. Known limitations in `CHANGELOG.md` "Known limitations", non-blocking.
 
 The system-level long/short-term memory and cognitive graph hub of the Fusion ecosystem ("一核九端"). Solves the Agent cross-session state gap, repeated questions, and context-window blowup. Goal: the more it is used, the better it knows the user.
 
@@ -40,6 +40,15 @@ The system-level long/short-term memory and cognitive graph hub of the Fusion ec
 - **HTTP boundary** (`fm-server/src/http.rs`): in multi-tenant mode `check_bearer` (static api_key) is skipped — Bearer is the JWT (identity-verified). `handle_rpc` + `get_memory` call `enforce_multi_tenant` after tenant extraction.
 - **Test counts**: default features 433→452 (+19 identity tests: 4 config + 7 http + 8 identity unit/e2e); `--features fm-store/store-fusion` 439→458. Gates all green (fmt / clippy -D warnings / check / test). Version bump all 12 crates 1.2.0→1.3.0 (additive, no breaking change).
 - **Upstream**: fusion-identity consumed (not modified) — sole JWT issuer + tenant registry. fm-server calls `POST /api/v1/auth/verify` (service-token gated) + `POST /api/v1/tenants/{tenant_id}/usage` (best-effort). Three red lines honored: fail-closed, cross-tenant denied, data isolation layering.
+
+**Scoped memory namespaces landed (2026-10-21, issue #21)**: second visibility dimension orthogonal to tenant — `namespace` (`user` / `project` / `local` / empty) with `namespace_key` (project path / machine id / user id). Fully additive: empty namespace = global (old behavior); all fields `#[serde(default)]` so old JSON and WOP payloads replay unchanged.
+- **Data** (`fm-core`): `MemoryItem` / `Interaction` / `RetrieveQuery` gain `namespace` + `namespace_key`; `MemoryItem::with_namespace` builder keeps the existing 8-arg skeleton signature.
+- **Stacking rule**: `project` sees its own key ∪ `user`; `local` sees only its own key; `user` sees user only; empty = no filter. Unknown values fail closed (`-32602`) rather than silently widening the read.
+- **Schema v4** (`fm-persist`): `namespace` / `namespace_key` columns + `idx_memory_namespace`; idempotent v3→v4 `ALTER`; migration order fixed (table → ALTER → index DDL).
+- **Engine** (`fm-engine`): commit stamps namespace onto turn items; retrieve filters the KNN hit lookup by the SQL predicate and over-fetches `top_k × 4` when a filter is active (the store trait has no metadata filter); `consolidate_memories_scoped()` restricts recycle/promote/merge/summarize/reconcile to the visible domain and deliberately does **not** advance the global consolidation watermark, so a scoped backfill cannot swallow other namespaces' pending changes.
+- **RPC** (`fm-server`): optional `namespace` / `namespace_key` on `commit`, `retrieve`, `memory.retrieve_context`, `consolidate` (`{}` / null params still valid); commit params override interaction values. Named `namespace` to avoid colliding with the existing `delete_scope` / `count` `scope` (session_id) meaning.
+- **Test counts**: default features 452→468 (+16 namespace tests: filter unit / persist scoped + v3→v4 migration / engine stacking + watermark / jsonrpc passthrough + validation / HTTP end-to-end scoping). Gates all green. Version bump all 12 crates 1.3.0→1.4.0 (additive, SemVer MINOR).
+- **Consumer side** (out of this repo): fusion-agent-studio#434 — subagent `memory:` field, project-root key derivation, per-subagent toggle. Wire contract: `clients/README.md`.
 
 **M2 completed**: real bge-m3 embedding (dim=1024) + entity extraction (injection-proof prompt + strict JSON parsing) + SQLite recursive CTE graph traversal + rule-priority entity alignment + fused scoring (cosine+decay+graph_affinity) + agent-studio history memory import. Acceptance: entity extraction JSON parse success rate 100% (>90%), rule-priority alignment correct (same name same type merge / same name different type no merge), real embedding roundtrip dim=1024. Test coverage lines 90.59% / regions 92.17%. 162 tests all green, clippy -D warnings passed.
 

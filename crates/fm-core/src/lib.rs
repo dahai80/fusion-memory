@@ -8,6 +8,7 @@ pub mod entity;
 pub mod error;
 pub mod interaction;
 pub mod memory;
+pub mod namespace;
 pub mod report;
 pub mod trait_def;
 
@@ -16,5 +17,6 @@ pub use entity::{EntityNode, EntityType};
 pub use error::{MemoryError, MemoryResult};
 pub use interaction::{Interaction, ToolCall, Turn};
 pub use memory::{MemoryItem, MemoryTier, MemoryType};
+pub use namespace::NamespaceFilter;
 pub use report::{CommitOutcome, ConsolidationFailure, ConsolidationReport, MemoryId, TurnFailure};
 pub use trait_def::FusionMemoryEngine;

@@ -23,14 +23,17 @@ CREATE TABLE IF NOT EXISTS memory_item (\
   provenance TEXT,\
   tombstone INTEGER NOT NULL DEFAULT 0,\
   entities_pending INTEGER NOT NULL DEFAULT 1,\
-  entities_json TEXT NOT NULL DEFAULT '[]'\
+  entities_json TEXT NOT NULL DEFAULT '[]',\
+  namespace TEXT NOT NULL DEFAULT '',\
+  namespace_key TEXT NOT NULL DEFAULT ''\
 )";
 
 pub const MEMORY_ITEM_DDL_INSERT: &str = "\
 INSERT OR REPLACE INTO memory_item(\
   id,interaction_id,turn_idx,session_id,tenant,memory_type,tier,content,vector_ref,weight,\
-  access_count,last_accessed_timestamp,created_timestamp,provenance,tombstone,entities_pending,entities_json\
-) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)";
+  access_count,last_accessed_timestamp,created_timestamp,provenance,tombstone,entities_pending,entities_json,\
+  namespace,namespace_key\
+) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)";
 
 pub const MEMORY_ITEM_DDL_SELECT_BY_ID: &str = "SELECT * FROM memory_item WHERE id=?1";
 
@@ -140,6 +143,10 @@ CREATE INDEX IF NOT EXISTS idx_memory_vector_ref ON memory_item(vector_ref)";
 pub const INDEX_MEMORY_TENANT: &str = "\
 CREATE INDEX IF NOT EXISTS idx_memory_tenant ON memory_item(tenant, tombstone)";
 
+// issue #21: namespace 索引 — 作用域检索/调度按 (namespace, namespace_key) 过滤走此索引。
+pub const INDEX_MEMORY_NAMESPACE: &str = "\
+CREATE INDEX IF NOT EXISTS idx_memory_namespace ON memory_item(namespace, namespace_key, tombstone)";
+
 pub const ALL_DDL: &[&str] = &[
     MEMORY_ITEM_DDL,
     ENTITY_DDL,
@@ -157,6 +164,7 @@ pub const ALL_DDL: &[&str] = &[
     INDEX_MEMORY_ENTITY_EID,
     INDEX_MEMORY_VECTOR_REF,
     INDEX_MEMORY_TENANT,
+    INDEX_MEMORY_NAMESPACE,
 ];
 
 pub const ALL_PRAGMAS: &[&str] = &[PRAGMA_BUSY, PRAGMA_SYNC, PRAGMA_FK];
@@ -166,7 +174,9 @@ pub const ALL_PRAGMAS: &[&str] = &[PRAGMA_BUSY, PRAGMA_SYNC, PRAGMA_FK];
 // v1: 加 idx_memory_entity_eid 索引 (§1.15 audit 反查); 旧库已由 IF NOT EXISTS 补建, 版本号记录此点。
 // v2: 加 idx_memory_vector_ref 索引 (§1.3 retrieve 定向查询); 旧库由 v1→v2 迁移步补建。
 // v3: #16 加 tenant 列 + idx_memory_tenant 索引 (多租户隔离); 旧库 ALTER TABLE 补列 DEFAULT '' + 补索引。
-pub const SCHEMA_VERSION: u32 = 3;
+// v4: #21 加 namespace/namespace_key 列 + idx_memory_namespace 索引 (作用域命名空间);
+//     旧库 ALTER TABLE 补列 DEFAULT '' + 补索引。
+pub const SCHEMA_VERSION: u32 = 4;
 
 /// §1.10: 读旧库 user_version。新库/空 PRAGMA 返 0。
 pub fn user_version(conn: &rusqlite::Connection) -> rusqlite::Result<u32> {
@@ -188,10 +198,8 @@ pub fn migrate(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
     if from >= SCHEMA_VERSION {
         return Ok(());
     }
-    // v0 → v1: 表/索引全 IF NOT EXISTS 幂等补建 (含 §1.15 新索引)。
-    for ddl in ALL_DDL {
-        conn.execute_batch(ddl)?;
-    }
+    // v0 → v1: 先建主表 (空库需要), ALTER 补列后再建其余表/索引 (索引引用新列, 顺序不能反)。
+    conn.execute_batch(MEMORY_ITEM_DDL)?;
     // v2 → v3: #16 加 tenant 列。ALTER TABLE ADD COLUMN 幂等性靠先查 pragma_table_info
     // (SQLite ADD COLUMN 无 IF NOT EXISTS 语法, 重复 ALTER 会报 duplicate column)。
     if from < 3 {
@@ -207,6 +215,36 @@ pub fn migrate(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
             tracing::info!("migrate: added tenant column to memory_item (v3)");
         }
         // idx_memory_tenant 已在 ALL_DDL 内 IF NOT EXISTS 补建, 此处不重复。
+    }
+    // v3 → v4: #21 加 namespace/namespace_key 列 (作用域命名空间)。
+    if from < 4 {
+        for (col, ddl) in [
+            (
+                "namespace",
+                "ALTER TABLE memory_item ADD COLUMN namespace TEXT NOT NULL DEFAULT ''",
+            ),
+            (
+                "namespace_key",
+                "ALTER TABLE memory_item ADD COLUMN namespace_key TEXT NOT NULL DEFAULT ''",
+            ),
+        ] {
+            let has: i64 = conn.query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM pragma_table_info('memory_item') WHERE name='{col}'"
+                ),
+                [],
+                |r| r.get(0),
+            )?;
+            if has == 0 {
+                conn.execute_batch(ddl)?;
+                tracing::info!(col, "migrate: added namespace column to memory_item (v4)");
+            }
+        }
+        // idx_memory_namespace 在下方 ALL_DDL 内 IF NOT EXISTS 补建, 此处不重复。
+    }
+    // 其余表 + 全部索引 (IF NOT EXISTS 幂等; namespace/tenant 列此时已就位)。
+    for ddl in ALL_DDL {
+        conn.execute_batch(ddl)?;
     }
     set_user_version(conn, SCHEMA_VERSION)?;
     tracing::info!(from = from, to = SCHEMA_VERSION, "schema migrated");

@@ -10,7 +10,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use fm_core::{
     ConsolidationFailure, ConsolidationReport, ContextBlock, FormattedContext, Interaction,
-    MemoryId, MemoryItem, MemoryTier, MemoryType, RetrieveQuery, Turn,
+    MemoryId, MemoryItem, MemoryTier, MemoryType, NamespaceFilter, RetrieveQuery, Turn,
 };
 use fm_embed::{vector_id_from_ulid, Embedder};
 use fm_persist::{MergeLogEntry, Persist};
@@ -224,6 +224,7 @@ impl MemoryEngine {
         changed: &[MemoryItem],
         at: u64,
         failures: &mut Vec<ConsolidationFailure>,
+        ns: &NamespaceFilter,
     ) -> fm_core::MemoryResult<usize> {
         let mut merged = 0usize;
         let semantic: Vec<&MemoryItem> = changed
@@ -232,10 +233,10 @@ impl MemoryEngine {
             .collect();
         // P3: 旧版在 KNN 内层循环对每个候选 vector_id 都 list_all 全表扫 + 字符串反查 → O(S×KNN×N)。
         // 改: 循环外一次性建 vector_id → MemoryItem 索引, 内层 O(1) 查。
-        // #16: 按 self.tenant 限定, 跨租户不参与合并。
+        // #16: 按 self.tenant 限定, 跨租户不参与合并。#21: 再按 namespace 可见域限定。
         let all = self
             .persist
-            .list_all_by_tenant(&self.tenant)
+            .list_all_by_tenant_scoped(&self.tenant, ns)
             .map_err(|e| e.to_memory())?;
         let by_vec_ref: std::collections::HashMap<u64, &MemoryItem> = all
             .iter()
@@ -330,6 +331,7 @@ impl MemoryEngine {
         changed: &[MemoryItem],
         at: u64,
         failures: &mut Vec<ConsolidationFailure>,
+        ns: &NamespaceFilter,
     ) -> fm_core::MemoryResult<usize> {
         let Some(cfg) = &self.extract_config else {
             debug!("no extract_config, summarize skipped");
@@ -403,6 +405,16 @@ impl MemoryEngine {
                 summary,
                 at,
             );
+            // #21: 摘要继承来源 session 的命名空间 (作用域运行显式给定则以其为准)。
+            let (summary_ns, summary_key) = if ns.is_active() {
+                (ns.namespace.clone(), ns.key.clone())
+            } else {
+                items
+                    .first()
+                    .map(|m| (m.namespace.clone(), m.namespace_key.clone()))
+                    .unwrap_or_default()
+            };
+            item = item.with_namespace(summary_ns, summary_key);
             item.vector_ref = vec_id.to_string();
             item.tier = MemoryTier::Long;
             item.entities_pending = true;
@@ -438,10 +450,11 @@ impl MemoryEngine {
         &self,
         at: u64,
         failures: &mut Vec<ConsolidationFailure>,
+        ns: &NamespaceFilter,
     ) -> fm_core::MemoryResult<usize> {
         let sqlite_all = self
             .persist
-            .list_all_by_tenant(&self.tenant)
+            .list_all_by_tenant_scoped(&self.tenant, ns)
             .map_err(|e| e.to_memory())?;
         // 正向: SQLite→store 悬空 (SQLite 有 vector_ref 但 store 无向量)。
         let mut reconciled = 0usize;
@@ -575,7 +588,7 @@ impl MemoryEngine {
     pub fn reconcile(&self) -> fm_core::MemoryResult<usize> {
         let at = Self::now_ms();
         let mut failures = Vec::new();
-        self.consolidate_reconcile(at, &mut failures)
+        self.consolidate_reconcile(at, &mut failures, &NamespaceFilter::default())
     }
 
     /// fm-cli: 列全部 merge_log。
@@ -662,6 +675,10 @@ impl MemoryEngine {
                 MemoryType::Episodic,
                 content.clone(),
                 now,
+            )
+            .with_namespace(
+                interaction.namespace.clone(),
+                interaction.namespace_key.clone(),
             );
             let vec_id = vector_id_from_ulid(&id);
             // §3.7: embed 失败 (fusion-mlx 429/挂) → 跳过此 turn 不 abort 整交互。
@@ -741,6 +758,199 @@ impl MemoryEngine {
             memory_ids: ids,
             failed_turns,
         })
+    }
+    async fn consolidate_impl(
+        &self,
+        ns: &NamespaceFilter,
+    ) -> fm_core::MemoryResult<ConsolidationReport> {
+        // H4: 持引擎级锁, 与 retrieve 的 touch_access 写互斥。
+        // "读快照→决策→写" 原子化, 防并发 touch 回退 access_count (lost update) 或回收刚访问项 (TOCTOU)。
+        let _guard = self.consolidate_lock.lock().await;
+        let start = Self::now_ms();
+        let now = start;
+        let since = self
+            .persist
+            .last_consolidate_at()
+            .map_err(|e| e.to_memory())?;
+        let mut failures: Vec<ConsolidationFailure> = Vec::new();
+        let mut dropped = 0usize;
+        let mut promoted = 0usize;
+        let mut reextracted = 0usize;
+
+        // 增量变更集 (B4: 仅处理 last_consolidate_at 以来变更)。
+        // #21: 作用域运行只看可见域内变更。
+        let changed = self
+            .persist
+            .list_changed_since_scoped(since, ns)
+            .map_err(|e| e.to_memory())?;
+
+        // 1. 衰减回收 + 晋升 (增量)
+        // §1.13: phase-1 全同步 SQL I/O (delete_vector/tombstone/put_memory) 放 spawn_blocking,
+        // 不阻塞 tokio worker 线程。旧版在 async fn 内同步阻塞 → 占满 worker (CPU 核少的小机器饥饿)。
+        // phase-2/3 有 LLM await 自然 yield 不阻塞, 故仅 phase-1 入 blocking。
+        let store = self.store.clone();
+        let persist = self.persist.clone();
+        let (changed, phase1_dropped, phase1_promoted, phase1_failures) =
+            tokio::task::spawn_blocking(move || {
+                let mut d = 0usize;
+                let mut p = 0usize;
+                let mut fl: Vec<ConsolidationFailure> = Vec::new();
+                for m in &changed {
+                    if scoring::should_recycle(m, now) {
+                        if let Ok(vr) = m.vector_ref.parse::<u64>() {
+                            if let Err(e) = store.delete_vector(vr) {
+                                warn!(id = %m.id, error = %e, "recycle delete_vector failed");
+                                fl.push(ConsolidationFailure {
+                                    memory_id: m.id.clone(),
+                                    stage: "recycle".into(),
+                                    error: e.to_string(),
+                                });
+                            }
+                        }
+                        if let Err(e) = persist.tombstone_memory(&m.id) {
+                            fl.push(ConsolidationFailure {
+                                memory_id: m.id.clone(),
+                                stage: "recycle".into(),
+                                error: e.to_string(),
+                            });
+                        }
+                        // §1.9: emit recycle wop → follower tombstone 同步 (向量 leader 已删,
+                        // follower reconcile 兜底)。旧版不 emit → follower 该 tombstone 的仍活。
+                        if let Err(e) = persist.append_wop("recycle", &m.id, now) {
+                            warn!(id = %m.id, error = %e, "recycle wop append failed, follower may diverge");
+                        }
+                        d += 1;
+                        continue;
+                    }
+                    if m.tier == MemoryTier::Short && scoring::should_promote(m, now) {
+                        let mut up = m.clone();
+                        up.tier = MemoryTier::Long;
+                        if let Err(e) = persist.put_memory(&up) {
+                            fl.push(ConsolidationFailure {
+                                memory_id: m.id.clone(),
+                                stage: "promote".into(),
+                                error: e.to_string(),
+                            });
+                        } else {
+                            // §1.9: emit promote wop → follower promote_tier 同步。
+                            // payload = "id\ttier"。旧版不 emit → follower 该 Long 的仍 Short。
+                            if let Err(e) =
+                                persist.append_wop("promote", &format!("{}\tLong", m.id), now)
+                            {
+                                warn!(id = %m.id, error = %e, "promote wop append failed, follower may diverge");
+                            }
+                            p += 1;
+                        }
+                    }
+                }
+                (changed, d, p, fl)
+            })
+            .await
+            .map_err(|e| fm_core::MemoryError::Store(format!("consolidate phase-1 join: {e}")))?;
+        dropped += phase1_dropped;
+        promoted += phase1_promoted;
+        failures.extend(phase1_failures);
+
+        // 2. 图合并 (ANN top-5, sim>0.92 + 共享实体) — 仅 Semantic
+        let merged = self
+            .consolidate_merge(&changed, start, &mut failures, ns)
+            .await?;
+
+        // 3. 摘要压缩 (同 session 高密度 Episodic 序列 → fusion-mlx → 新 Semantic)
+        let summarized = self
+            .consolidate_summarize(&changed, start, &mut failures, ns)
+            .await?;
+
+        // 4. 延迟补抽 (C5)
+        for m in &changed {
+            if m.entities_pending {
+                if let Some(extractor) = &self.extractor {
+                    let ExtractResult { entities, success } = extractor.extract(&m.content).await;
+                    if success {
+                        let mut item = m.clone();
+                        item.entities = entities;
+                        item.entities_pending = false;
+                        if let Err(e) = self.persist.put_memory(&item) {
+                            failures.push(ConsolidationFailure {
+                                memory_id: m.id.clone(),
+                                stage: "reextract".into(),
+                                error: e.to_string(),
+                            });
+                        } else {
+                            // §1.9: emit reextract wop → follower put_item 覆写 entities 同步。
+                            // payload = MemoryItem JSON (向量不变, 内容未变)。旧版不 emit →
+                            // follower entities_pending 永真, audit_memory_access 返不同集合。
+                            let payload = serde_json::to_string(&item).unwrap_or_default();
+                            if let Err(e) = self.persist.append_wop("reextract", &payload, now) {
+                                warn!(id = %m.id, error = %e, "reextract wop append failed, follower may diverge");
+                            }
+                            reextracted += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        // 5. 跨库对账 (A1): SQLite memory_item.id ↔ store 向量 id 差异 → reconcile_report;
+        //    tombstone 且三库一致 → 物理删。
+        let reconciled = self.consolidate_reconcile(start, &mut failures, ns)?;
+
+        let report = ConsolidationReport {
+            elapsed_ms: Self::now_ms().saturating_sub(start),
+            dropped,
+            promoted,
+            merged,
+            summarized,
+            reextracted,
+            reconciled,
+            failures,
+        };
+        // #21: 作用域运行不写 consolidation_log (该表 MAX(started_at) 是全局水位),
+        // 否则会吞掉其他 namespace 的待处理变更。失败明细改走 reconcile_report 留痕。
+        if ns.is_active() {
+            for f in &report.failures {
+                if let Err(e) =
+                    self.persist
+                        .append_reconcile(start, &f.memory_id, &f.stage, &f.error)
+                {
+                    warn!(error = %e, "scoped consolidate failure log append failed");
+                }
+            }
+        } else {
+            self.persist
+                .record_consolidation(&report, start)
+                .map_err(|e| e.to_memory())?;
+        }
+        info!(
+            dropped,
+            promoted,
+            merged,
+            summarized,
+            reextracted,
+            reconciled,
+            namespace = %ns.namespace,
+            namespace_key = %ns.key,
+            "consolidate done"
+        );
+        // P1-3: 审计日志。actor="system" (cron/手动触发, 无外部调用方), action=consolidate,
+        // target="saga", detail=六计数 + 失败数。
+        let con_detail = format!(
+            "dropped={} promoted={} merged={} summarized={} reextracted={} reconciled={} failures={}",
+            report.dropped,
+            report.promoted,
+            report.merged,
+            report.summarized,
+            report.reextracted,
+            report.reconciled,
+            report.failures.len()
+        );
+        if let Err(e) = self
+            .persist
+            .append_audit(now, "system", "consolidate", "saga", &con_detail)
+        {
+            warn!(error = %e, "audit_log append failed (consolidate), non-fatal");
+        }
+        Ok(report)
     }
 }
 
@@ -872,15 +1082,24 @@ impl fm_core::FusionMemoryEngine for MemoryEngine {
             .embed(&query.text)
             .await
             .map_err(|e| e.to_memory())?;
-        let knn = self.store.search_knn(&qvec, query.top_k)?;
-        debug!(hits = knn.len(), "knn done");
+        // issue #21: 作用域过滤在 KNN 之后 (store trait 无元数据过滤), 命中会被过滤掉,
+        // 故激活时超采样 4x 缓解 top_k 欠填充。
+        let ns_filter = NamespaceFilter::new(query.namespace.clone(), query.namespace_key.clone());
+        let knn_k = if ns_filter.is_active() {
+            query.top_k.saturating_mul(4)
+        } else {
+            query.top_k
+        };
+        let knn = self.store.search_knn(&qvec, knn_k)?;
+        debug!(hits = knn.len(), requested = knn_k, "knn done");
         // §1.3: 定向查 KNN 命中 vec_id 对应的 memory_item, 走 idx_memory_vector_ref 索引。
         // 旧版 list_all 全表扫 + HashMap (10k 记忆 ≈ 2MB clone/次) 仅为查 ~10 个 KNN 命中。
         let knn_vec_ids: Vec<u64> = knn.iter().map(|(vid, _)| *vid).collect();
         // #16: 按 query.tenant 定向查 KNN 命中, 防跨租户泄漏 (tenant="" = 默认租户, 命中旧库行)。
+        // #21: 同一条 SQL 追加 namespace 可见域谓词 (project 叠 user / local 仅本机)。
         let hits = self
             .persist
-            .get_by_vector_refs_tenant(&knn_vec_ids, &query.tenant)
+            .get_by_vector_refs_tenant_scoped(&knn_vec_ids, &query.tenant, &ns_filter)
             .map_err(|e| e.to_memory())?;
         let mut by_vec_ref: std::collections::HashMap<u64, MemoryItem> =
             std::collections::HashMap::new();
@@ -1016,173 +1235,17 @@ impl fm_core::FusionMemoryEngine for MemoryEngine {
     }
 
     async fn consolidate_memories(&self) -> fm_core::MemoryResult<ConsolidationReport> {
-        // H4: 持引擎级锁, 与 retrieve 的 touch_access 写互斥。
-        // "读快照→决策→写" 原子化, 防并发 touch 回退 access_count (lost update) 或回收刚访问项 (TOCTOU)。
-        let _guard = self.consolidate_lock.lock().await;
-        let start = Self::now_ms();
-        let now = start;
-        let since = self
-            .persist
-            .last_consolidate_at()
-            .map_err(|e| e.to_memory())?;
-        let mut failures: Vec<ConsolidationFailure> = Vec::new();
-        let mut dropped = 0usize;
-        let mut promoted = 0usize;
-        let mut reextracted = 0usize;
+        self.consolidate_impl(&NamespaceFilter::default()).await
+    }
 
-        // 增量变更集 (B4: 仅处理 last_consolidate_at 以来变更)。
-        let changed = self
-            .persist
-            .list_changed_since(since)
-            .map_err(|e| e.to_memory())?;
-
-        // 1. 衰减回收 + 晋升 (增量)
-        // §1.13: phase-1 全同步 SQL I/O (delete_vector/tombstone/put_memory) 放 spawn_blocking,
-        // 不阻塞 tokio worker 线程。旧版在 async fn 内同步阻塞 → 占满 worker (CPU 核少的小机器饥饿)。
-        // phase-2/3 有 LLM await 自然 yield 不阻塞, 故仅 phase-1 入 blocking。
-        let store = self.store.clone();
-        let persist = self.persist.clone();
-        let (changed, phase1_dropped, phase1_promoted, phase1_failures) =
-            tokio::task::spawn_blocking(move || {
-                let mut d = 0usize;
-                let mut p = 0usize;
-                let mut fl: Vec<ConsolidationFailure> = Vec::new();
-                for m in &changed {
-                    if scoring::should_recycle(m, now) {
-                        if let Ok(vr) = m.vector_ref.parse::<u64>() {
-                            if let Err(e) = store.delete_vector(vr) {
-                                warn!(id = %m.id, error = %e, "recycle delete_vector failed");
-                                fl.push(ConsolidationFailure {
-                                    memory_id: m.id.clone(),
-                                    stage: "recycle".into(),
-                                    error: e.to_string(),
-                                });
-                            }
-                        }
-                        if let Err(e) = persist.tombstone_memory(&m.id) {
-                            fl.push(ConsolidationFailure {
-                                memory_id: m.id.clone(),
-                                stage: "recycle".into(),
-                                error: e.to_string(),
-                            });
-                        }
-                        // §1.9: emit recycle wop → follower tombstone 同步 (向量 leader 已删,
-                        // follower reconcile 兜底)。旧版不 emit → follower 该 tombstone 的仍活。
-                        if let Err(e) = persist.append_wop("recycle", &m.id, now) {
-                            warn!(id = %m.id, error = %e, "recycle wop append failed, follower may diverge");
-                        }
-                        d += 1;
-                        continue;
-                    }
-                    if m.tier == MemoryTier::Short && scoring::should_promote(m, now) {
-                        let mut up = m.clone();
-                        up.tier = MemoryTier::Long;
-                        if let Err(e) = persist.put_memory(&up) {
-                            fl.push(ConsolidationFailure {
-                                memory_id: m.id.clone(),
-                                stage: "promote".into(),
-                                error: e.to_string(),
-                            });
-                        } else {
-                            // §1.9: emit promote wop → follower promote_tier 同步。
-                            // payload = "id\ttier"。旧版不 emit → follower 该 Long 的仍 Short。
-                            if let Err(e) =
-                                persist.append_wop("promote", &format!("{}\tLong", m.id), now)
-                            {
-                                warn!(id = %m.id, error = %e, "promote wop append failed, follower may diverge");
-                            }
-                            p += 1;
-                        }
-                    }
-                }
-                (changed, d, p, fl)
-            })
+    /// issue #21: 作用域调度 — 仅可见域内记忆参与 (project 叠 user / local 仅本机)。
+    async fn consolidate_memories_scoped(
+        &self,
+        namespace: &str,
+        namespace_key: &str,
+    ) -> fm_core::MemoryResult<ConsolidationReport> {
+        self.consolidate_impl(&NamespaceFilter::new(namespace, namespace_key))
             .await
-            .map_err(|e| fm_core::MemoryError::Store(format!("consolidate phase-1 join: {e}")))?;
-        dropped += phase1_dropped;
-        promoted += phase1_promoted;
-        failures.extend(phase1_failures);
-
-        // 2. 图合并 (ANN top-5, sim>0.92 + 共享实体) — 仅 Semantic
-        let merged = self
-            .consolidate_merge(&changed, start, &mut failures)
-            .await?;
-
-        // 3. 摘要压缩 (同 session 高密度 Episodic 序列 → fusion-mlx → 新 Semantic)
-        let summarized = self
-            .consolidate_summarize(&changed, start, &mut failures)
-            .await?;
-
-        // 4. 延迟补抽 (C5)
-        for m in &changed {
-            if m.entities_pending {
-                if let Some(extractor) = &self.extractor {
-                    let ExtractResult { entities, success } = extractor.extract(&m.content).await;
-                    if success {
-                        let mut item = m.clone();
-                        item.entities = entities;
-                        item.entities_pending = false;
-                        if let Err(e) = self.persist.put_memory(&item) {
-                            failures.push(ConsolidationFailure {
-                                memory_id: m.id.clone(),
-                                stage: "reextract".into(),
-                                error: e.to_string(),
-                            });
-                        } else {
-                            // §1.9: emit reextract wop → follower put_item 覆写 entities 同步。
-                            // payload = MemoryItem JSON (向量不变, 内容未变)。旧版不 emit →
-                            // follower entities_pending 永真, audit_memory_access 返不同集合。
-                            let payload = serde_json::to_string(&item).unwrap_or_default();
-                            if let Err(e) = self.persist.append_wop("reextract", &payload, now) {
-                                warn!(id = %m.id, error = %e, "reextract wop append failed, follower may diverge");
-                            }
-                            reextracted += 1;
-                        }
-                    }
-                }
-            }
-        }
-
-        // 5. 跨库对账 (A1): SQLite memory_item.id ↔ store 向量 id 差异 → reconcile_report;
-        //    tombstone 且三库一致 → 物理删。
-        let reconciled = self.consolidate_reconcile(start, &mut failures)?;
-
-        let report = ConsolidationReport {
-            elapsed_ms: Self::now_ms().saturating_sub(start),
-            dropped,
-            promoted,
-            merged,
-            summarized,
-            reextracted,
-            reconciled,
-            failures,
-        };
-        self.persist
-            .record_consolidation(&report, start)
-            .map_err(|e| e.to_memory())?;
-        info!(
-            dropped,
-            promoted, merged, summarized, reextracted, reconciled, "consolidate done"
-        );
-        // P1-3: 审计日志。actor="system" (cron/手动触发, 无外部调用方), action=consolidate,
-        // target="saga", detail=六计数 + 失败数。
-        let con_detail = format!(
-            "dropped={} promoted={} merged={} summarized={} reextracted={} reconciled={} failures={}",
-            report.dropped,
-            report.promoted,
-            report.merged,
-            report.summarized,
-            report.reextracted,
-            report.reconciled,
-            report.failures.len()
-        );
-        if let Err(e) = self
-            .persist
-            .append_audit(now, "system", "consolidate", "saga", &con_detail)
-        {
-            warn!(error = %e, "audit_log append failed (consolidate), non-fatal");
-        }
-        Ok(report)
     }
 
     async fn get_memory(&self, id: &str) -> fm_core::MemoryResult<Option<MemoryItem>> {
@@ -1371,6 +1434,8 @@ mod tests {
             id: ix_id.into(),
             session_id: "sess-1".into(),
             tenant: String::new(),
+            namespace: String::new(),
+            namespace_key: String::new(),
             turns: t,
             timestamp: 1000,
             metadata: serde_json::json!({}),
@@ -1452,6 +1517,8 @@ mod tests {
             id: "ix-flaky".into(),
             session_id: "sess-1".into(),
             tenant: String::new(),
+            namespace: String::new(),
+            namespace_key: String::new(),
             turns: vec![
                 Turn {
                     turn_idx: 0,
@@ -1526,6 +1593,8 @@ mod tests {
             id: "ix-detailed".into(),
             session_id: "sess-1".into(),
             tenant: String::new(),
+            namespace: String::new(),
+            namespace_key: String::new(),
             turns: vec![
                 Turn {
                     turn_idx: 0,
@@ -1596,6 +1665,8 @@ mod tests {
             id: "ix-allfail".into(),
             session_id: "sess-1".into(),
             tenant: String::new(),
+            namespace: String::new(),
+            namespace_key: String::new(),
             turns: vec![Turn {
                 turn_idx: 0,
                 user_message: "x".into(),
@@ -1630,6 +1701,67 @@ mod tests {
         assert_eq!(ctx.blocks[0].turns.len(), 2);
     }
 
+    // #21: 作用域检索 — project 叠 user, local 仅本机, 空 = 旧行为全量; 未知值 fail-closed。
+    #[tokio::test]
+    async fn retrieve_respects_namespace_stacking() {
+        let eng = tmp_engine(16);
+        for (ix_id, ns, key) in [
+            ("ix-user", "user", "u1"),
+            ("ix-proj", "project", "p1"),
+            ("ix-other", "project", "p2"),
+            ("ix-local", "local", "m1"),
+            ("ix-global", "", ""),
+        ] {
+            let mut ix = sample_interaction(ix_id, 1);
+            ix.id = ix_id.into();
+            ix.namespace = ns.into();
+            ix.namespace_key = key.into();
+            eng.commit_episodic_memory("sess-1", &ix).await.unwrap();
+        }
+        let block_ids = |ns: &str, key: &str| {
+            let mut q = RetrieveQuery::new("user says 0", 50, 65536);
+            q.namespace = ns.into();
+            q.namespace_key = key.into();
+            let eng = &eng;
+            async move {
+                let ctx = eng.retrieve_context(&q).await.unwrap();
+                let mut ids: Vec<String> =
+                    ctx.blocks.into_iter().map(|b| b.interaction_id).collect();
+                ids.sort();
+                ids
+            }
+        };
+        assert_eq!(
+            block_ids("project", "p1").await,
+            vec!["ix-proj".to_string(), "ix-user".to_string()]
+        );
+        assert_eq!(block_ids("local", "m1").await, vec!["ix-local".to_string()]);
+        assert_eq!(block_ids("user", "").await, vec!["ix-user".to_string()]);
+        assert_eq!(block_ids("", "").await.len(), 5);
+        let mut bad = RetrieveQuery::new("user says 0", 10, 4096);
+        bad.namespace = "bogus".into();
+        assert!(eng.retrieve_context(&bad).await.is_err());
+    }
+
+    // #21: 作用域 consolidate 不推进全局水位 (否则吞掉其他 namespace 待处理变更)。
+    #[tokio::test]
+    async fn scoped_consolidate_does_not_advance_watermark() {
+        let eng = tmp_engine(16);
+        let mut ix = sample_interaction("ix-cons", 3);
+        ix.namespace = "project".into();
+        ix.namespace_key = "p1".into();
+        eng.commit_episodic_memory("sess-1", &ix).await.unwrap();
+        let report = eng
+            .consolidate_memories_scoped("project", "p1")
+            .await
+            .unwrap();
+        assert!(report.failures.len() <= 1, "report={report:?}");
+        assert_eq!(eng.persist.last_consolidate_at().unwrap(), 0);
+        // 全局运行仍能看到该变更 (水位未动)。
+        eng.consolidate_memories().await.unwrap();
+        assert!(eng.persist.last_consolidate_at().unwrap() > 0);
+    }
+
     #[tokio::test]
     async fn retrieve_ranks_relevant_higher() {
         let eng = tmp_engine(16);
@@ -1638,6 +1770,8 @@ mod tests {
             id: "ix-b".into(),
             session_id: "sess-1".into(),
             tenant: String::new(),
+            namespace: String::new(),
+            namespace_key: String::new(),
             turns: vec![Turn {
                 turn_idx: 0,
                 user_message: "rust cargo build error".into(),
@@ -1920,6 +2054,8 @@ mod tests {
             top_k: 5,
             session_id: None,
             tenant: String::new(),
+            namespace: String::new(),
+            namespace_key: String::new(),
             tier_filter: None,
             token_budget: 1024,
             aggregate: false,
@@ -2310,6 +2446,8 @@ mod tests {
             id: "ix-pii".into(),
             session_id: "sess-1".into(),
             tenant: String::new(),
+            namespace: String::new(),
+            namespace_key: String::new(),
             turns: vec![Turn {
                 turn_idx: 0,
                 user_message: "my phone is 13912345678 call me".into(),
@@ -2335,6 +2473,8 @@ mod tests {
             id: "ix-raw".into(),
             session_id: "sess-1".into(),
             tenant: String::new(),
+            namespace: String::new(),
+            namespace_key: String::new(),
             turns: vec![Turn {
                 turn_idx: 0,
                 user_message: "my phone is 13912345678 call me".into(),

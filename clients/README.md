@@ -40,12 +40,19 @@ cp target/debug/libfusion_memory.dylib /path/to/fusion_memory.so
 wire 契约（JSON-RPC 2.0 envelope）：
 
 ```
-POST /v1/memory/commit     {"jsonrpc":"2.0","method":"commit","params":{"session_id","interaction"},"id":1}
+POST /v1/memory/commit     {"jsonrpc":"2.0","method":"commit","params":{"session_id","interaction","namespace?","namespace_key?"},"id":1}
   → {"result":["<turn_id1>","<turn_id2>"]}
-POST /v1/memory/retrieve   {"method":"retrieve","params":{"text","top_k","token_budget","aggregate"},"id":2}
+POST /v1/memory/retrieve   {"method":"retrieve","params":{"text","top_k","token_budget","aggregate","namespace?","namespace_key?"},"id":2}
   → {"result":{"blocks":[{interaction_id,turns,memory_type,turns_text,score,source_entities}],"total_tokens":N}}
-POST /v1/memory/consolidate {"method":"consolidate","params":{},"id":3}
+POST /v1/memory/consolidate {"method":"consolidate","params":{"namespace?","namespace_key?"},"id":3}
   → {"result":{"dropped","promoted","merged","summarized","reextracted","reconciled"}}
+```
+
+v1.4.0 (issue #21) namespace 说明：`namespace` ∈ `user` / `project` / `local` / 空（空 = 不过滤，旧行为）。
+`namespace_key` 为路径/机器 id/用户 id。可见域叠加：`project` 见本 key ∪ `user`；`local` 仅见本 key；`user` 仅见 user。
+未知 namespace → `-32602`。commit 显式 `namespace` 参数覆盖 `interaction.namespace`。
+
+```
 POST /v1/memory/audit      {"method":"audit","params":{"entity_ids":["..."]},"id":6}
   → {"result":[MemoryItem,...]}
 POST /v1/memory/delete     {"method":"delete","params":{"id","confirm":true},"id":5}  # confirm 必填 (B5)

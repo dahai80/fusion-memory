@@ -65,6 +65,8 @@ fn episodic_interaction(sess: &str, n: u32) -> Interaction {
         id: format!("ix-{sess}"),
         session_id: sess.into(),
         tenant: String::new(),
+        namespace: String::new(),
+        namespace_key: String::new(),
         turns: t,
         timestamp: 1000,
         metadata: serde_json::json!({}),

@@ -487,6 +487,8 @@ mod tests {
             id: ix.into(),
             session_id: "s".into(),
             tenant: String::new(),
+            namespace: String::new(),
+            namespace_key: String::new(),
             turns: vec![Turn {
                 turn_idx: 0,
                 user_message: "hello rust".into(),
@@ -542,6 +544,8 @@ mod tests {
                 id: format!("ix-bulk-{i}"),
                 session_id: "bulk".into(),
                 tenant: String::new(),
+                namespace: String::new(),
+                namespace_key: String::new(),
                 turns: vec![
                     Turn {
                         turn_idx: 0,
@@ -945,6 +949,8 @@ mod tests {
                 id: "ix-dst".into(),
                 session_id: "s".into(),
                 tenant: String::new(),
+                namespace: String::new(),
+                namespace_key: String::new(),
                 turns: vec![Turn {
                     turn_idx: 0,
                     user_message: "dst only content".into(),
