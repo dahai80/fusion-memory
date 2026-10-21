@@ -131,7 +131,8 @@ impl PyEngine {
     }
 
     /// 检索记忆上下文，返回 dict（FormattedContext）。
-    #[pyo3(signature = (text, top_k=10, token_budget=4096, aggregate=true))]
+    #[pyo3(signature = (text, top_k=10, token_budget=4096, aggregate=true, namespace="", namespace_key=""))]
+    #[allow(clippy::too_many_arguments)]
     fn retrieve_context(
         &self,
         py: Python<'_>,
@@ -139,11 +140,20 @@ impl PyEngine {
         top_k: usize,
         token_budget: usize,
         aggregate: bool,
+        namespace: &str,
+        namespace_key: &str,
     ) -> PyResult<PyObject> {
+        if !fm_core::namespace::is_valid_namespace(namespace) {
+            return Err(perr(format!(
+                "invalid namespace: {namespace} (expect user|project|local|empty)"
+            )));
+        }
         let q = RetrieveQuery {
             text: text.to_string(),
             top_k,
             session_id: None,
+            namespace: namespace.to_string(),
+            namespace_key: namespace_key.to_string(),
             tier_filter: None,
             token_budget,
             aggregate,
@@ -234,6 +244,8 @@ mod tests {
             text: "x".into(),
             top_k: 5,
             session_id: None,
+            namespace: String::new(),
+            namespace_key: String::new(),
             tier_filter: None,
             token_budget: 100,
             aggregate: false,

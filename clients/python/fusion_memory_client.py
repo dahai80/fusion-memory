@@ -52,9 +52,20 @@ class FusionMemoryClient:
             raise RuntimeError(f"fusion-memory {method} RPC {err['code']}: {err['message']}")
         return data.get("result")
 
-    async def commit_episodic_memory(self, session_id: str, interaction: dict[str, Any]) -> list[str]:
+    async def commit_episodic_memory(
+        self,
+        session_id: str,
+        interaction: dict[str, Any],
+        namespace: str = "",
+        namespace_key: str = "",
+    ) -> list[str]:
         """写入 Interaction, 返回 turn 级 memory_id 列表。"""
-        return await self._rpc("commit", {"session_id": session_id, "interaction": interaction})
+        params: dict[str, Any] = {"session_id": session_id, "interaction": interaction}
+        if namespace:
+            params["namespace"] = namespace
+        if namespace_key:
+            params["namespace_key"] = namespace_key
+        return await self._rpc("commit", params)
 
     async def retrieve_context(
         self,
@@ -62,16 +73,32 @@ class FusionMemoryClient:
         top_k: int = 10,
         token_budget: int = 4096,
         aggregate: bool = True,
+        namespace: str = "",
+        namespace_key: str = "",
     ) -> dict[str, Any]:
         """检索记忆上下文, 返回 {blocks, total_tokens}。"""
-        return await self._rpc(
-            "retrieve",
-            {"text": text, "top_k": top_k, "token_budget": token_budget, "aggregate": aggregate},
-        )
+        params: dict[str, Any] = {
+            "text": text,
+            "top_k": top_k,
+            "token_budget": token_budget,
+            "aggregate": aggregate,
+        }
+        if namespace:
+            params["namespace"] = namespace
+        if namespace_key:
+            params["namespace_key"] = namespace_key
+        return await self._rpc("retrieve", params)
 
-    async def consolidate_memories(self) -> dict[str, Any]:
+    async def consolidate_memories(
+        self, namespace: str = "", namespace_key: str = ""
+    ) -> dict[str, Any]:
         """触发遗忘/合并 saga, 返回报告。"""
-        return await self._rpc("consolidate", {})
+        params: dict[str, Any] = {}
+        if namespace:
+            params["namespace"] = namespace
+        if namespace_key:
+            params["namespace_key"] = namespace_key
+        return await self._rpc("consolidate", params)
 
     async def get_memory(self, memory_id: str) -> dict[str, Any] | None:
         """按 id 取记忆 (miss → None)。"""

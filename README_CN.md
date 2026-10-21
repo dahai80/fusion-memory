@@ -2,7 +2,7 @@
 
 > **[English](README.md)** | 中文
 
-> **当前版本：v1.3.0（Commercial GA）** — fusion-identity 集成落地（issue #18）：fm-server 边界强制校验调用方 JWT、tid↔tenant 匹配、多租户模式下空租户拒绝。v1.2.0 多租户隔离落地（issue #16）。已知限制见 `CHANGELOG.md` "Known limitations"，非阻塞。
+> **当前版本：v1.4.0** — 作用域记忆命名空间落地（issue #21）：commit / retrieve / consolidate 支持 `user` / `project` / `local` 可见域（与 tenant 正交，纯加法式）。v1.3.0 fusion-identity 集成（issue #18）、v1.2.0 多租户隔离（issue #16）此前已落地。已知限制见 `CHANGELOG.md` "Known limitations"，非阻塞。
 
 Fusion 生态（"一核九端"）系统级长/短期记忆与认知图谱中枢。解决 Agent 跨 session 状态断层、重复提问、context window 爆炸，目标：越用越懂用户。
 
@@ -40,6 +40,15 @@ Fusion 生态（"一核九端"）系统级长/短期记忆与认知图谱中枢�
 - **HTTP 边界**（`fm-server/src/http.rs`）：多租户模式下跳过 `check_bearer`（静态 api_key）——Bearer 即 JWT（由 identity 校验）。`handle_rpc` + `get_memory` 在租户提取后调 `enforce_multi_tenant`。
 - **测试数**：默认特性 433→452（+19 identity 测试：4 config + 7 http + 8 identity 单元/e2e）；`--features fm-store/store-fusion` 439→458。门禁全绿（fmt / clippy -D warnings / check / test）。12 crate 版本 1.2.0→1.3.0（加法式，无破坏性变更）。
 - **上游**：fusion-identity 消费（不修改）——唯一 JWT 签发方 + 租户注册表。fm-server 调 `POST /api/v1/auth/verify`（service-token 守卫）+ `POST /api/v1/tenants/{tenant_id}/usage`（best-effort）。三条红线遵守：fail-closed、跨租户拒绝、数据隔离分层。
+
+**作用域记忆命名空间落地（2026-10-21，issue #21）**：与 tenant 正交的第二维可见域 —— `namespace`（`user` / `project` / `local` / 空）+ `namespace_key`（项目路径 / 机器 id / 用户 id）。纯加法式：空 namespace = 全局（旧行为），全部字段 `#[serde(default)]`，旧 JSON 与 WOP 负载重放不受影响。
+- **数据结构**（`fm-core`）：`MemoryItem` / `Interaction` / `RetrieveQuery` 增加 `namespace` + `namespace_key`；`MemoryItem::with_namespace` 构建器保持原 8 参数骨架签名不变。
+- **叠加规则**：`project` 见本 key ∪ `user`；`local` 仅见本 key；`user` 仅见 user；空 = 不过滤。未知值 fail-closed（RPC `-32602`），不静默放宽读取。
+- **Schema v4**（`fm-persist`）：`namespace` / `namespace_key` 列 + `idx_memory_namespace` 索引；v3→v4 幂等 `ALTER`；迁移顺序修正（建表 → ALTER → 索引 DDL）。
+- **引擎**（`fm-engine`）：commit 将 namespace 落到每个 turn 记忆；retrieve 在 KNN 命中回填时用 SQL 谓词过滤，激活过滤时超采样 `top_k × 4`（store trait 无元数据过滤）；`consolidate_memories_scoped()` 仅处理可见域内的回收/晋升/合并/摘要/对账，且**不推进**全局 consolidate 水位 —— 作用域补跑不得吞掉其他 namespace 的待处理变更。
+- **RPC**（`fm-server`）：`commit`、`retrieve`、`memory.retrieve_context`、`consolidate` 增加可选 `namespace` / `namespace_key`（`{}` / null 仍合法）；commit 显式参数覆盖 interaction 内值。参数名用 `namespace` 以免与既有 `delete_scope` / `count` 的 `scope`（session_id 语义）混淆。
+- **测试数**：默认特性 452→468（+16 namespace 测试：过滤器单元 / persist 作用域查询 + v3→v4 迁移 / 引擎叠层 + 水位 / jsonrpc 透传 + 校验 / HTTP 端到端隔离）。门禁全绿。12 crate 版本 1.3.0→1.4.0（加法式，SemVer MINOR）。
+- **消费端**（不在本仓）：fusion-agent-studio#434 —— subagent `memory:` 字段、项目根 key 派生、按 subagent 开关。线协议见 `clients/README.md`。
 
 **M2 已完成**：真实 bge-m3 embedding（dim=1024）+ 实体抽取（防注入 prompt + 严格 JSON 解析）+ SQLite 递归 CTE 图遍历 + 规则优先实体对齐 + 融合评分（cosine+衰减+graph_affinity）+ agent-studio 历史记忆导入。验收：实体抽取 JSON 解析成功率 100%（>90%），规则优先对齐正确（同名同 type 合并 / 同名异 type 不合并），真实 embedding 往返 dim=1024。测试覆盖率 lines 90.59% / regions 92.17%。162 测试全绿，clippy -D warnings 通过。
 

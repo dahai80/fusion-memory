@@ -15,6 +15,12 @@ pub struct RetrieveQuery {
     /// #16 多租户: 检索作用域租户。空 = 默认租户 (单租户向后兼容)。
     #[serde(default)]
     pub tenant: String,
+    /// issue #21: 检索作用域命名空间 (user/project/local), 空 = 不过滤 (旧行为)。
+    #[serde(default)]
+    pub namespace: String,
+    /// issue #21: 命名空间键。
+    #[serde(default)]
+    pub namespace_key: String,
     pub tier_filter: Option<Vec<MemoryTier>>,
     /// 压缩目标 token 数（Qwen tokenizer 实算，C4 修正）。
     pub token_budget: usize,
@@ -29,6 +35,8 @@ impl RetrieveQuery {
             top_k,
             session_id: None,
             tenant: String::new(),
+            namespace: String::new(),
+            namespace_key: String::new(),
             tier_filter: None,
             token_budget,
             aggregate: true,

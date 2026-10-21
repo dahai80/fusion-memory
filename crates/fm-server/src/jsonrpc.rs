@@ -159,7 +159,7 @@ pub async fn dispatch(req: RpcRequest, engine: &EngineHandle, tenant: &str) -> R
         "retrieve" => retrieve(params, engine, tenant).await,
         // issue #1/#4: fusion-event 契约别名 (text-in, fused shape out)。
         "memory.retrieve_context" => retrieve_context_contract(params, engine, tenant).await,
-        "consolidate" => consolidate(engine).await,
+        "consolidate" => consolidate(params, engine).await,
         "get" => get(params, engine, tenant).await,
         "delete" => delete(params, engine, tenant).await,
         // issue #2: fusion-agent-studio adapter 契约 (scope 批量删 + 计数)。
@@ -222,11 +222,27 @@ pub fn http_status_for_error(code: i64) -> StatusCode {
     }
 }
 
+/// issue #21: namespace 参数校验 (user/project/local/空)。非法值 invalid_params, 不静默降级。
+fn validate_namespace(ns: &str) -> Result<(), RpcError> {
+    if fm_core::namespace::is_valid_namespace(ns) {
+        Ok(())
+    } else {
+        Err(RpcError::invalid_params(format!(
+            "namespace must be one of user|project|local|\"\", got {ns:?}"
+        )))
+    }
+}
+
 /// commit params。
 #[derive(Debug, Deserialize)]
 struct CommitParams {
     session_id: String,
     interaction: Interaction,
+    /// issue #21: 显式作用域命名空间 (优先于 interaction 内值)。
+    #[serde(default)]
+    namespace: Option<String>,
+    #[serde(default)]
+    namespace_key: Option<String>,
 }
 
 async fn commit(params: Value, engine: &EngineHandle, tenant: &str) -> Result<Value, RpcError> {
@@ -236,6 +252,15 @@ async fn commit(params: Value, engine: &EngineHandle, tenant: &str) -> Result<Va
     // 空 tenant = 默认租户 (单租户向后兼容)。
     if !tenant.is_empty() {
         p.interaction.tenant = tenant.to_string();
+    }
+    // #21: 显式 namespace 参数覆盖 interaction 内值 (与服务端权威参数模式一致)。
+    if let Some(ns) = p.namespace.as_deref() {
+        validate_namespace(ns)?;
+        p.interaction.namespace = ns.to_string();
+    }
+    validate_namespace(&p.interaction.namespace)?;
+    if let Some(key) = p.namespace_key {
+        p.interaction.namespace_key = key;
     }
     // P1-1: 返回详细结果 (memory_ids + failed_turns), 客户端可感知失败 turn 并重试。
     // 旧契约 result: ["id1","id2"] (纯数组) → 改 result: {"memory_ids":[...],"failed_turns":[...]}。
@@ -259,6 +284,11 @@ struct RetrieveParams {
     aggregate: bool,
     #[serde(default)]
     session_id: Option<String>,
+    /// issue #21: 检索作用域命名空间 (user/project/local), 空 = 不过滤。
+    #[serde(default)]
+    namespace: Option<String>,
+    #[serde(default)]
+    namespace_key: Option<String>,
 }
 
 fn default_top_k() -> usize {
@@ -274,12 +304,16 @@ fn default_true() -> bool {
 async fn retrieve(params: Value, engine: &EngineHandle, tenant: &str) -> Result<Value, RpcError> {
     let p: RetrieveParams =
         serde_json::from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+    let namespace = p.namespace.unwrap_or_default();
+    validate_namespace(&namespace)?;
     let q = RetrieveQuery {
         text: p.text,
         top_k: p.top_k,
         session_id: p.session_id,
-        // #16: 权威租户作用域检索。
+        // #16: 权威租户作用域检索。 #21: namespace 作用域过滤。
         tenant: tenant.to_string(),
+        namespace,
+        namespace_key: p.namespace_key.unwrap_or_default(),
         tier_filter: None,
         token_budget: p.token_budget,
         aggregate: p.aggregate,
@@ -291,11 +325,35 @@ async fn retrieve(params: Value, engine: &EngineHandle, tenant: &str) -> Result<
     serde_json::to_value(ctx).map_err(|e| RpcError::internal(e.to_string()))
 }
 
-async fn consolidate(engine: &EngineHandle) -> Result<Value, RpcError> {
-    let report: ConsolidationReport = engine
-        .consolidate_memories()
-        .await
-        .map_err(|e| RpcError::from_engine(&e))?;
+/// consolidate params (issue #21: 可选 namespace 作用域调度)。
+#[derive(Debug, Default, Deserialize)]
+struct ConsolidateParams {
+    #[serde(default)]
+    namespace: Option<String>,
+    #[serde(default)]
+    namespace_key: Option<String>,
+}
+
+async fn consolidate(params: Value, engine: &EngineHandle) -> Result<Value, RpcError> {
+    // params 可为 null/空对象 (旧调用方), serde 默认字段全空 → 全局调度。
+    let p: ConsolidateParams = if params.is_null() {
+        ConsolidateParams::default()
+    } else {
+        serde_json::from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?
+    };
+    let namespace = p.namespace.unwrap_or_default();
+    validate_namespace(&namespace)?;
+    let report: ConsolidationReport = if namespace.is_empty() {
+        engine
+            .consolidate_memories()
+            .await
+            .map_err(|e| RpcError::from_engine(&e))?
+    } else {
+        engine
+            .consolidate_memories_scoped(&namespace, p.namespace_key.as_deref().unwrap_or(""))
+            .await
+            .map_err(|e| RpcError::from_engine(&e))?
+    };
     serde_json::to_value(report).map_err(|e| RpcError::internal(e.to_string()))
 }
 
@@ -416,6 +474,11 @@ struct RetrieveContextContractParams {
     top_k: usize,
     #[serde(default)]
     node_id: String,
+    /// issue #21: 可选作用域过滤 (加法式, 旧调用方不传 = 不过滤)。
+    #[serde(default)]
+    namespace: Option<String>,
+    #[serde(default)]
+    namespace_key: Option<String>,
 }
 
 /// 契约返回: {context, memory_ids, cache_hit}。context = block turns_text 拼接;
@@ -428,12 +491,16 @@ async fn retrieve_context_contract(
     let p: RetrieveContextContractParams =
         serde_json::from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
     debug!(trigger = %p.trigger_id, node = %p.node_id, "memory.retrieve_context contract");
+    let namespace = p.namespace.unwrap_or_default();
+    validate_namespace(&namespace)?;
     let q = RetrieveQuery {
         text: p.query,
         top_k: p.top_k,
         session_id: None,
-        // #16: 权威租户作用域检索。
+        // #16: 权威租户作用域检索。 #21: namespace 作用域过滤。
         tenant: tenant.to_string(),
+        namespace,
+        namespace_key: p.namespace_key.unwrap_or_default(),
         tier_filter: None,
         token_budget: default_budget(),
         aggregate: true,
@@ -554,6 +621,7 @@ mod tests {
 
     struct DispatchStub {
         committed: Arc<Mutex<Vec<String>>>,
+        queries: Arc<Mutex<Vec<RetrieveQuery>>>,
     }
     #[async_trait::async_trait]
     impl fm_core::FusionMemoryEngine for DispatchStub {
@@ -575,6 +643,7 @@ mod tests {
             &self,
             _q: &RetrieveQuery,
         ) -> fm_core::MemoryResult<FormattedContext> {
+            self.queries.lock().await.push(_q.clone());
             Ok(FormattedContext {
                 blocks: vec![],
                 total_tokens: 7,
@@ -626,12 +695,25 @@ mod tests {
     }
 
     fn stub_handle() -> (EngineHandle, Arc<Mutex<Vec<String>>>) {
+        let (eng, committed, _) = stub_handle_q();
+        (eng, committed)
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn stub_handle_q() -> (
+        EngineHandle,
+        Arc<Mutex<Vec<String>>>,
+        Arc<Mutex<Vec<RetrieveQuery>>>,
+    ) {
         let committed = Arc::new(Mutex::new(vec![]));
+        let queries = Arc::new(Mutex::new(vec![]));
         (
             EngineHandle::from_concrete(DispatchStub {
                 committed: committed.clone(),
+                queries: queries.clone(),
             }),
             committed,
+            queries,
         )
     }
 
@@ -698,6 +780,70 @@ mod tests {
         let v = dispatch_ok(&rpc("consolidate", serde_json::json!({}), 4), &eng).await;
         let report: ConsolidationReport = serde_json::from_value(v).unwrap();
         assert_eq!(report.dropped, 1);
+    }
+
+    // #21: namespace 参数透传到 RetrieveQuery; 非法值 -32602。
+    #[tokio::test]
+    async fn dispatch_retrieve_namespace_passthrough() {
+        let (eng, _, queries) = stub_handle_q();
+        dispatch_ok(
+            &rpc(
+                "retrieve",
+                serde_json::json!({"text":"hi","namespace":"project","namespace_key":"/p"}),
+                30,
+            ),
+            &eng,
+        )
+        .await;
+        let qs = queries.lock().await;
+        assert_eq!(qs.last().unwrap().namespace, "project");
+        assert_eq!(qs.last().unwrap().namespace_key, "/p");
+    }
+
+    #[tokio::test]
+    async fn dispatch_invalid_namespace_rejected() {
+        let (eng, _) = stub_handle();
+        let ix = serde_json::json!({
+            "id":"ix1","session_id":"s","turns":[],"timestamp":1,"metadata":{}
+        });
+        for (method, params) in [
+            (
+                "retrieve",
+                serde_json::json!({"text":"hi","namespace":"bogus"}),
+            ),
+            (
+                "commit",
+                serde_json::json!({"session_id":"s","interaction":ix,"namespace":"bogus"}),
+            ),
+            ("consolidate", serde_json::json!({"namespace":"bogus"})),
+            (
+                "memory.retrieve_context",
+                serde_json::json!({"query":"q","namespace":"bogus"}),
+            ),
+        ] {
+            let e = dispatch_err(&rpc(method, params, 31), &eng).await;
+            assert_eq!(e.code, -32602, "method={method} msg={}", e.message);
+        }
+    }
+
+    // #21: commit 显式 namespace 参数覆盖 interaction 内值 (服务端权威参数模式)。
+    #[tokio::test]
+    async fn dispatch_commit_namespace_override() {
+        let (eng, committed) = stub_handle();
+        let ix = serde_json::json!({
+            "id":"ix-ns","session_id":"s","namespace":"user","namespace_key":"u1",
+            "turns":[],"timestamp":1,"metadata":{}
+        });
+        dispatch_ok(
+            &rpc(
+                "commit",
+                serde_json::json!({"session_id":"s","interaction":ix,"namespace":"project","namespace_key":"p1"}),
+                32,
+            ),
+            &eng,
+        )
+        .await;
+        assert!(committed.lock().await.contains(&"ix-ns".to_string()));
     }
 
     #[tokio::test]

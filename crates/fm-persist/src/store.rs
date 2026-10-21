@@ -11,7 +11,9 @@ use tracing::{debug, info, warn};
 
 use crate::error::{PersistError, PersistResult};
 use crate::schema;
-use fm_core::{ConsolidationReport, EntityNode, MemoryItem, MemoryTier, MemoryType};
+use fm_core::{
+    ConsolidationReport, EntityNode, MemoryItem, MemoryTier, MemoryType, NamespaceFilter,
+};
 
 // P4: 递归 CTE 结果集扇出上限 (graph_affinity 远端节点贡献 0.5^h 指数衰减, 截断无损精度)。
 const N_HOP_RESULT_LIMIT: i64 = 256;
@@ -148,6 +150,8 @@ impl Persist {
                 item.tombstone as i64,
                 item.entities_pending as i64,
                 enc_entities,
+                item.namespace,
+                item.namespace_key,
             ],
         )?;
         for e in &item.entities {
@@ -206,6 +210,8 @@ impl Persist {
                 item.tombstone as i64,
                 item.entities_pending as i64,
                 enc_entities,
+                item.namespace,
+                item.namespace_key,
             ],
         )?;
         for e in &item.entities {
@@ -275,11 +281,30 @@ impl Persist {
     /// #16: 按 tenant 列全量活记忆 (consolidate 多租户作用域扫描)。
     /// tenant="" 即默认租户, 语义与 list_all() 等价 (旧库迁移后 tenant 列全 '')。
     pub fn list_all_by_tenant(&self, tenant: &str) -> PersistResult<Vec<MemoryItem>> {
+        self.list_all_by_tenant_scoped(tenant, &NamespaceFilter::default())
+    }
+
+    /// issue #21: 按 tenant + namespace 可见域列全部活跃记忆 (project 叠 user)。
+    /// namespace 空 = 旧行为 (该租户全量)。
+    pub fn list_all_by_tenant_scoped(
+        &self,
+        tenant: &str,
+        ns: &NamespaceFilter,
+    ) -> PersistResult<Vec<MemoryItem>> {
         let conn = self.conn()?;
-        let mut stmt = conn.prepare(
-            "SELECT * FROM memory_item WHERE tombstone=0 AND tenant=?1 ORDER BY created_timestamp ASC",
-        )?;
-        let rows = stmt.query_map(params![tenant], |r| row_to_memory(r, self.cipher.as_ref()))?;
+        let (pred, ns_params) = ns_predicate(ns, 2)?;
+        let sql = format!(
+            "SELECT * FROM memory_item WHERE tombstone=0 AND tenant=?1{pred} ORDER BY created_timestamp ASC"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let mut bound: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(tenant.to_string())];
+        bound.extend(
+            ns_params
+                .into_iter()
+                .map(|s| Box::new(s) as Box<dyn rusqlite::ToSql>),
+        );
+        let refs: Vec<&dyn rusqlite::ToSql> = bound.iter().map(|p| p.as_ref()).collect();
+        let rows = stmt.query_map(refs.as_slice(), |r| row_to_memory(r, self.cipher.as_ref()))?;
         let mut out = Vec::new();
         for r in rows {
             out.push(r?);
@@ -323,19 +348,30 @@ impl Persist {
         vec_refs: &[u64],
         tenant: &str,
     ) -> PersistResult<Vec<MemoryItem>> {
+        self.get_by_vector_refs_tenant_scoped(vec_refs, tenant, &NamespaceFilter::default())
+    }
+
+    /// issue #21: tenant + namespace 可见域定向查 (retrieve_context KNN 命中回填)。
+    pub fn get_by_vector_refs_tenant_scoped(
+        &self,
+        vec_refs: &[u64],
+        tenant: &str,
+        ns: &NamespaceFilter,
+    ) -> PersistResult<Vec<MemoryItem>> {
         if vec_refs.is_empty() {
             return Ok(Vec::new());
         }
         let conn = self.conn()?;
         let refs_str: Vec<String> = vec_refs.iter().map(|v| v.to_string()).collect();
-        // 占位: ?1..?n 为 vec_refs, ?(n+1) 为 tenant。
+        // 占位: ?1..?n 为 vec_refs, ?(n+1) 为 tenant, 其后为 namespace 过滤键。
         let placeholders = (0..refs_str.len())
             .map(|i| format!("?{}", i + 1))
             .collect::<Vec<_>>()
             .join(",");
         let tenant_pos = refs_str.len() + 1;
+        let (pred, ns_params) = ns_predicate(ns, tenant_pos + 1)?;
         let sql = format!(
-            "SELECT * FROM memory_item WHERE tombstone=0 AND tenant=?{tenant_pos} AND vector_ref IN ({placeholders})"
+            "SELECT * FROM memory_item WHERE tombstone=0 AND tenant=?{tenant_pos}{pred} AND vector_ref IN ({placeholders})"
         );
         let mut stmt = conn.prepare(&sql)?;
         let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = refs_str
@@ -343,6 +379,11 @@ impl Persist {
             .map(|s| Box::new(s.clone()) as Box<dyn rusqlite::ToSql>)
             .collect();
         params_vec.push(Box::new(tenant.to_string()));
+        params_vec.extend(
+            ns_params
+                .into_iter()
+                .map(|s| Box::new(s) as Box<dyn rusqlite::ToSql>),
+        );
         let params_refs: Vec<&dyn rusqlite::ToSql> =
             params_vec.iter().map(|p| p.as_ref()).collect();
         let rows = stmt.query_map(params_refs.as_slice(), |r| {
@@ -833,15 +874,31 @@ ORDER BY first_hop ASC LIMIT ?3";
 
     /// 增量变更集: last_accessed 或 created > since 的非 tombstone 记忆。B4。
     pub fn list_changed_since(&self, since: u64) -> PersistResult<Vec<MemoryItem>> {
+        self.list_changed_since_scoped(since, &NamespaceFilter::default())
+    }
+
+    /// issue #21: 增量变更集 + namespace 可见域过滤 (作用域 consolidate 用)。
+    pub fn list_changed_since_scoped(
+        &self,
+        since: u64,
+        ns: &NamespaceFilter,
+    ) -> PersistResult<Vec<MemoryItem>> {
         let conn = self.conn()?;
-        let mut stmt = conn.prepare(
+        let (pred, ns_params) = ns_predicate(ns, 2)?;
+        let sql = format!(
             "SELECT * FROM memory_item WHERE tombstone=0 \
-             AND (last_accessed_timestamp > ?1 OR created_timestamp > ?1) \
-             ORDER BY created_timestamp ASC",
-        )?;
-        let rows = stmt.query_map(params![since as i64], |r| {
-            row_to_memory(r, self.cipher.as_ref())
-        })?;
+             AND (last_accessed_timestamp > ?1 OR created_timestamp > ?1){pred} \
+             ORDER BY created_timestamp ASC"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let mut bound: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(since as i64)];
+        bound.extend(
+            ns_params
+                .into_iter()
+                .map(|s| Box::new(s) as Box<dyn rusqlite::ToSql>),
+        );
+        let refs: Vec<&dyn rusqlite::ToSql> = bound.iter().map(|p| p.as_ref()).collect();
+        let rows = stmt.query_map(refs.as_slice(), |r| row_to_memory(r, self.cipher.as_ref()))?;
         let mut out = Vec::new();
         for r in rows {
             out.push(r?);
@@ -1008,6 +1065,52 @@ const _: () = {
     // 占位：保证 entities_json 列名常量可见（避免未来误删）
 };
 
+/// issue #21: namespace 可见域 SQL 谓词。`base` = 下一个可用占位符编号。
+/// 返回 (追加到 WHERE 后的谓词, 需绑定在其前参数之后的键值)。空 namespace = 无谓词 (旧行为)。
+/// 未知 namespace 值 fail-closed 报错, 不静默放行 (防越权读其他作用域)。
+fn ns_predicate(ns: &NamespaceFilter, base: usize) -> PersistResult<(String, Vec<String>)> {
+    use fm_core::namespace::{is_valid_namespace, NS_LOCAL, NS_PROJECT, NS_USER};
+    if !ns.is_active() {
+        return Ok((String::new(), Vec::new()));
+    }
+    if !is_valid_namespace(&ns.namespace) {
+        return Err(PersistError::Namespace(ns.namespace.clone()));
+    }
+    let key_placeholder = format!("?{base}");
+    let mut key_params: Vec<String> = Vec::new();
+    let pred = match ns.namespace.as_str() {
+        NS_USER => {
+            if ns.key.is_empty() {
+                " AND namespace='user'".to_string()
+            } else {
+                key_params.push(ns.key.clone());
+                format!(" AND namespace='user' AND namespace_key={key_placeholder}")
+            }
+        }
+        NS_PROJECT => {
+            if ns.key.is_empty() {
+                " AND (namespace='project' OR namespace='user')".to_string()
+            } else {
+                key_params.push(ns.key.clone());
+                format!(
+                    " AND ((namespace='project' AND namespace_key={key_placeholder}) OR namespace='user')"
+                )
+            }
+        }
+        NS_LOCAL => {
+            if ns.key.is_empty() {
+                " AND namespace='local'".to_string()
+            } else {
+                key_params.push(ns.key.clone());
+                format!(" AND namespace='local' AND namespace_key={key_placeholder}")
+            }
+        }
+        // is_valid_namespace 已挡, 此处不可达; 保守 fail-closed。
+        _ => return Err(PersistError::Namespace(ns.namespace.clone())),
+    };
+    Ok((pred, key_params))
+}
+
 fn row_to_memory(
     row: &rusqlite::Row,
     cipher: Option<&crate::crypto::Cipher>,
@@ -1059,6 +1162,8 @@ fn row_to_memory(
         turn_idx: row.get::<_, i64>("turn_idx")? as u32,
         session_id: row.get("session_id")?,
         tenant: row.get("tenant").unwrap_or_default(),
+        namespace: row.get("namespace").unwrap_or_default(),
+        namespace_key: row.get("namespace_key").unwrap_or_default(),
         memory_type,
         tier,
         content: crate::crypto::decrypt_field(cipher, &row.get::<_, String>("content")?),
@@ -1471,6 +1576,123 @@ mod tests {
         // 再 migrate 一次应 no-op (from >= to 早返)
         schema::migrate(&c).unwrap();
         assert_eq!(schema::user_version(&c).unwrap(), schema::SCHEMA_VERSION);
+    }
+
+    // #21: v4 加 namespace/namespace_key 列; v3 旧库 migrate 补列 (DROP COLUMN 模拟旧库)。
+    #[test]
+    fn schema_v4_namespace_migration() {
+        let p = Persist::open_in_memory().unwrap();
+        {
+            let c = p.conn().unwrap();
+            let cols: Vec<String> = {
+                let mut stmt = c
+                    .prepare("SELECT name FROM pragma_table_info('memory_item')")
+                    .unwrap();
+                let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
+                rows.map(|r| r.unwrap()).collect()
+            };
+            assert!(cols.contains(&"namespace".to_string()), "cols={cols:?}");
+            assert!(cols.contains(&"namespace_key".to_string()), "cols={cols:?}");
+        }
+        // 模拟 v3 旧库: 删列 + 回退版本号 → migrate 补列。
+        {
+            let c = p.conn().unwrap();
+            c.execute_batch("DROP INDEX IF EXISTS idx_memory_namespace")
+                .unwrap();
+            c.execute_batch("ALTER TABLE memory_item DROP COLUMN namespace_key")
+                .unwrap();
+            c.execute_batch("ALTER TABLE memory_item DROP COLUMN namespace")
+                .unwrap();
+            c.execute_batch("PRAGMA user_version=3").unwrap();
+            schema::migrate(&c).unwrap();
+            assert_eq!(schema::user_version(&c).unwrap(), 4);
+            let n: i64 = c
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('memory_item') WHERE name IN ('namespace','namespace_key')",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 2);
+        }
+    }
+
+    fn ns_item(id: &str, vec: u64, ns: &str, key: &str) -> MemoryItem {
+        let mut m = sample_item(id, &format!("ix-{id}"), 0);
+        m.vector_ref = vec.to_string();
+        m.namespace = ns.into();
+        m.namespace_key = key.into();
+        m
+    }
+
+    // #21: project 作用域叠 user, 不越界读 local/其他 project/全局。
+    #[test]
+    fn scoped_vector_lookup_stacks_project_user() {
+        let p = Persist::open_in_memory().unwrap();
+        p.put_memory(&ns_item("u", 1, "user", "u1")).unwrap();
+        p.put_memory(&ns_item("p1", 2, "project", "p1")).unwrap();
+        p.put_memory(&ns_item("p2", 3, "project", "p2")).unwrap();
+        p.put_memory(&ns_item("l", 4, "local", "m1")).unwrap();
+        p.put_memory(&ns_item("g", 5, "", "")).unwrap();
+        let all = [1u64, 2, 3, 4, 5];
+        let ids = |v: Vec<MemoryItem>| {
+            let mut xs: Vec<String> = v.into_iter().map(|m| m.id).collect();
+            xs.sort();
+            xs
+        };
+        assert_eq!(
+            ids(p
+                .get_by_vector_refs_tenant_scoped(&all, "", &NamespaceFilter::new("project", "p1"))
+                .unwrap()),
+            vec!["p1".to_string(), "u".to_string()]
+        );
+        assert_eq!(
+            ids(p
+                .get_by_vector_refs_tenant_scoped(&all, "", &NamespaceFilter::new("local", "m1"))
+                .unwrap()),
+            vec!["l".to_string()]
+        );
+        assert_eq!(
+            ids(p
+                .get_by_vector_refs_tenant_scoped(&all, "", &NamespaceFilter::new("user", ""))
+                .unwrap()),
+            vec!["u".to_string()]
+        );
+        assert_eq!(
+            p.get_by_vector_refs_tenant_scoped(&all, "", &NamespaceFilter::default())
+                .unwrap()
+                .len(),
+            5
+        );
+    }
+
+    // #21: 增量变更集与全量列举同语义过滤 (作用域 consolidate 用)。
+    #[test]
+    fn scoped_list_filters_by_namespace() {
+        let p = Persist::open_in_memory().unwrap();
+        p.put_memory(&ns_item("u", 1, "user", "u1")).unwrap();
+        p.put_memory(&ns_item("p1", 2, "project", "p1")).unwrap();
+        p.put_memory(&ns_item("l", 4, "local", "m1")).unwrap();
+        let f = NamespaceFilter::new("project", "p1");
+        let changed = p.list_changed_since_scoped(0, &f).unwrap();
+        assert_eq!(changed.len(), 2, "changed={changed:?}");
+        let all = p.list_all_by_tenant_scoped("", &f).unwrap();
+        assert_eq!(all.len(), 2);
+        assert!(p
+            .list_all_by_tenant_scoped("", &NamespaceFilter::new("local", "m1"))
+            .unwrap()
+            .iter()
+            .all(|m| m.namespace == "local"));
+    }
+
+    // #21: 未知 namespace fail-closed。
+    #[test]
+    fn unknown_namespace_rejected() {
+        let p = Persist::open_in_memory().unwrap();
+        let err = p
+            .list_all_by_tenant_scoped("", &NamespaceFilter::new("bogus", "k"))
+            .unwrap_err();
+        assert!(matches!(err, crate::error::PersistError::Namespace(_)));
     }
 
     // §1.10: idx_memory_entity_eid 索引存在 (audit_by_entities 反查依赖)。

@@ -39,6 +39,8 @@ async fn seed(engine: &MemoryEngine) {
             id: format!("ix-{i}"),
             session_id: format!("sess-{i}"),
             tenant: String::new(),
+            namespace: String::new(),
+            namespace_key: String::new(),
             turns: (0..TURNS_PER_INTERACTION)
                 .map(|t| Turn {
                     turn_idx: t,

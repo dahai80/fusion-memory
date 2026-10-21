@@ -88,6 +88,8 @@ mod tests {
             id: "ix".into(),
             session_id: "s".into(),
             tenant: String::new(),
+            namespace: String::new(),
+            namespace_key: String::new(),
             turns: vec![],
             timestamp: 0,
             metadata: Default::default(),

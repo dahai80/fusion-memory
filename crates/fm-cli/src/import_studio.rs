@@ -277,6 +277,9 @@ pub async fn run_import(engine: &MemoryEngine, source_db: &str) -> Result<Import
             turn_idx: 0,
             session_id: "import-agent-studio".to_string(),
             tenant: String::new(),
+            // issue #21: Studio 旧库无 namespace 概念, 导入为全局 (空)。
+            namespace: String::new(),
+            namespace_key: String::new(),
             memory_type,
             tier,
             content: content.to_string(),

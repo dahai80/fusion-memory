@@ -5,6 +5,31 @@ Internal path-dep private ecosystem (not on crates.io); versions tag + GitHub re
 
 ## [Unreleased]
 
+## [1.4.0] — 2026-10-21
+
+Scoped memory namespaces (issue #21, consumer fusion-agent-studio#434). Adds a second, tenant-orthogonal visibility dimension `namespace` (`user` / `project` / `local` / empty) to commit, retrieve, and consolidation. Fully additive: empty namespace = old behavior (global), and all new fields are `#[serde(default)]` so old JSON / WOP payloads replay unchanged.
+
+### Added
+- **Namespace data fields** (`fm-core`): `MemoryItem.namespace` / `namespace_key`, `Interaction.namespace` / `namespace_key`, `RetrieveQuery.namespace` / `namespace_key` (all `#[serde(default)]`). `MemoryItem::with_namespace()` builder keeps the 8-arg `new_turn_skeleton` signature stable. New `fm_core::namespace` module: constants, `is_valid_namespace`, `NamespaceFilter` with in-memory `visible()` stacking rule.
+- **Visibility stacking**: `project` sees its own key ∪ `user`; `local` sees only its own key (no user stacking); `user` sees user items only; empty = no filter. Unknown namespace values are rejected fail-closed (`PersistError::Namespace` → `MemoryError::Unsupported`, RPC `-32602`) instead of silently reading everything.
+- **Schema v4** (`fm-persist`): `namespace TEXT NOT NULL DEFAULT ''` + `namespace_key TEXT NOT NULL DEFAULT ''` columns and `idx_memory_namespace(namespace, namespace_key, tombstone)`. Idempotent `ALTER TABLE` via `pragma_table_info`. `SCHEMA_VERSION` 3 → 4. Migration order fixed: main table first, then `ALTER`, then indexes (index DDL references the new columns).
+- **Scoped persist queries** (`fm-persist/src/store.rs`): `get_by_vector_refs_tenant_scoped`, `list_changed_since_scoped`, `list_all_by_tenant_scoped` plus `ns_predicate()` SQL builder (project stacking / local isolation / user key refinement). Original tenant-only methods kept intact and now delegate.
+- **Engine scoping** (`fm-engine`): commit stamps `interaction.namespace` onto every turn item; `retrieve_context` passes the filter into the KNN hit lookup and over-fetches `top_k × 4` when a namespace filter is active (store trait has no metadata filter, so post-KNN filtering would otherwise under-fill); `consolidate_memories_scoped()` limits recycle/promote/merge/summarize/reconcile to the visible domain and does **not** advance the global consolidation watermark (`consolidation_log` MAX(started_at)) — scoped runs are backfills and must not swallow other namespaces' pending changes. Summary items inherit the source session namespace.
+- **RPC surface** (`fm-server/src/jsonrpc.rs`): `namespace` / `namespace_key` params on `commit`, `retrieve`, `memory.retrieve_context`, and `consolidate` (params optional; `{}` / null still works). Explicit commit params override interaction values (same authoritative-parameter pattern as tenant). Named `namespace` to avoid colliding with the existing `delete_scope` / `count` `scope` (session_id) semantics.
+- **Clients**: Python and TypeScript reference clients gained optional namespace arguments; `fm-py` `retrieve_context` gained `namespace` / `namespace_key` kwargs with validation.
+- **Tests** (+10): namespace filter unit tests (stacking, fail-closed, validation), persist scoped-query tests + v3→v4 migration, engine stacking/watermark tests, jsonrpc passthrough/validation/override, and an HTTP end-to-end scoping test on the real server chain.
+
+### Changed
+- Version bump all 12 crates `1.3.0` → `1.4.0` (additive API; SemVer MINOR, not PATCH).
+- `migrate()` reordered: `CREATE TABLE` → `ALTER TABLE` → `ALL_DDL` (previously index DDL ran before column migration, which fails when the index references a column the old database lacks).
+
+### Test counts
+- Default features: 452 → 468 (+16 namespace tests).
+- Gates: fmt / clippy -D warnings / check / test all green.
+
+### Upstream status
+- Consumer-side implementation (subagent `memory:` field, project-root key derivation, per-subagent toggle) lives in **fusion-agent-studio#434**, out of this repo's scope. Wire contract documented in `clients/README.md`.
+
 ## [1.3.0] — 2026-09-03
 
 fusion-identity integration (issue #18). fm-server HTTP boundary enforces caller JWT verified by fusion-identity (`POST /api/v1/auth/verify`), tid↔tenant match, and rejects empty tenant in multi-tenant mode (multi-tenant PRD §4 red line 1 fail-closed). Single-tenant backward compatible (default `multi_tenant: false` = no identity verify).

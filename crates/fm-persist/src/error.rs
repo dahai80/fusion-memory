@@ -26,6 +26,10 @@ pub enum PersistError {
     // v1.0.0 B-1: 静态加密错误 (key 缺失/格式错/解密失败)。
     #[error("encryption error: {0}")]
     Encrypt(String),
+
+    // v1.4.0 #21: 未知 namespace 值 (仅 user/project/local/空 合法), fail-closed 不静默降级。
+    #[error("invalid namespace: {0}")]
+    Namespace(String),
 }
 
 // §1.1: r2d2::Error → PersistError::Pool (供 Pool::builder().build()? 的 ? 转换)。
@@ -62,6 +66,9 @@ impl PersistError {
             }
             // v1.0.0 B-1: 加密错误 → MemoryError::Encrypt (永久, 不可重试)。
             PersistError::Encrypt(s) => fm_core::MemoryError::Encrypt(s),
+            PersistError::Namespace(s) => fm_core::MemoryError::Unsupported(format!(
+                "invalid namespace: {s} (expect user|project|local|empty)"
+            )),
         }
     }
 }

@@ -95,6 +95,12 @@ pub struct MemoryItem {
     /// #16 多租户隔离: 权威租户标识 (来自 gateway X-Fusion-Tenant)。
     /// 空 = 默认租户 (单租户向后兼容, 旧库迁移后 tenant 列 DEFAULT '')。
     pub tenant: String,
+    /// issue #21 作用域命名空间: user/project/local, 空 = 全局 (旧行为)。
+    #[serde(default)]
+    pub namespace: String,
+    /// issue #21 命名空间键 (project path / machine id / user id)。空 = 同级不限 key。
+    #[serde(default)]
+    pub namespace_key: String,
     pub memory_type: MemoryType,
     pub tier: MemoryTier,
     pub content: String,
@@ -129,6 +135,8 @@ impl MemoryItem {
             turn_idx,
             session_id,
             tenant,
+            namespace: String::new(),
+            namespace_key: String::new(),
             memory_type,
             tier: MemoryTier::Working,
             content,
@@ -142,6 +150,13 @@ impl MemoryItem {
             tombstone: false,
             entities_pending: true,
         }
+    }
+
+    /// issue #21: 挂作用域命名空间 (空 namespace = 全局, 不改旧调用点签名)。
+    pub fn with_namespace(mut self, namespace: impl Into<String>, key: impl Into<String>) -> Self {
+        self.namespace = namespace.into();
+        self.namespace_key = key.into();
+        self
     }
 }
 
