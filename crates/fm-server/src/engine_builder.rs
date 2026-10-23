@@ -29,15 +29,31 @@ pub fn build_server_engine(cfg: &ServerConfig, stub: bool) -> Result<ServerEngin
         Arc::new(LocalStore::open(&store_dir, dim).map_err(|e| format!("store open: {e}"))?);
     let persist = Arc::new(Persist::open(&db_path).map_err(|e| format!("persist open: {e}"))?);
 
-    let embedder: Arc<dyn Embedder> = if stub {
-        Arc::new(StubEmbedder::new(dim))
+    // #23: TOML [embed] 作底 (cfg 解析), env 仍最高优先 (overlay_env)。
+    let ecfg = if stub {
+        None
     } else {
-        let ecfg = EmbedConfig {
-            api_key: std::env::var("FUSION_MEMORY_MLX_API_KEY").unwrap_or_default(),
-            ..EmbedConfig::from_env()
+        let base = EmbedConfig {
+            mlx_url: cfg.embed_mlx_url.clone(),
+            embed_model: cfg.embed_model.clone(),
+            api_key: cfg.mlx_api_key.clone(),
+            ..EmbedConfig::default()
         };
-        let mlx = MlxEmbedder::new(ecfg).map_err(|e| format!("mlx embedder: {e}"))?;
-        Arc::new(mlx)
+        let merged = base.overlay_env();
+        info!(
+            mlx_url = %merged.mlx_url,
+            embed_model = %merged.embed_model,
+            has_key = !merged.api_key.is_empty(),
+            "embedding config resolved (#23)"
+        );
+        Some(merged)
+    };
+    let embedder: Arc<dyn Embedder> = match &ecfg {
+        None => Arc::new(StubEmbedder::new(dim)),
+        Some(e) => {
+            let mlx = MlxEmbedder::new(e.clone()).map_err(|e| format!("mlx embedder: {e}"))?;
+            Arc::new(mlx)
+        }
     };
 
     let mut engine = MemoryEngine::new(store, persist, embedder);
@@ -49,10 +65,11 @@ pub fn build_server_engine(cfg: &ServerConfig, stub: bool) -> Result<ServerEngin
     }
 
     if !stub {
+        // #23: extractor 与 embedder 共用同一份解析后配置 (TOML [embed] + env 覆盖)。
+        let e = ecfg.as_ref().expect("non-stub 必有 embed cfg");
         let xcfg = ExtractConfig {
-            mlx_url: std::env::var("FUSION_MLX_URL")
-                .unwrap_or_else(|_| "http://127.0.0.1:11434/v1".into()),
-            api_key: std::env::var("FUSION_MEMORY_MLX_API_KEY").unwrap_or_default(),
+            mlx_url: e.mlx_url.clone(),
+            api_key: e.api_key.clone(),
             chat_model: std::env::var("FUSION_MEMORY_CHAT_MODEL")
                 .unwrap_or_else(|_| "Qwen3.5-9B-4bit".into()),
             timeout_secs: 60,

@@ -10,6 +10,7 @@
 
 use std::path::PathBuf;
 
+use fm_embed::EmbedConfig;
 use serde::Deserialize;
 use tracing::{info, warn};
 
@@ -44,6 +45,12 @@ pub struct ServerConfig {
     pub identity_url: String,
     /// #18: fusion-identity service token (gate /verify + /usage)。多租户模式必配。
     pub identity_service_token: String,
+    /// #23: MLX embedding base url (TOML [embed].mlx_url 镜像, env FUSION_MLX_URL 仍优先)。
+    pub embed_mlx_url: String,
+    /// #23: 嵌入模型名 (TOML [embed].embed_model, env FUSION_MEMORY_EMBED_MODEL 优先)。
+    pub embed_model: String,
+    /// #23: fusion-mlx API key (TOML [embed].mlx_api_key / mlx_api_key_file, env FUSION_MEMORY_MLX_API_KEY 优先)。
+    pub mlx_api_key: String,
 }
 
 /// P1-8: TOML 配置文件镜像。全字段可选 — 仅出现的字段覆盖默认。
@@ -74,6 +81,20 @@ pub struct ConfigFile {
     pub identity_service_token: Option<String>,
     /// #18: 读此文件内容作 identity_service_token (推荐, 文件权限 0600)。
     pub identity_service_token_file: Option<String>,
+    /// #23: MLX embedding 配置段。
+    pub embed: Option<EmbedFileConfig>,
+}
+
+/// #23: `[embed]` 段。fusion-mlx embedding 连接配置的 TOML 镜像。
+/// env (FUSION_MLX_URL / FUSION_MEMORY_EMBED_MODEL / FUSION_MEMORY_MLX_API_KEY) 仍最高优先。
+#[derive(Debug, Default, Deserialize)]
+pub struct EmbedFileConfig {
+    pub mlx_url: Option<String>,
+    pub embed_model: Option<String>,
+    /// fusion-mlx API key 明文 (优先用 mlx_api_key_file)。
+    pub mlx_api_key: Option<String>,
+    /// 读此文件内容作 mlx_api_key (推荐, 文件权限 0600)。
+    pub mlx_api_key_file: Option<String>,
 }
 
 /// P1-8: 默认配置文件路径。env FM_CONFIG 显式指定, 否则 data_dir/fusion-memory.toml。
@@ -123,6 +144,9 @@ impl Default for ServerConfig {
             multi_tenant: false,
             identity_url: "http://127.0.0.1:11470".into(),
             identity_service_token: String::new(),
+            embed_mlx_url: EmbedConfig::default().mlx_url,
+            embed_model: EmbedConfig::default().embed_model,
+            mlx_api_key: String::new(),
         }
     }
 }
@@ -253,6 +277,25 @@ impl ServerConfig {
                 }
             }
         }
+        // #23: [embed] 段 (fusion-mlx embedding 连接)。secret_file 同模式: 字段空才读文件。
+        if let Some(e) = &f.embed {
+            if let Some(u) = &e.mlx_url {
+                self.embed_mlx_url = u.clone();
+            }
+            if let Some(m) = &e.embed_model {
+                self.embed_model = m.clone();
+            }
+            if let Some(k) = &e.mlx_api_key {
+                self.mlx_api_key = k.clone();
+            }
+            if let Some(p) = &e.mlx_api_key_file {
+                if self.mlx_api_key.is_empty() {
+                    if let Some(v) = read_secret_file("mlx_api_key", p) {
+                        self.mlx_api_key = v;
+                    }
+                }
+            }
+        }
         // 记录 secret_file 路径供 env 阶段后重读? 不需要 — env 若给了密钥直接覆盖, 无需再读文件。
         // 但若 env 没给密钥、文件给了 secret_file 路径, 上面已读填。env 阶段不会再设空覆盖。
         // 唯一缺口: env 设了空字符串? env::var 设空串仍是 Ok, 会覆盖为空。罕见, 接受。
@@ -313,6 +356,16 @@ impl ServerConfig {
         if let Ok(v) = std::env::var("FUSION_MEMORY_IDENTITY_SERVICE_TOKEN") {
             self.identity_service_token = v;
         }
+        // #23: embedding env 覆盖 (与 fm-embed from_env 同名 env, 优先级最高)。
+        if let Ok(v) = std::env::var("FUSION_MLX_URL") {
+            self.embed_mlx_url = v;
+        }
+        if let Ok(v) = std::env::var("FUSION_MEMORY_EMBED_MODEL") {
+            self.embed_model = v;
+        }
+        if let Ok(v) = std::env::var("FUSION_MEMORY_MLX_API_KEY") {
+            self.mlx_api_key = v;
+        }
         if let Ok(v) = std::env::var("FUSION_MEMORY_DIM") {
             match v.parse::<usize>() {
                 Ok(d) if d > 0 => self.dim = d,
@@ -353,6 +406,14 @@ impl ServerConfig {
             if let Ok(p) = std::env::var("FUSION_MEMORY_IDENTITY_SERVICE_TOKEN_FILE") {
                 if let Some(v) = read_secret_file("identity_service_token", &p) {
                     self.identity_service_token = v;
+                }
+            }
+        }
+        // #23: mlx_api_key 的 env secret_file 路径。
+        if self.mlx_api_key.is_empty() {
+            if let Ok(p) = std::env::var("FUSION_MEMORY_MLX_API_KEY_FILE") {
+                if let Some(v) = read_secret_file("mlx_api_key", &p) {
+                    self.mlx_api_key = v;
                 }
             }
         }
@@ -688,5 +749,102 @@ mod tests {
         assert_eq!(c.identity_service_token, "id-secret");
         assert!(c.multi_tenant);
         std::env::remove_var("FM_CONFIG");
+    }
+
+    // ---- #23: [embed] 段 TOML 镜像 ----
+
+    fn clear_embed_env() {
+        std::env::remove_var("FUSION_MLX_URL");
+        std::env::remove_var("FUSION_MEMORY_EMBED_MODEL");
+        std::env::remove_var("FUSION_MEMORY_MLX_API_KEY");
+        std::env::remove_var("FUSION_MEMORY_MLX_API_KEY_FILE");
+    }
+
+    #[test]
+    fn embed_toml_overrides_defaults() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let toml_path = dir.path().join("fm.toml");
+        std::fs::write(
+            &toml_path,
+            "[embed]\nmlx_url = \"http://127.0.0.1:11432/v1\"\nembed_model = \"bge-small\"\nmlx_api_key = \"toml-key\"\n",
+        )
+        .unwrap();
+        std::env::set_var("FM_CONFIG", &toml_path);
+        clear_embed_env();
+        let c = ServerConfig::from_file_or_env();
+        assert_eq!(c.embed_mlx_url, "http://127.0.0.1:11432/v1");
+        assert_eq!(c.embed_model, "bge-small");
+        assert_eq!(c.mlx_api_key, "toml-key");
+        std::env::remove_var("FM_CONFIG");
+    }
+
+    #[test]
+    fn embed_env_overrides_toml() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let toml_path = dir.path().join("fm.toml");
+        std::fs::write(
+            &toml_path,
+            "[embed]\nmlx_url = \"http://127.0.0.1:11432/v1\"\nmlx_api_key = \"toml-key\"\n",
+        )
+        .unwrap();
+        std::env::set_var("FM_CONFIG", &toml_path);
+        std::env::set_var("FUSION_MLX_URL", "http://127.0.0.1:9999/v1");
+        std::env::set_var("FUSION_MEMORY_MLX_API_KEY", "env-key");
+        std::env::remove_var("FUSION_MEMORY_EMBED_MODEL");
+        let c = ServerConfig::from_file_or_env();
+        // env 赢; env 未设字段保留 TOML
+        assert_eq!(c.embed_mlx_url, "http://127.0.0.1:9999/v1");
+        assert_eq!(c.embed_model, "BAAI/bge-m3");
+        assert_eq!(c.mlx_api_key, "env-key");
+        std::env::remove_var("FM_CONFIG");
+        std::env::remove_var("FUSION_MLX_URL");
+        std::env::remove_var("FUSION_MEMORY_MLX_API_KEY");
+    }
+
+    #[test]
+    fn embed_secret_file_read() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let key_file = dir.path().join("mlx.key");
+        std::fs::write(&key_file, "  mlx-secret  \n").unwrap();
+        let toml_path = dir.path().join("fm.toml");
+        std::fs::write(
+            &toml_path,
+            format!("[embed]\nmlx_api_key_file = \"{}\"\n", key_file.display()),
+        )
+        .unwrap();
+        std::env::set_var("FM_CONFIG", &toml_path);
+        clear_embed_env();
+        let c = ServerConfig::from_file_or_env();
+        assert_eq!(c.mlx_api_key, "mlx-secret");
+        assert_eq!(c.embed_mlx_url, "http://127.0.0.1:11434/v1", "未配 → 默认");
+        std::env::remove_var("FM_CONFIG");
+    }
+
+    #[test]
+    fn embed_secret_file_env_path() {
+        // env 给 secret_file 路径 (非明文), 无 TOML 文件
+        let _g = ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let key_file = dir.path().join("mlx-env.key");
+        std::fs::write(&key_file, "mlx-env-secret\n").unwrap();
+        std::env::set_var("FM_CONFIG", dir.path().join("nope.toml"));
+        std::env::set_var("FUSION_MEMORY_MLX_API_KEY_FILE", &key_file);
+        std::env::remove_var("FUSION_MEMORY_MLX_API_KEY");
+        let c = ServerConfig::from_file_or_env();
+        assert_eq!(c.mlx_api_key, "mlx-env-secret");
+        std::env::remove_var("FM_CONFIG");
+        std::env::remove_var("FUSION_MEMORY_MLX_API_KEY_FILE");
+    }
+
+    #[test]
+    fn embed_defaults_when_absent() {
+        // 无 [embed] 段 → 默认, 不破坏既有配置
+        let c = ServerConfig::default();
+        assert_eq!(c.embed_mlx_url, "http://127.0.0.1:11434/v1");
+        assert_eq!(c.embed_model, "BAAI/bge-m3");
+        assert!(c.mlx_api_key.is_empty());
     }
 }

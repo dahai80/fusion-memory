@@ -5,6 +5,18 @@ Internal path-dep private ecosystem (not on crates.io); versions tag + GitHub re
 
 ## [Unreleased]
 
+## [1.4.1] — 2026-10-24
+
+MLX embedding API key TOML mirror (issue #23). Previously the fusion-mlx embedding key was only readable from env `FUSION_MEMORY_MLX_API_KEY` — a default `start.sh` service start against key-enforced fusion-mlx silently produced 401s on `/v1/embeddings`. Fully backward compatible: no `[embed]` section and no env = old behavior.
+
+### Added
+- **`[embed]` TOML section** (`fm-server/src/config.rs`): `mlx_url` (default `http://127.0.0.1:11434/v1`), `embed_model` (default `BAAI/bge-m3`), `mlx_api_key`, `mlx_api_key_file` (0600 secret file, recommended over env). Priority unchanged: env > TOML field > secret file > default. Env secret path `FUSION_MEMORY_MLX_API_KEY_FILE` also supported.
+- **`EmbedConfig::overlay_env()`** (`fm-embed`): applies env overrides on top of an existing (TOML/default) base; `from_env()` now delegates to it. `build_server_engine` resolves the config once and shares it between the embedder and the entity extractor (extractor no longer reads env directly, so it stops 401-ing independently of the embedder).
+- `start.sh` header documents the `[embed]` section.
+
+### Tests
+- Default features: 468 → 474 (+6: fm-embed overlay base/env precedence, fm-server TOML override / env-over-TOML / secret file / env secret path / absent-section defaults).
+
 ## [1.4.0] — 2026-10-21
 
 Scoped memory namespaces (issue #21, consumer fusion-agent-studio#434). Adds a second, tenant-orthogonal visibility dimension `namespace` (`user` / `project` / `local` / empty) to commit, retrieve, and consolidation. Fully additive: empty namespace = old behavior (global), and all new fields are `#[serde(default)]` so old JSON / WOP payloads replay unchanged.

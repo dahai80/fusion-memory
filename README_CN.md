@@ -2,7 +2,7 @@
 
 > **[English](README.md)** | 中文
 
-> **当前版本：v1.4.0** — 作用域记忆命名空间落地（issue #21）：commit / retrieve / consolidate 支持 `user` / `project` / `local` 可见域（与 tenant 正交，纯加法式）。v1.3.0 fusion-identity 集成（issue #18）、v1.2.0 多租户隔离（issue #16）此前已落地。已知限制见 `CHANGELOG.md` "Known limitations"，非阻塞。
+> **当前版本：v1.4.1** — MLX embedding API key TOML 镜像（issue #23）：`fusion-memory.toml` 新增 `[embed]` 段（`mlx_url` / `embed_model` / `mlx_api_key` / `mlx_api_key_file`），env 仍最高优先。v1.4.0 作用域记忆命名空间（issue #21）：commit / retrieve / consolidate 支持 `user` / `project` / `local` 可见域（与 tenant 正交，纯加法式）。v1.3.0 fusion-identity 集成（issue #18）、v1.2.0 多租户隔离（issue #16）此前已落地。已知限制见 `CHANGELOG.md` "Known limitations"，非阻塞。
 
 Fusion 生态（"一核九端"）系统级长/短期记忆与认知图谱中枢。解决 Agent 跨 session 状态断层、重复提问、context window 爆炸，目标：越用越懂用户。
 
@@ -150,7 +150,7 @@ Fusion 生态（"一核九端"）系统级长/短期记忆与认知图谱中枢�
 - **P1-5 UDS token 鉴权**：UDS 连接级 token（`FUSION_MEMORY_UDS_TOKEN`，连接首行 `AUTH <token>` 握手比对，空 token 本机放行），不匹配 → `-32004 unauthorized` 断连。多租户 UDS 鉴权。`crates/fm-server/src/uds.rs`。
 - **P1-6 集群 bind gate**：leader/follower 启动校验 bind 地址（非 127.0.0.1/内网段 → 拒启，防误绑公网），PRD §16 离线边界强约束。`crates/fm-cluster/src/transport.rs`。
 - **P1-7 规模验证 bench**：`crates/fm-engine/benches/scale_bench.rs`，10k/100k/1M 向量规模验证（`FM_SCALE` env 选档），测 seed 吞吐 / rebuild_from_sled / 单条 knn p99 / 10 并发 retrieve p99 / sled 磁盘占用。100k 基线落 `benches/baseline-scale-2026-08-28.json`。旧版仅 10k 未验证规模。`crates/fm-engine/benches/scale_bench.rs`。
-- **P1-8 配置文件**：`fm-server` 支持 TOML 配置（`FM_CONFIG` env 或 `data_dir/fusion-memory.toml`）+ env 覆盖 + secret 文件（`FUSION_MEMORY_API_KEY_FILE`/`FUSION_MEMORY_UDS_TOKEN_FILE`，避免密钥落 env/cmdline）+ 启动 `validate()` fail-visible exit(1)。优先级 env > TOML > secret_file > default。`crates/fm-server/src/config.rs`、`crates/fm-server/src/main.rs`。
+- **P1-8 配置文件**：`fm-server` 支持 TOML 配置（`FM_CONFIG` env 或 `data_dir/fusion-memory.toml`）+ env 覆盖 + secret 文件（`FUSION_MEMORY_API_KEY_FILE`/`FUSION_MEMORY_UDS_TOKEN_FILE`，避免密钥落 env/cmdline）+ 启动 `validate()` fail-visible exit(1)。优先级 env > TOML > secret_file > default。`crates/fm-server/src/config.rs`、`crates/fm-server/src/main.rs`。**v1.4.1** 新增 `[embed]` 段（`mlx_url` / `embed_model` / `mlx_api_key` / `mlx_api_key_file`，另有 env `FUSION_MEMORY_MLX_API_KEY_FILE`），fusion-mlx embedding key 不再依赖 env（issue #23）。
 - **P1-9 连接池 get 超时**：r2d2 `connection_timeout(5s)` 显式兜底（默认 30s），池满 `get()` 超时返 `GetTimeout` → `MemoryError::Busy` 可重试，非无限阻塞防死锁。`crates/fm-persist/src/store.rs`、`crates/fm-persist/src/error.rs`。
 - **P1-10 StoreStub 命名一致**：`store-stub` → `local-store`（feature flag）、`StoreStub` → `LocalStore`（类型）、`stub.rs` → `local.rs`（文件）。唯一实作者命名去贬义（非 stub，是长期生产后端）。`crates/fm-store/`。
 
