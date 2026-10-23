@@ -39,24 +39,28 @@ impl Default for EmbedConfig {
 impl EmbedConfig {
     /// 从 env 读覆盖 (PRD §12.3)。
     pub fn from_env() -> Self {
-        let mut c = Self::default();
+        Self::default().overlay_env()
+    }
+
+    /// #23: 在既有配置 (默认/TOML) 上叠 env 覆盖。env 仍最高优先。
+    pub fn overlay_env(mut self) -> Self {
         if let Ok(v) = std::env::var("FUSION_MLX_URL") {
-            c.mlx_url = v;
+            self.mlx_url = v;
         }
         if let Ok(v) = std::env::var("FUSION_MEMORY_EMBED_MODEL") {
-            c.embed_model = v;
+            self.embed_model = v;
         }
         if let Ok(v) = std::env::var("FUSION_MEMORY_MLX_API_KEY") {
-            c.api_key = v;
+            self.api_key = v;
         }
         if let Ok(v) = std::env::var("FUSION_MEMORY_MLX_CONCURRENCY") {
             if let Ok(n) = v.parse::<usize>() {
                 if n > 0 {
-                    c.mlx_concurrency = n;
+                    self.mlx_concurrency = n;
                 }
             }
         }
-        c
+        self
     }
 
     /// embeddings endpoint URL。
@@ -68,6 +72,10 @@ impl EmbedConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    // env 进程全局, 并行测试 set/remove 同名 env 串扰, 锁串行化。
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn defaults() {
@@ -92,6 +100,7 @@ mod tests {
     #[test]
     fn from_env_overrides_and_defaults() {
         // 单测试串行 env, 避免并行测试 env 竞争。
+        let _g = ENV_LOCK.lock().unwrap();
         // 1) 全设 → 全覆盖
         std::env::set_var("FUSION_MLX_URL", "http://127.0.0.1:11432/v1");
         std::env::set_var("FUSION_MEMORY_EMBED_MODEL", "BAAI/bge-small");
@@ -117,5 +126,23 @@ mod tests {
         assert_eq!(d.embed_model, "BAAI/bge-m3");
         assert_eq!(d.api_key, "");
         assert_eq!(d.mlx_concurrency, 2);
+    }
+
+    #[test]
+    fn overlay_env_keeps_base_and_env_wins() {
+        // #23: TOML/base 值保留, env 只覆盖出现的字段。
+        let _g = ENV_LOCK.lock().unwrap();
+        let base = EmbedConfig {
+            mlx_url: "http://10.0.0.1:9000/v1".into(),
+            embed_model: "custom-model".into(),
+            api_key: "toml-key".into(),
+            ..Default::default()
+        };
+        std::env::set_var("FUSION_MEMORY_MLX_API_KEY", "env-key");
+        let c = base.overlay_env();
+        assert_eq!(c.mlx_url, "http://10.0.0.1:9000/v1", "env 未设 → 保留 base");
+        assert_eq!(c.embed_model, "custom-model");
+        assert_eq!(c.api_key, "env-key", "env 设 → 覆盖 base");
+        std::env::remove_var("FUSION_MEMORY_MLX_API_KEY");
     }
 }

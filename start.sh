@@ -14,6 +14,11 @@
 #   FM_HOME (默认 ~/.fusion-memory)
 #   FUSION_MEMORY_SOCK / FUSION_MEMORY_HTTP_PORT (默认 11435) / FUSION_MEMORY_API_KEY (HTTP 必配)
 #   FUSION_MEMORY_DIM (默认 1024) / FUSION_MEMORY_STUB
+#   FUSION_MEMORY_MLX_API_KEY (fusion-mlx embedding key; 也可在 TOML 配 [embed] 段, 见 #23):
+#     [embed]
+#     mlx_url = "http://127.0.0.1:11434/v1"
+#     embed_model = "BAAI/bge-m3"
+#     mlx_api_key_file = "/path/to/key"   # 推荐 0600 secret 文件, 免 env 明文
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
