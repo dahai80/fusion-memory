@@ -39,6 +39,23 @@ pub fn weight_of(item: &MemoryItem, now: u64) -> f64 {
     )
 }
 
+/// #25: 归一化新鲜度 — 融合评分专用 (retrieval quality ablation 裁定)。
+/// exp(-t/τ(type)) * reinforce, w0=1 封顶 1.0。
+/// 原始 W(t) 含 w0 (0.6/0.8/1.0 随 MemoryType), 加性注入融合分数会让
+/// Procedural/Semantic 与相关性无关地系统性压过 Episodic — benchmark 实测
+/// recall@5 0.48 → 0.17 (见 docs/benchmarks/retrieval-quality-2026-10-25.md)。
+/// W(t) 原值仍用于 θ_drop/θ_promote 调度阈值 (PRD §7.3), 仅检索排序改用归一化值。
+pub fn freshness_of(item: &MemoryItem, now: u64) -> f64 {
+    let f = weight_at(
+        1.0,
+        item.created_timestamp,
+        now,
+        item.memory_type,
+        item.access_count,
+    );
+    f.min(1.0)
+}
+
 /// 候选记忆的实体 id 列表。
 pub fn entity_ids(entities: &[EntityNode]) -> Vec<String> {
     entities.iter().map(|e| e.id.clone()).collect()
@@ -53,7 +70,8 @@ pub fn score_candidate(
     query_entity_ids: &[String],
     now: u64,
 ) -> GraphResult<f64> {
-    let w_t = weight_of(item, now);
+    // #25: 融合用归一化新鲜度 (剥 w0), 非 W(t) 原值 — 见 freshness_of 注释。
+    let w_t = freshness_of(item, now);
     let cand_ids = entity_ids(&item.entities);
     let graph_aff = if query_entity_ids.is_empty() || cand_ids.is_empty() {
         0.0

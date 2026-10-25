@@ -5,6 +5,20 @@ Internal path-dep private ecosystem (not on crates.io); versions tag + GitHub re
 
 ## [Unreleased]
 
+## [1.4.2] — 2026-10-25
+
+Retrieval quality evaluation + fusion-score retune (issue #25). The forgetting-curve decay, graph affinity, and fusion scoring were real algorithms with zero retrieval-quality evidence; this lands the ablation benchmark and acts on its first finding.
+
+### Added
+- **Retrieval quality benchmark** (`crates/fm-engine/tests/retrieval_quality.rs`): deterministic synthetic corpus (seeded xorshift64*, fixed `now`, in-memory SQLite graph), ground-truth queries, and four+one ablation arms — plain cosine / cosine+decay / cosine+graph / full fusion / pre-retune raw-W (kept as the decision record). Metrics: recall@5 / nDCG@10 / MRR. CI gate asserts full fusion never below plain cosine, no single component drags, fresh-over-stale temporal wins ≥90% (fusion 40/40 vs plain 18/40), and bitwise seed determinism. Full scale via `FM_RQ_SCALE=full` (400 topics / 5200 items / 400 queries, ~10s).
+- **Results + decision** (`docs/benchmarks/retrieval-quality-2026-10-25.md`): full fusion beats plain cosine by +0.40 recall@5 / +0.32 nDCG@10 / +0.25 MRR at full scale.
+
+### Changed
+- **Fusion-score decay term retuned**: `score_candidate` now uses `freshness_of()` (normalized freshness: `exp(-t/τ(type))·reinforce`, w0 stripped, capped at 1.0) instead of raw `W(t)`. First benchmark run proved the raw-`W(t)` fusion was **worse than plain cosine** (recall@5 0.4250 → 0.2285 full scale): `W(t)` carries the type-dependent w0 (0.6/0.8/1.0), so the additive β·W(t) term promoted Procedural/Semantic items regardless of relevance. α/β/γ weights unchanged; raw `W(t)` still drives the θ_drop/θ_promote scheduling thresholds — only retrieval ranking changed. `crates/fm-engine/src/scoring.rs`.
+
+### Tests
+- Default features: 474 → 478 (+4 retrieval-quality tests). Gates: fmt / clippy -D warnings / test all green.
+
 ## [1.4.1] — 2026-10-24
 
 MLX embedding API key TOML mirror (issue #23). Previously the fusion-mlx embedding key was only readable from env `FUSION_MEMORY_MLX_API_KEY` — a default `start.sh` service start against key-enforced fusion-mlx silently produced 401s on `/v1/embeddings`. Fully backward compatible: no `[embed]` section and no env = old behavior.
