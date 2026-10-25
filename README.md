@@ -2,7 +2,7 @@
 
 > **English** | **[中文](README_CN.md)**
 
-> **Current version: v1.4.1** — MLX embedding API key TOML mirror (issue #23): `[embed]` section (`mlx_url` / `embed_model` / `mlx_api_key` / `mlx_api_key_file`) in `fusion-memory.toml`, env still wins. v1.4.0 scoped memory namespaces (issue #21): `user` / `project` / `local` visibility tiers on commit, retrieve, and consolidation (tenant-orthogonal, fully additive). v1.3.0 fusion-identity integration (issue #18) and v1.2.0 multi-tenant isolation (issue #16) landed earlier. Known limitations in `CHANGELOG.md` "Known limitations", non-blocking.
+> **Current version: v1.4.2** — retrieval quality ablation landed (issue #25): full fusion scoring beats plain cosine by **+0.40 recall@5** (0.8270 vs 0.4250, full-scale corpus in `docs/benchmarks/retrieval-quality-2026-10-25.md`), and the benchmark's first finding forced a retune — the fusion decay term now uses normalized freshness instead of raw `W(t)` (raw-`W(t)` fusion measured *worse* than plain cosine). CI gate: fusion must never score below plain cosine. v1.4.1 MLX embedding API key TOML mirror (issue #23), v1.4.0 scoped memory namespaces (issue #21), v1.3.0 fusion-identity integration (issue #18), v1.2.0 multi-tenant isolation (issue #16) landed earlier. Known limitations in `CHANGELOG.md` "Known limitations", non-blocking.
 
 The system-level long/short-term memory and cognitive graph hub of the Fusion ecosystem ("一核九端"). Solves the Agent cross-session state gap, repeated questions, and context-window blowup. Goal: the more it is used, the better it knows the user.
 
@@ -228,6 +228,22 @@ Handling of 7 blockers before commercial release. Class A 3 items constrained by
 - **fuzz**: `cargo-fuzz` targets — JSON-RPC request parsing (malformed JSON / overlong / bad UTF-8 / type confusion / deep nesting), HTTP body boundaries, entity extraction JSON parsing. Crash/panic treated as defect. `crates/fm-server/fuzz/`.
 - **load stress**: expanded `retrieve_bench` — 100k vectors (baseline 10k × 10) + concurrency gradient (1/10/50/100), recording p50/p99/p999 + throughput. Commercial-grade load validation. Results saved to `benches/baseline-1.0.0-*.json`.
 
+### v1.4.2 retrieval quality ablation (issue #25)
+
+Deterministic synthetic corpus + ground-truth queries prove the fusion score against plain cosine — and forced a retune on first measurement: raw-`W(t)` fusion scored **worse** than plain cosine (recall@5 0.4250 → 0.2285 full scale) because `W(t)` carries the type-dependent w0, so the decay term promoted Procedural/Semantic items regardless of relevance. The fusion decay term now uses normalized freshness (`freshness_of()`, w0 stripped, capped 1.0); α/β/γ weights and the θ_drop/θ_promote scheduling thresholds (raw `W(t)`) are unchanged. Full data + decision: `docs/benchmarks/retrieval-quality-2026-10-25.md`.
+
+Full-scale ablation (400 topics / 5200 items / 400 queries, seed `0x5eed25abcd100001`):
+
+| arm | recall@5 | nDCG@10 | MRR |
+|---|---|---|---|
+| plain cosine | 0.4250 | 0.5797 | 0.7100 |
+| cosine + decay (normalized freshness) | 0.6325 | 0.7891 | 0.9307 |
+| cosine + graph affinity | 0.7190 | 0.8016 | 0.8603 |
+| **full fusion (α=0.5, β=0.3, γ=0.2)** | **0.8270** | **0.9042** | **0.9629** |
+| fusion, raw W(t) — pre-retune, deprecated | 0.2285 | 0.3166 | 0.6193 |
+
+Temporal validity (fresh over stale duplicates): full fusion **40/40** queries vs plain cosine 18/40. CI gate (`cargo test -p fm-engine --test retrieval_quality`, <1s): fusion never below plain cosine, no component drags, seed-deterministic; full scale on demand via `FM_RQ_SCALE=full`.
+
 ## Architecture
 
 - Core Rust (no GC pauses), SQLite WAL + SQLite recursive CTE graph traversal (replaces Kuzu, see deviation record), store-stub (hnsw_rs + sled, long-term production backend)
@@ -256,7 +272,7 @@ Handling of 7 blockers before commercial release. Class A 3 items constrained by
 
 ```bash
 cargo check --workspace        # compile check
-cargo test --workspace         # all offline tests (429 cases, excludes fm-py cdylib; --features fm-store/store-fusion = 435)
+cargo test --workspace         # all offline tests (478 cases, excludes fm-py cdylib; --features fm-store/store-fusion = 484)
 cargo clippy --workspace --all-targets -- -D warnings   # lint
 cargo fmt --all --check        # format check
 

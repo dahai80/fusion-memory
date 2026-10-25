@@ -2,7 +2,7 @@
 
 > **[English](README.md)** | 中文
 
-> **当前版本：v1.4.1** — MLX embedding API key TOML 镜像（issue #23）：`fusion-memory.toml` 新增 `[embed]` 段（`mlx_url` / `embed_model` / `mlx_api_key` / `mlx_api_key_file`），env 仍最高优先。v1.4.0 作用域记忆命名空间（issue #21）：commit / retrieve / consolidate 支持 `user` / `project` / `local` 可见域（与 tenant 正交，纯加法式）。v1.3.0 fusion-identity 集成（issue #18）、v1.2.0 多租户隔离（issue #16）此前已落地。已知限制见 `CHANGELOG.md` "Known limitations"，非阻塞。
+> **当前版本：v1.4.2** — 检索质量消融落地（issue #25）：全融合评分对纯 cosine **recall@5 +0.40**（0.8270 vs 0.4250，全量语料见 `docs/benchmarks/retrieval-quality-2026-10-25.md`）；benchmark 首测暴露融合衰减项缺陷并裁定 retune — 融合衰减项改用归一化新鲜度（实测原始 `W(t)` 融合反而*差于*纯 cosine）。CI 门禁：融合评分永不低于纯 cosine。v1.4.1 MLX embedding key TOML 镜像（issue #23）、v1.4.0 作用域命名空间（issue #21）、v1.3.0 fusion-identity 集成（issue #18）、v1.2.0 多租户隔离（issue #16）此前已落地。已知限制见 `CHANGELOG.md` "Known limitations"，非阻塞。
 
 Fusion 生态（"一核九端"）系统级长/短期记忆与认知图谱中枢。解决 Agent 跨 session 状态断层、重复提问、context window 爆炸，目标：越用越懂用户。
 
@@ -228,6 +228,22 @@ PRD §14 M5 三部分，(a) store-fusion 可选切换、(b) fusion-guard DLP gat
 - **fuzz**：`cargo-fuzz` 目标 — JSON-RPC 请求解析（畸形 JSON / 超长 / 坏 UTF-8 / 类型混淆 / 嵌套深）、HTTP body 边界、实体抽取 JSON 解析。崩溃/panic 视为缺陷。`crates/fm-server/fuzz/`。
 - **负载压测**：扩 `retrieve_bench` — 100k 向量（基线 10k × 10）+ 并发梯度（1/10/50/100），记录 p50/p99/p999 + 吞吐。商用级负载验证。结果落 `benches/baseline-1.0.0-*.json`。
 
+### v1.4.2 检索质量消融（issue #25）
+
+确定性合成语料 + 已知相关 ground truth，实测融合评分对纯 cosine — 并在首测就逼出一次 retune：原始 `W(t)` 融合**差于**纯 cosine（recall@5 0.4250 → 0.2285 全量），根因 `W(t)` 含类型相关的 w0，衰减项与相关性无关地抬升 Procedural/Semantic。融合衰减项改用归一化新鲜度（`freshness_of()`，剥 w0，封顶 1.0）；α/β/γ 权重与 θ_drop/θ_promote 调度阈值（原始 `W(t)`）不变。完整数据 + 裁定：`docs/benchmarks/retrieval-quality-2026-10-25.md`。
+
+全量消融（400 主题 / 5200 条 / 400 query，种子 `0x5eed25abcd100001`）：
+
+| 评分臂 | recall@5 | nDCG@10 | MRR |
+|---|---|---|---|
+| 纯 cosine | 0.4250 | 0.5797 | 0.7100 |
+| cosine + 衰减（归一化新鲜度） | 0.6325 | 0.7891 | 0.9307 |
+| cosine + 图亲和 | 0.7190 | 0.8016 | 0.8603 |
+| **全融合（α=0.5, β=0.3, γ=0.2）** | **0.8270** | **0.9042** | **0.9629** |
+| 融合, 原始 W(t) — retune 前, 已弃用 | 0.2285 | 0.3166 | 0.6193 |
+
+时序有效性（fresh 压过 stale 重复条目）：全融合 **40/40** query，纯 cosine 18/40。CI 门禁（`cargo test -p fm-engine --test retrieval_quality`，<1s）：融合不低于纯 cosine、无组件拖后腿、种子确定性；全量按需 `FM_RQ_SCALE=full`。
+
 ## 架构
 
 - 核心 Rust（无 GC 停顿），SQLite WAL + SQLite 递归 CTE 图遍历（替代 Kuzu，见偏离记录），store-stub（hnsw_rs + sled，长期生产后端）
@@ -256,7 +272,7 @@ PRD §14 M5 三部分，(a) store-fusion 可选切换、(b) fusion-guard DLP gat
 
 ```bash
 cargo check --workspace        # 编译检查
-cargo test --workspace         # 全离线测试 (429 用例, 排除 fm-py cdylib; --features fm-store/store-fusion = 435)
+cargo test --workspace         # 全离线测试 (478 用例, 排除 fm-py cdylib; --features fm-store/store-fusion = 484)
 cargo clippy --workspace --all-targets -- -D warnings   # lint
 cargo fmt --all --check        # 格式检查
 
