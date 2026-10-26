@@ -1,6 +1,6 @@
 [package]
 name = "fm-store"
-version = "1.4.2"
+version = "1.4.3"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -29,11 +29,11 @@ tracing = { workspace = true }
 hnsw_rs = { workspace = true, optional = true }
 sled = { workspace = true, optional = true }
 # §1.4: fusion-store fs-core 上游 (issue #3 get_vector/list_vector_ids trait 对齐, rev 47d5b83)。
-# path dep (monorepo 同级兄弟项目 fusion-store/crates/fs-core)。100% 离线: 纯本地 path,
-# 无 git fetch / 无 cloud。fusion 本身是 monorepo ("一核九端"), fusion-memory checkout 伴
-# fusion-store 同级; 独立 clone fusion-memory 无兄弟项目时 store-fusion feature 编译断
-# (需 monorepo 全量 checkout)。default 不含此 feature, 不影响默认 build。
-fs-core = { path = "../../../fusion-store/crates/fs-core", optional = true }
+# git tag dep (issue #27: 跨仓 path dep 破坏 CI 独立 checkout — manifest 解析含 optional dep,
+# 默认 build 同样断)。上游 repo public (dahai80/fusion-store), tag v0.2.0-rc.3 与 HEAD 零漂移。
+# 100% 离线指运行时 (HTTP 仅 127.0.0.1); 构建期 cargo git fetch 一次后缓存 ~/.cargo/git。
+# 本地改上游联调: [patch."https://github.com/dahai80/fusion-store"] 覆盖。
+fs-core = { git = "https://github.com/dahai80/fusion-store", tag = "v0.2.0-rc.3", optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
