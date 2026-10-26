@@ -1,6 +1,6 @@
 [package]
 name = "fm-engine"
-version = "1.4.2"
+version = "1.4.3"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -33,9 +33,11 @@ regex = { workspace = true }
 # 仅跑凭据子集, 跳 PII)。fg-redact 补 fusion-memory 没有的凭据覆盖 (AWS Secret/JWT/PEM/bearer/
 # GCP/Azure/Stripe/连接串/.env); PII (手机/身份证/银行卡/IPv4/护照/IPv6/国际手机) 由 fusion-memory
 # 自带逻辑脱敏 (比 fg-redact PII 准, 见 redact.rs 段 2)。见 redact.rs。
-# path dep (monorepo 同级兄弟项目 fusion-guard/crates/fg-redact)。100% 离线: 纯本地 path,
-# 无 git fetch / 无 cloud。default 无 feature 门, 始终启用 (凭据脱敏为默认安全基线, §1.16 fail-closed)。
-fg-redact = { path = "../../../fusion-guard/crates/fg-redact" }
+# git tag dep (issue #27: 跨仓 path dep 在 CI 独立 checkout 时 manifest 加载即断, main 红 3 连)。
+# 上游 repo public (dahai80/fusion-guard), tag v0.2.0-rc.7 = 本地工作树同 commit, 零漂移。
+# 100% 离线指运行时 (HTTP 仅 127.0.0.1); 构建期 cargo git fetch 一次后缓存 ~/.cargo/git。
+# 本地改上游联调: cargo 源码级 patch — [patch."https://github.com/dahai80/fusion-guard"] 覆盖。
+fg-redact = { git = "https://github.com/dahai80/fusion-guard", tag = "v0.2.0-rc.7" }
 
 [dev-dependencies]
 tokio = { workspace = true }

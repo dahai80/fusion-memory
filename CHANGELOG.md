@@ -5,6 +5,16 @@ Internal path-dep private ecosystem (not on crates.io); versions tag + GitHub re
 
 ## [Unreleased]
 
+## [1.4.3] — 2026-10-26
+
+CI-red fix: cross-repo path dependencies replaced with pinned git tag dependencies (issue #27). The v1.4.2 commit landed red on CI — a runner checks out fusion-memory alone, so the sibling monorepo directories don't exist and the whole workspace manifest fails to load before any build step.
+
+### Fixed
+- **`fg-redact` (fm-engine)**: `path = "../../../fusion-guard/crates/fg-redact"` → git tag dep `dahai80/fusion-guard` `v0.2.0-rc.7` (same commit as the local working tree — zero drift).
+- **`fs-core` (fm-store, optional `store-fusion`)**: `path = "../../../fusion-store/crates/fs-core"` → git tag dep `dahai80/fusion-store` `v0.2.0-rc.3` (same commit as the local working tree — zero drift). Optional deps participate in manifest resolution, so this broke the default build too, not just the feature build.
+- Verified with a standalone `git clone` (no sibling repos): `cargo test --workspace` green, all 32 suites including the retrieval-quality gate (which had never executed in CI before).
+- "100% offline" remains a **runtime** constraint (HTTP only to 127.0.0.1); build-time cargo fetches each git dep once and caches it in `~/.cargo/git`. Local upstream co-development: override with a `[patch."https://github.com/dahai80/fusion-guard"]` section.
+
 ## [1.4.2] — 2026-10-25
 
 Retrieval quality evaluation + fusion-score retune (issue #25). The forgetting-curve decay, graph affinity, and fusion scoring were real algorithms with zero retrieval-quality evidence; this lands the ablation benchmark and acts on its first finding.

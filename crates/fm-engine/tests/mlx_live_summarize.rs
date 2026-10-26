@@ -9,7 +9,7 @@
 use std::sync::Arc;
 
 use fm_core::{FusionMemoryEngine, Interaction, MemoryTier, ToolCall, Turn};
-use fm_embed::{EmbedConfig, Embedder, MlxEmbedder, StubEmbedder};
+use fm_embed::{Embedder, StubEmbedder};
 use fm_engine::{
     entity_extract::{EntityExtractor, ExtractConfig, MlxEntityExtractor},
     MemoryEngine,

@@ -2,7 +2,7 @@
 
 > **[English](README.md)** | 中文
 
-> **当前版本：v1.4.2** — 检索质量消融落地（issue #25）：全融合评分对纯 cosine **recall@5 +0.40**（0.8270 vs 0.4250，全量语料见 `docs/benchmarks/retrieval-quality-2026-10-25.md`）；benchmark 首测暴露融合衰减项缺陷并裁定 retune — 融合衰减项改用归一化新鲜度（实测原始 `W(t)` 融合反而*差于*纯 cosine）。CI 门禁：融合评分永不低于纯 cosine。v1.4.1 MLX embedding key TOML 镜像（issue #23）、v1.4.0 作用域命名空间（issue #21）、v1.3.0 fusion-identity 集成（issue #18）、v1.2.0 多租户隔离（issue #16）此前已落地。已知限制见 `CHANGELOG.md` "Known limitations"，非阻塞。
+> **当前版本：v1.4.3** — CI 红修复（issue #27）：跨仓 path 依赖（`fg-redact` 依赖 fusion-guard、`fs-core` 依赖 fusion-store）破坏 CI 独立 checkout，全部换成 pin 的 git tag 依赖（与本地工作树零漂移），并以无兄弟目录的全新 lone clone 验证通过。v1.4.2 检索质量消融（issue #25）：全融合评分对纯 cosine **recall@5 +0.40**（0.8270 vs 0.4250，全量语料见 `docs/benchmarks/retrieval-quality-2026-10-25.md`）；benchmark 首测暴露融合衰减项缺陷并裁定 retune — 融合衰减项改用归一化新鲜度（实测原始 `W(t)` 融合反而*差于*纯 cosine）。CI 门禁：融合评分永不低于纯 cosine。v1.4.1 MLX embedding key TOML 镜像（issue #23）、v1.4.0 作用域命名空间（issue #21）、v1.3.0 fusion-identity 集成（issue #18）、v1.2.0 多租户隔离（issue #16）此前已落地。已知限制见 `CHANGELOG.md` "Known limitations"，非阻塞。
 
 Fusion 生态（"一核九端"）系统级长/短期记忆与认知图谱中枢。解决 Agent 跨 session 状态断层、重复提问、context window 爆炸，目标：越用越懂用户。
 
@@ -227,6 +227,10 @@ PRD §14 M5 三部分，(a) store-fusion 可选切换、(b) fusion-guard DLP gat
 
 - **fuzz**：`cargo-fuzz` 目标 — JSON-RPC 请求解析（畸形 JSON / 超长 / 坏 UTF-8 / 类型混淆 / 嵌套深）、HTTP body 边界、实体抽取 JSON 解析。崩溃/panic 视为缺陷。`crates/fm-server/fuzz/`。
 - **负载压测**：扩 `retrieve_bench` — 100k 向量（基线 10k × 10）+ 并发梯度（1/10/50/100），记录 p50/p99/p999 + 吞吐。商用级负载验证。结果落 `benches/baseline-1.0.0-*.json`。
+
+### v1.4.3 CI 红修复 — 跨仓 path 依赖改 git tag 依赖（issue #27）
+
+v1.4.2 commit 落地即红：CI 只 checkout fusion-memory 本仓，而 `fm-engine` 依赖 `fg-redact`、`fm-store`（可选 `store-fusion`）依赖 `fs-core`，均为 monorepo 兄弟目录相对 path — 任何 build 步骤跑之前 workspace manifest 加载即断。现全部改为公开上游仓的 pin 版 git tag 依赖（`dahai80/fusion-guard` `v0.2.0-rc.7`、`dahai80/fusion-store` `v0.2.0-rc.3`），各自与本地工作树同 commit（零漂移）。以无兄弟仓的全新独立 clone 跑 `cargo test --workspace` 验证通过。运行时保持 100% 离线（HTTP 仅 127.0.0.1）；构建期 cargo 每个依赖只 fetch 一次并缓存。本地改上游联调：`[patch."https://github.com/dahai80/fusion-guard"]` / `[patch."https://github.com/dahai80/fusion-store"]` 覆盖。
 
 ### v1.4.2 检索质量消融（issue #25）
 

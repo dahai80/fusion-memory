@@ -2,7 +2,7 @@
 
 > **English** | **[中文](README_CN.md)**
 
-> **Current version: v1.4.2** — retrieval quality ablation landed (issue #25): full fusion scoring beats plain cosine by **+0.40 recall@5** (0.8270 vs 0.4250, full-scale corpus in `docs/benchmarks/retrieval-quality-2026-10-25.md`), and the benchmark's first finding forced a retune — the fusion decay term now uses normalized freshness instead of raw `W(t)` (raw-`W(t)` fusion measured *worse* than plain cosine). CI gate: fusion must never score below plain cosine. v1.4.1 MLX embedding API key TOML mirror (issue #23), v1.4.0 scoped memory namespaces (issue #21), v1.3.0 fusion-identity integration (issue #18), v1.2.0 multi-tenant isolation (issue #16) landed earlier. Known limitations in `CHANGELOG.md` "Known limitations", non-blocking.
+> **Current version: v1.4.3** — CI-red fix (issue #27): the cross-repo path dependencies (`fg-redact` on fusion-guard, `fs-core` on fusion-store) broke CI's standalone checkout; both replaced with pinned git tag deps (zero drift vs the local trees) and verified against a fresh lone clone. v1.4.2 retrieval quality ablation (issue #25): full fusion scoring beats plain cosine by **+0.40 recall@5** (0.8270 vs 0.4250, full-scale corpus in `docs/benchmarks/retrieval-quality-2026-10-25.md`), and the benchmark's first finding forced a retune — the fusion decay term now uses normalized freshness instead of raw `W(t)` (raw-`W(t)` fusion measured *worse* than plain cosine). CI gate: fusion must never score below plain cosine. v1.4.1 MLX embedding API key TOML mirror (issue #23), v1.4.0 scoped memory namespaces (issue #21), v1.3.0 fusion-identity integration (issue #18), v1.2.0 multi-tenant isolation (issue #16) landed earlier. Known limitations in `CHANGELOG.md` "Known limitations", non-blocking.
 
 The system-level long/short-term memory and cognitive graph hub of the Fusion ecosystem ("一核九端"). Solves the Agent cross-session state gap, repeated questions, and context-window blowup. Goal: the more it is used, the better it knows the user.
 
@@ -227,6 +227,10 @@ Handling of 7 blockers before commercial release. Class A 3 items constrained by
 
 - **fuzz**: `cargo-fuzz` targets — JSON-RPC request parsing (malformed JSON / overlong / bad UTF-8 / type confusion / deep nesting), HTTP body boundaries, entity extraction JSON parsing. Crash/panic treated as defect. `crates/fm-server/fuzz/`.
 - **load stress**: expanded `retrieve_bench` — 100k vectors (baseline 10k × 10) + concurrency gradient (1/10/50/100), recording p50/p99/p999 + throughput. Commercial-grade load validation. Results saved to `benches/baseline-1.0.0-*.json`.
+
+### v1.4.3 CI-red fix — cross-repo path deps → git tag deps (issue #27)
+
+The v1.4.2 commit landed red: CI checks out fusion-memory alone, but `fm-engine` depended on `fg-redact` and `fm-store` (optional `store-fusion`) on `fs-core` via monorepo sibling relative paths — the workspace manifest failed to load before any build step ran. Both are now pinned git tag dependencies on the public upstream repos (`dahai80/fusion-guard` `v0.2.0-rc.7`, `dahai80/fusion-store` `v0.2.0-rc.3`), each the same commit as the local working tree (zero drift). Verified by `cargo test --workspace` in a fresh standalone clone with no sibling repos. Runtime stays 100% offline (HTTP only to 127.0.0.1); cargo fetches each git dep once at build time and caches it. Local upstream co-development: `[patch."https://github.com/dahai80/fusion-guard"]` / `[patch."https://github.com/dahai80/fusion-store"]` overrides.
 
 ### v1.4.2 retrieval quality ablation (issue #25)
 
