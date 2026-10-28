@@ -5,6 +5,19 @@ Internal path-dep private ecosystem (not on crates.io); versions tag + GitHub re
 
 ## [Unreleased]
 
+## [1.4.4] — 2026-10-28
+
+Env contract documentation + check-env false-positive fix (issue #29, config governance Phase 2.2). Docs-only patch: no code change, no API change.
+
+### Added
+- **"Environment variables" section** (README.md / README_CN.md): consolidated `FUSION_MEMORY_*` inventory — server (fm-server/src/config.rs), embedding (fm-embed + `[embed]` TOML mirror), engine/persistence (PII redaction, static encryption, wop retention), cluster (fm-cluster election + sync) — each with default, purpose, and source file. Resolution priority chain documented: env > TOML (`FM_CONFIG` / `<data_dir>/fusion-memory.toml`) > secret file > default.
+
+### Fixed
+- **check-env `[legacy]` false positive** (workspace `scripts/check-env.py`, outside any git repo): rule 2c matched legacy names by line-level substring, so compliant `FUSION_MEMORY_MLX_API_KEY` (v1.4.1 API contract) was flagged for containing the substring `MLX_API_KEY` (`start.sh` lines 17/192 — both reference the compliant name and cannot be renamed). Rule 2c now extracts `FUSION_*` tokens and matches legacy names by exact prefix (alias-chain variants like `FUSION_MLX_API_KEY_FILE` still caught; the trailing-underscore `FUSION_FUSION_` bug pattern keeps substring matching, same source as rule 2a). Verified with a matcher unit matrix (11 cases) and a full workspace scan: this repo drops to **0 findings**; genuine legacy references in other repos still warn (workspace warn total 136 → 132, the 4 dropped findings diff-verified as false positives).
+
+### Acceptance
+- `python scripts/check-env.py` (workspace root): 0 non-baseline findings for this repo — issue #29's required-rename list was empty; every name already conforms to conventions §1.
+
 ## [1.4.3] — 2026-10-26
 
 CI-red fix: cross-repo path dependencies replaced with pinned git tag dependencies (issue #27). The v1.4.2 commit landed red on CI — a runner checks out fusion-memory alone, so the sibling monorepo directories don't exist and the whole workspace manifest fails to load before any build step.
