@@ -2,7 +2,7 @@
 
 > **[English](README.md)** | 中文
 
-> **当前版本：v1.4.3** — CI 红修复（issue #27）：跨仓 path 依赖（`fg-redact` 依赖 fusion-guard、`fs-core` 依赖 fusion-store）破坏 CI 独立 checkout，全部换成 pin 的 git tag 依赖（与本地工作树零漂移），并以无兄弟目录的全新 lone clone 验证通过。v1.4.2 检索质量消融（issue #25）：全融合评分对纯 cosine **recall@5 +0.40**（0.8270 vs 0.4250，全量语料见 `docs/benchmarks/retrieval-quality-2026-10-25.md`）；benchmark 首测暴露融合衰减项缺陷并裁定 retune — 融合衰减项改用归一化新鲜度（实测原始 `W(t)` 融合反而*差于*纯 cosine）。CI 门禁：融合评分永不低于纯 cosine。v1.4.1 MLX embedding key TOML 镜像（issue #23）、v1.4.0 作用域命名空间（issue #21）、v1.3.0 fusion-identity 集成（issue #18）、v1.2.0 多租户隔离（issue #16）此前已落地。已知限制见 `CHANGELOG.md` "Known limitations"，非阻塞。
+> **当前版本：v1.4.4** — env 契约文档（issue #29，配置治理 Phase 2.2）：本 README 汇总 `FUSION_MEMORY_*` 环境变量全表，另修 check-env 误报（合规名 `FUSION_MEMORY_MLX_API_KEY` 被子串匹配命中 legacy `MLX_API_KEY`；工作区 checker 改精确 token 匹配）。本仓零改名 — 验收 `python scripts/check-env.py`：0 findings。v1.4.3 CI 红修复（issue #27）：跨仓 path 依赖（`fg-redact` 依赖 fusion-guard、`fs-core` 依赖 fusion-store）破坏 CI 独立 checkout，全部换成 pin 的 git tag 依赖（与本地工作树零漂移），并以无兄弟目录的全新 lone clone 验证通过。v1.4.2 检索质量消融（issue #25）：全融合评分对纯 cosine **recall@5 +0.40**（0.8270 vs 0.4250，全量语料见 `docs/benchmarks/retrieval-quality-2026-10-25.md`）；benchmark 首测暴露融合衰减项缺陷并裁定 retune — 融合衰减项改用归一化新鲜度（实测原始 `W(t)` 融合反而*差于*纯 cosine）。CI 门禁：融合评分永不低于纯 cosine。v1.4.1 MLX embedding key TOML 镜像（issue #23）、v1.4.0 作用域命名空间（issue #21）、v1.3.0 fusion-identity 集成（issue #18）、v1.2.0 多租户隔离（issue #16）此前已落地。已知限制见 `CHANGELOG.md` "Known limitations"，非阻塞。
 
 Fusion 生态（"一核九端"）系统级长/短期记忆与认知图谱中枢。解决 Agent 跨 session 状态断层、重复提问、context window 爆炸，目标：越用越懂用户。
 
@@ -228,6 +228,10 @@ PRD §14 M5 三部分，(a) store-fusion 可选切换、(b) fusion-guard DLP gat
 - **fuzz**：`cargo-fuzz` 目标 — JSON-RPC 请求解析（畸形 JSON / 超长 / 坏 UTF-8 / 类型混淆 / 嵌套深）、HTTP body 边界、实体抽取 JSON 解析。崩溃/panic 视为缺陷。`crates/fm-server/fuzz/`。
 - **负载压测**：扩 `retrieve_bench` — 100k 向量（基线 10k × 10）+ 并发梯度（1/10/50/100），记录 p50/p99/p999 + 吞吐。商用级负载验证。结果落 `benches/baseline-1.0.0-*.json`。
 
+### v1.4.4 env 契约文档（issue #29）
+
+配置治理 Phase 2.2（工作区 `architecture/config-conventions.md` §1）。issue 对本仓的改名列**为空** — 所有命名已符合核心仓 `FUSION_MEMORY_*` 约定。check-env 唯一 finding（`[legacy] start.sh`）是 **checker 误报**：规则 2c 按行级子串匹配，合规名 `FUSION_MEMORY_MLX_API_KEY`（v1.4.1 API 契约，issue #23）含子串 `MLX_API_KEY`。已在工作区 checker（`scripts/check-env.py`）修复：规则 2c 改为提取 `FUSION_*` token 后按精确前缀匹配（别名链变体如 `FUSION_MLX_API_KEY_FILE` 仍命中；尾下划线 `FUSION_FUSION_` bug 模式与规则 2a 同源保持子串）。本仓交付：README/README_CN 新增"环境变量"汇总节 — 全量清单含默认值、来源文件与 env > TOML > secret 文件 > 默认 的优先级链。验收：`python scripts/check-env.py`（工作区根）本仓 0 findings。纯文档补丁，零代码变更，零 API 变更。
+
 ### v1.4.3 CI 红修复 — 跨仓 path 依赖改 git tag 依赖（issue #27）
 
 v1.4.2 commit 落地即红：CI 只 checkout fusion-memory 本仓，而 `fm-engine` 依赖 `fg-redact`、`fm-store`（可选 `store-fusion`）依赖 `fs-core`，均为 monorepo 兄弟目录相对 path — 任何 build 步骤跑之前 workspace manifest 加载即断。现全部改为公开上游仓的 pin 版 git tag 依赖（`dahai80/fusion-guard` `v0.2.0-rc.7`、`dahai80/fusion-store` `v0.2.0-rc.3`），各自与本地工作树同 commit（零漂移）。以无兄弟仓的全新独立 clone 跑 `cargo test --workspace` 验证通过。运行时保持 100% 离线（HTTP 仅 127.0.0.1）；构建期 cargo 每个依赖只 fetch 一次并缓存。本地改上游联调：`[patch."https://github.com/dahai80/fusion-guard"]` / `[patch."https://github.com/dahai80/fusion-store"]` 覆盖。
@@ -341,6 +345,66 @@ cargo llvm-cov --workspace \
 > commit 期间另线程纯 Python 计数器持续增长 → 证明 `py.allow_threads` 释放 GIL，事件循环不冻结。
 
 工具链：edition 2021，MSRV 1.87。系统 rustc（Homebrew）即可编译，无需 rustup。
+
+## 环境变量
+
+统一 env 契约（工作区 `architecture/config-conventions.md` §1，配置治理 Phase 2.2，issue #29）。命名全部 `FUSION_MEMORY_*` 作用域（核心仓约定，无裸名/跨应用名）。优先级：env > TOML（`FM_CONFIG` 或 `<data_dir>/fusion-memory.toml`）> secret 文件 > 默认。密钥建议走 `*_FILE` 变体或 `[embed]` TOML 段，避免落 env/命令行。
+
+服务端（`fm-server/src/config.rs`）：
+
+| env | 默认 | 用途 |
+|-----|------|------|
+| `FM_HOME` | `~/.fusion-memory` | 数据目录；sock 路径由它派生 |
+| `FM_CONFIG` | `<data_dir>/fusion-memory.toml` | TOML 配置路径 |
+| `FUSION_MEMORY_SOCK` | `<data_dir>/fusion-memory.sock` | UDS socket 路径 |
+| `FUSION_MEMORY_HTTP_PORT` | `11435` | HTTP 端口（0 = 关 HTTP；开 HTTP 须配 `api_key`） |
+| `FUSION_MEMORY_API_KEY` / `_FILE` | 空 | HTTP bearer key（空 = 不鉴权；file 变体读 0600 密钥文件） |
+| `FUSION_MEMORY_UDS_TOKEN` / `_FILE` | 空 | UDS 连接级 token（`AUTH <token>` 握手） |
+| `FUSION_MEMORY_GATEWAY_ORIGIN_REQUIRED` | `false` | HTTP 强制 `X-Fusion-Route` 网关头 |
+| `FUSION_MEMORY_DEFAULT_TENANT` | 空 | 调用方未带租户时的默认租户 |
+| `FUSION_MEMORY_MULTI_TENANT` | `false` | 开启 fusion-identity JWT 边界校验 |
+| `FUSION_MEMORY_IDENTITY_URL` | `http://127.0.0.1:11470` | fusion-identity 校验端点 |
+| `FUSION_MEMORY_IDENTITY_SERVICE_TOKEN` / `_FILE` | 空 | identity 校验调用方 service token |
+| `FUSION_MEMORY_DIM` | `1024` | 嵌入维度（须 > 0） |
+| `FUSION_MEMORY_STUB` | 未设 | `=1` 用 StubEmbedder（离线 FNV-1a）替代真 bge-m3 |
+
+嵌入（fm-embed + fm-server `[embed]` TOML 镜像，同名 env 两者通吃且优先）：
+
+| env | 默认 | 用途 |
+|-----|------|------|
+| `FUSION_MLX_URL` | `http://127.0.0.1:11434/v1` | fusion-mlx OpenAI 兼容 base URL |
+| `FUSION_MEMORY_EMBED_MODEL` | `bge-m3` | 嵌入模型名 |
+| `FUSION_MEMORY_MLX_API_KEY` / `_FILE` | 空 | fusion-mlx API key（env 优先于 `[embed]` TOML） |
+| `FUSION_MEMORY_MLX_CONCURRENCY` | `2` | 对 mlx 并发嵌入请求数 |
+| `FUSION_MEMORY_CHAT_MODEL` | `Qwen3.5-9B-4bit` | live 测试实体抽取聊天模型 |
+
+引擎 / 持久化：
+
+| env | 默认 | 用途 |
+|-----|------|------|
+| `FUSION_MEMORY_REDACT_PII` | 开（fail-closed） | `=0`/`=false` 关闭 commit/导入 PII 脱敏 |
+| `FUSION_MEMORY_ENC_KEY_FILE` | 未设 | AES-256-GCM key 文件（0600，32B 原始 key） |
+| `FUSION_MEMORY_ENC_PASSPHRASE` | 未设 | argon2id KDF 口令（备选 key 来源） |
+| `FUSION_MEMORY_WOP_RETENTION` | 不裁剪 | 写操作日志保留上限（调用方侧裁剪） |
+
+集群（fm-cluster；全程内网，无云）：
+
+| env | 默认 | 用途 |
+|-----|------|------|
+| `FUSION_MEMORY_ROLE` | role 文件 > standalone | 注入 leader/follower/standalone 角色 |
+| `FUSION_MEMORY_SYNC_PORT` | `11436` | TCP 同步端口 |
+| `FUSION_MEMORY_CLUSTER_BIND_ADDR` | `127.0.0.1` | 同步监听绑定地址 |
+| `FUSION_MEMORY_CLUSTER_TOKEN` | 未设 | H3 握手鉴权 token |
+| `FUSION_MEMORY_CLUSTER_ALLOW_NO_TOKEN` | `false` | 接受无 token 对端（内网信任） |
+| `FUSION_MEMORY_CLUSTER_EPOCH` | epoch 文件 > 0 | fencing epoch（拒绝陈旧 leader） |
+| `FUSION_MEMORY_CLUSTER_NODES` | 未设 | 选举成员表 `host:port,...`（未设 = 不选举） |
+| `FUSION_MEMORY_CLUSTER_NODE_ID` | 未设 | 在 `CLUSTER_NODES` 中自身下标（0 起） |
+| `FUSION_MEMORY_LEADER` | 未设 | follower 模式触发：同步源 leader 地址 |
+| `FUSION_MEMORY_HEARTBEAT_SECS` | `5` | follower ping 间隔 |
+| `FUSION_MEMORY_HEARTBEAT_FAILS` | `3` | 连续失败次数 = LeaderDown |
+| `FUSION_MEMORY_FETCH_LIMIT` | `256` | 单次同步拉取 wop 上限 |
+
+门禁：`python scripts/check-env.py`（工作区根）——本仓 0 findings。
 
 ## M1 数据流
 

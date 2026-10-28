@@ -2,7 +2,7 @@
 
 > **English** | **[中文](README_CN.md)**
 
-> **Current version: v1.4.3** — CI-red fix (issue #27): the cross-repo path dependencies (`fg-redact` on fusion-guard, `fs-core` on fusion-store) broke CI's standalone checkout; both replaced with pinned git tag deps (zero drift vs the local trees) and verified against a fresh lone clone. v1.4.2 retrieval quality ablation (issue #25): full fusion scoring beats plain cosine by **+0.40 recall@5** (0.8270 vs 0.4250, full-scale corpus in `docs/benchmarks/retrieval-quality-2026-10-25.md`), and the benchmark's first finding forced a retune — the fusion decay term now uses normalized freshness instead of raw `W(t)` (raw-`W(t)` fusion measured *worse* than plain cosine). CI gate: fusion must never score below plain cosine. v1.4.1 MLX embedding API key TOML mirror (issue #23), v1.4.0 scoped memory namespaces (issue #21), v1.3.0 fusion-identity integration (issue #18), v1.2.0 multi-tenant isolation (issue #16) landed earlier. Known limitations in `CHANGELOG.md` "Known limitations", non-blocking.
+> **Current version: v1.4.4** — env contract documentation (issue #29, config governance Phase 2.2): consolidated `FUSION_MEMORY_*` environment-variable tables in this README, plus a check-env false-positive fix (compliant `FUSION_MEMORY_MLX_API_KEY` was substring-matched as legacy `MLX_API_KEY`; the workspace checker now matches exact tokens). The repo itself needed zero renames — acceptance `python scripts/check-env.py`: 0 findings. v1.4.3 CI-red fix (issue #27): the cross-repo path dependencies (`fg-redact` on fusion-guard, `fs-core` on fusion-store) broke CI's standalone checkout; both replaced with pinned git tag deps (zero drift vs the local trees) and verified against a fresh lone clone. v1.4.2 retrieval quality ablation (issue #25): full fusion scoring beats plain cosine by **+0.40 recall@5** (0.8270 vs 0.4250, full-scale corpus in `docs/benchmarks/retrieval-quality-2026-10-25.md`), and the benchmark's first finding forced a retune — the fusion decay term now uses normalized freshness instead of raw `W(t)` (raw-`W(t)` fusion measured *worse* than plain cosine). CI gate: fusion must never score below plain cosine. v1.4.1 MLX embedding API key TOML mirror (issue #23), v1.4.0 scoped memory namespaces (issue #21), v1.3.0 fusion-identity integration (issue #18), v1.2.0 multi-tenant isolation (issue #16) landed earlier. Known limitations in `CHANGELOG.md` "Known limitations", non-blocking.
 
 The system-level long/short-term memory and cognitive graph hub of the Fusion ecosystem ("一核九端"). Solves the Agent cross-session state gap, repeated questions, and context-window blowup. Goal: the more it is used, the better it knows the user.
 
@@ -228,6 +228,10 @@ Handling of 7 blockers before commercial release. Class A 3 items constrained by
 - **fuzz**: `cargo-fuzz` targets — JSON-RPC request parsing (malformed JSON / overlong / bad UTF-8 / type confusion / deep nesting), HTTP body boundaries, entity extraction JSON parsing. Crash/panic treated as defect. `crates/fm-server/fuzz/`.
 - **load stress**: expanded `retrieve_bench` — 100k vectors (baseline 10k × 10) + concurrency gradient (1/10/50/100), recording p50/p99/p999 + throughput. Commercial-grade load validation. Results saved to `benches/baseline-1.0.0-*.json`.
 
+### v1.4.4 env contract documentation (issue #29)
+
+Config governance Phase 2.2 (workspace `architecture/config-conventions.md` §1). The issue's required-rename list for this repo was **empty** — every name already follows the `FUSION_MEMORY_*` core-repo convention. The single check-env finding (`[legacy] start.sh`) was a **checker false positive**: rule 2c matched by line-level substring, and compliant `FUSION_MEMORY_MLX_API_KEY` (the v1.4.1 API contract, issue #23) contains the substring `MLX_API_KEY`. Fixed in the workspace checker (`scripts/check-env.py`): rule 2c now extracts `FUSION_*` tokens and matches legacy names by exact prefix (alias-chain variants like `FUSION_MLX_API_KEY_FILE` still caught; the trailing-underscore `FUSION_FUSION_` bug pattern stays substring as in rule 2a). Repo deliverable: consolidated "Environment variables" section (this README + README_CN) — full inventory with defaults, sources, and the env > TOML > secret-file > default priority chain. Acceptance: `python scripts/check-env.py` (workspace root) = 0 findings for this repo. Docs-only patch, no code change, no API change.
+
 ### v1.4.3 CI-red fix — cross-repo path deps → git tag deps (issue #27)
 
 The v1.4.2 commit landed red: CI checks out fusion-memory alone, but `fm-engine` depended on `fg-redact` and `fm-store` (optional `store-fusion`) on `fs-core` via monorepo sibling relative paths — the workspace manifest failed to load before any build step ran. Both are now pinned git tag dependencies on the public upstream repos (`dahai80/fusion-guard` `v0.2.0-rc.7`, `dahai80/fusion-store` `v0.2.0-rc.3`), each the same commit as the local working tree (zero drift). Verified by `cargo test --workspace` in a fresh standalone clone with no sibling repos. Runtime stays 100% offline (HTTP only to 127.0.0.1); cargo fetches each git dep once at build time and caches it. Local upstream co-development: `[patch."https://github.com/dahai80/fusion-guard"]` / `[patch."https://github.com/dahai80/fusion-store"]` overrides.
@@ -341,6 +345,66 @@ cargo llvm-cov --workspace \
 > During commit, another thread's pure-Python counter keeps incrementing → proves `py.allow_threads` releases the GIL, event loop not frozen.
 
 Toolchain: edition 2021, MSRV 1.87. System rustc (Homebrew) compiles directly, no rustup needed.
+
+## Environment variables
+
+Consolidated env contract (workspace `architecture/config-conventions.md` §1, config governance Phase 2.2, issue #29). All names are `FUSION_MEMORY_*` scoped (core-repo convention; no bare or cross-app names). Resolution priority: env > TOML (`FM_CONFIG` or `<data_dir>/fusion-memory.toml`) > secret file > default. Secrets should go through the `*_FILE` variants or the `[embed]` TOML section rather than env/command line.
+
+Server (`fm-server/src/config.rs`):
+
+| Env | Default | Purpose |
+|-----|---------|---------|
+| `FM_HOME` | `~/.fusion-memory` | data dir; sock path derives from it |
+| `FM_CONFIG` | `<data_dir>/fusion-memory.toml` | TOML config path |
+| `FUSION_MEMORY_SOCK` | `<data_dir>/fusion-memory.sock` | UDS socket path |
+| `FUSION_MEMORY_HTTP_PORT` | `11435` | HTTP port (0 = HTTP off; opening HTTP requires `api_key`) |
+| `FUSION_MEMORY_API_KEY` / `_FILE` | empty | HTTP bearer key (empty = no auth; file variant reads a 0600 secret file) |
+| `FUSION_MEMORY_UDS_TOKEN` / `_FILE` | empty | UDS connection-level token (`AUTH <token>` handshake) |
+| `FUSION_MEMORY_GATEWAY_ORIGIN_REQUIRED` | `false` | require `X-Fusion-Route` gateway header on HTTP |
+| `FUSION_MEMORY_DEFAULT_TENANT` | empty | tenant when caller provides none |
+| `FUSION_MEMORY_MULTI_TENANT` | `false` | enable fusion-identity JWT boundary verify |
+| `FUSION_MEMORY_IDENTITY_URL` | `http://127.0.0.1:11470` | fusion-identity verify endpoint |
+| `FUSION_MEMORY_IDENTITY_SERVICE_TOKEN` / `_FILE` | empty | service token for identity verify calls |
+| `FUSION_MEMORY_DIM` | `1024` | embedding dimension (must be > 0) |
+| `FUSION_MEMORY_STUB` | unset | `=1` uses StubEmbedder (offline FNV-1a) instead of real bge-m3 |
+
+Embedding (fm-embed + fm-server `[embed]` TOML mirror, same env wins for both):
+
+| Env | Default | Purpose |
+|-----|---------|---------|
+| `FUSION_MLX_URL` | `http://127.0.0.1:11434/v1` | fusion-mlx OpenAI-compatible base URL |
+| `FUSION_MEMORY_EMBED_MODEL` | `bge-m3` | embedding model name |
+| `FUSION_MEMORY_MLX_API_KEY` / `_FILE` | empty | fusion-mlx API key (env wins over `[embed]` TOML) |
+| `FUSION_MEMORY_MLX_CONCURRENCY` | `2` | concurrent embedding requests to mlx |
+| `FUSION_MEMORY_CHAT_MODEL` | `Qwen3.5-9B-4bit` | live-test entity-extraction chat model |
+
+Engine / persistence:
+
+| Env | Default | Purpose |
+|-----|---------|---------|
+| `FUSION_MEMORY_REDACT_PII` | on (fail-closed) | `=0`/`=false` disables PII redaction on commit/import |
+| `FUSION_MEMORY_ENC_KEY_FILE` | unset | AES-256-GCM key file (0600, 32B raw key) |
+| `FUSION_MEMORY_ENC_PASSPHRASE` | unset | argon2id KDF passphrase (alternative key source) |
+| `FUSION_MEMORY_WOP_RETENTION` | no prune | write-op log retention bound (caller-side pruning) |
+
+Cluster (fm-cluster; all intranet, no cloud):
+
+| Env | Default | Purpose |
+|-----|---------|---------|
+| `FUSION_MEMORY_ROLE` | role file > standalone | inject leader/follower/standalone role |
+| `FUSION_MEMORY_SYNC_PORT` | `11436` | TCP sync port |
+| `FUSION_MEMORY_CLUSTER_BIND_ADDR` | `127.0.0.1` | sync listener bind address |
+| `FUSION_MEMORY_CLUSTER_TOKEN` | unset | H3 handshake auth token |
+| `FUSION_MEMORY_CLUSTER_ALLOW_NO_TOKEN` | `false` | accept token-less peers (intranet trust) |
+| `FUSION_MEMORY_CLUSTER_EPOCH` | epoch file > 0 | fencing epoch (rejects stale leaders) |
+| `FUSION_MEMORY_CLUSTER_NODES` | unset | election membership `host:port,...` (unset = no election) |
+| `FUSION_MEMORY_CLUSTER_NODE_ID` | unset | 0-based own index in `CLUSTER_NODES` |
+| `FUSION_MEMORY_LEADER` | unset | follower mode trigger: leader address to sync from |
+| `FUSION_MEMORY_HEARTBEAT_SECS` | `5` | follower ping interval |
+| `FUSION_MEMORY_HEARTBEAT_FAILS` | `3` | consecutive failures = LeaderDown |
+| `FUSION_MEMORY_FETCH_LIMIT` | `256` | max wops per sync pull |
+
+Gate: `python scripts/check-env.py` (workspace root) — this repo has 0 findings.
 
 ## M1 data flow
 
