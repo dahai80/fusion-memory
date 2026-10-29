@@ -5,6 +5,13 @@ Internal path-dep private ecosystem (not on crates.io); versions tag + GitHub re
 
 ## [Unreleased]
 
+## [1.4.5] — 2026-10-30
+
+start.sh registry self-check (issue #31, config governance Phase 3.3). Shell-only patch: no Rust code change, no API change.
+
+### Added
+- **`start.sh` port-registry self-check**: after the port-in-use check, `start.sh start` verifies the configured `FUSION_MEMORY_HTTP_PORT` is registered for `fusion-memory` in `port-registry.yaml` (`FUSION_REGISTRY`, default `~/fusion/architecture/port-registry.yaml`) and refuses to start (exit 1) otherwise — the CI `check-ports.py` failure moves forward to first boot. Missing registry file = warn + continue (standalone deploy); `FUSION_SKIP_REGISTRY_CHECK=1` bypasses with a warning. Acceptance verified against temp registry copies: unregistered port refuses, registered port starts, bypass and missing-file paths warn + start.
+
 ## [1.4.4] — 2026-10-28
 
 Env contract documentation + check-env false-positive fix (issue #29, config governance Phase 2.2). Docs-only patch: no code change, no API change.

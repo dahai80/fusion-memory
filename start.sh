@@ -19,6 +19,8 @@
 #     mlx_url = "http://127.0.0.1:11434/v1"
 #     embed_model = "BAAI/bge-m3"
 #     mlx_api_key_file = "/path/to/key"   # 推荐 0600 secret 文件, 免 env 明文
+#   FUSION_REGISTRY (默认 ~/fusion/architecture/port-registry.yaml) / FUSION_SKIP_REGISTRY_CHECK=1
+#     启动前注册自检 (#31): 端口未登记拒绝启动; registry 缺失 warn 放行
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -77,6 +79,20 @@ cmd_start() {
             echo "${C_RED}✘ port $HTTP_PORT already in use${C_RESET}" >&2
             exit 1
         fi
+    fi
+    # Config Phase 3.3 (#31): 注册自检 — 端口未登记 port-registry.yaml 则拒绝启动,
+    # 把 CI check-ports 的失败前移到 start。registry 文件缺失 = warn 放行 (standalone
+    # 部署); FUSION_SKIP_REGISTRY_CHECK=1 显式跳过。
+    SERVICE="fusion-memory"
+    REGISTRY="${FUSION_REGISTRY:-$HOME/fusion/architecture/port-registry.yaml}"
+    if [ ! -f "$REGISTRY" ]; then
+        echo "${C_YELLOW}warn: port-registry.yaml not found at $REGISTRY — registry self-check skipped${C_RESET}" >&2
+    elif ! grep -A3 "^  ${SERVICE}:" "$REGISTRY" 2>/dev/null | grep -q "port: $HTTP_PORT$"; then
+        if [ "${FUSION_SKIP_REGISTRY_CHECK:-}" != "1" ]; then
+            echo "${C_RED}✘ port $HTTP_PORT for ${SERVICE} not registered in $REGISTRY — refusing to start${C_RESET}" >&2
+            exit 1
+        fi
+        echo "${C_YELLOW}warn: registry check bypassed (FUSION_SKIP_REGISTRY_CHECK=1)${C_RESET}" >&2
     fi
     # 残留 sock 清理
     if [[ -e "$SOCK" ]]; then

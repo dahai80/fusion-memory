@@ -2,7 +2,7 @@
 
 > **[English](README.md)** | 中文
 
-> **当前版本：v1.4.4** — env 契约文档（issue #29，配置治理 Phase 2.2）：本 README 汇总 `FUSION_MEMORY_*` 环境变量全表，另修 check-env 误报（合规名 `FUSION_MEMORY_MLX_API_KEY` 被子串匹配命中 legacy `MLX_API_KEY`；工作区 checker 改精确 token 匹配）。本仓零改名 — 验收 `python scripts/check-env.py`：0 findings。v1.4.3 CI 红修复（issue #27）：跨仓 path 依赖（`fg-redact` 依赖 fusion-guard、`fs-core` 依赖 fusion-store）破坏 CI 独立 checkout，全部换成 pin 的 git tag 依赖（与本地工作树零漂移），并以无兄弟目录的全新 lone clone 验证通过。v1.4.2 检索质量消融（issue #25）：全融合评分对纯 cosine **recall@5 +0.40**（0.8270 vs 0.4250，全量语料见 `docs/benchmarks/retrieval-quality-2026-10-25.md`）；benchmark 首测暴露融合衰减项缺陷并裁定 retune — 融合衰减项改用归一化新鲜度（实测原始 `W(t)` 融合反而*差于*纯 cosine）。CI 门禁：融合评分永不低于纯 cosine。v1.4.1 MLX embedding key TOML 镜像（issue #23）、v1.4.0 作用域命名空间（issue #21）、v1.3.0 fusion-identity 集成（issue #18）、v1.2.0 多租户隔离（issue #16）此前已落地。已知限制见 `CHANGELOG.md` "Known limitations"，非阻塞。
+> **当前版本：v1.4.5** — start.sh 注册自检（issue #31，配置治理 Phase 3.3）：`start.sh start` 启动前校验自身 `port-registry.yaml` 登记 — 端口未登记则拒绝启动（exit 1），把 CI check-ports 的失败前移到启动时。registry 文件缺失 = warn 放行（standalone 部署）；`FUSION_SKIP_REGISTRY_CHECK=1` 显式跳过。v1.4.4 env 契约文档（issue #29，配置治理 Phase 2.2）：本 README 汇总 `FUSION_MEMORY_*` 环境变量全表，另修 check-env 误报（合规名 `FUSION_MEMORY_MLX_API_KEY` 被子串匹配命中 legacy `MLX_API_KEY`；工作区 checker 改精确 token 匹配）。本仓零改名 — 验收 `python scripts/check-env.py`：0 findings。v1.4.3 CI 红修复（issue #27）：跨仓 path 依赖（`fg-redact` 依赖 fusion-guard、`fs-core` 依赖 fusion-store）破坏 CI 独立 checkout，全部换成 pin 的 git tag 依赖（与本地工作树零漂移），并以无兄弟目录的全新 lone clone 验证通过。v1.4.2 检索质量消融（issue #25）：全融合评分对纯 cosine **recall@5 +0.40**（0.8270 vs 0.4250，全量语料见 `docs/benchmarks/retrieval-quality-2026-10-25.md`）；benchmark 首测暴露融合衰减项缺陷并裁定 retune — 融合衰减项改用归一化新鲜度（实测原始 `W(t)` 融合反而*差于*纯 cosine）。CI 门禁：融合评分永不低于纯 cosine。v1.4.1 MLX embedding key TOML 镜像（issue #23）、v1.4.0 作用域命名空间（issue #21）、v1.3.0 fusion-identity 集成（issue #18）、v1.2.0 多租户隔离（issue #16）此前已落地。已知限制见 `CHANGELOG.md` "Known limitations"，非阻塞。
 
 Fusion 生态（"一核九端"）系统级长/短期记忆与认知图谱中枢。解决 Agent 跨 session 状态断层、重复提问、context window 爆炸，目标：越用越懂用户。
 
@@ -228,6 +228,10 @@ PRD §14 M5 三部分，(a) store-fusion 可选切换、(b) fusion-guard DLP gat
 - **fuzz**：`cargo-fuzz` 目标 — JSON-RPC 请求解析（畸形 JSON / 超长 / 坏 UTF-8 / 类型混淆 / 嵌套深）、HTTP body 边界、实体抽取 JSON 解析。崩溃/panic 视为缺陷。`crates/fm-server/fuzz/`。
 - **负载压测**：扩 `retrieve_bench` — 100k 向量（基线 10k × 10）+ 并发梯度（1/10/50/100），记录 p50/p99/p999 + 吞吐。商用级负载验证。结果落 `benches/baseline-1.0.0-*.json`。
 
+### v1.4.5 start.sh 注册自检（issue #31）
+
+配置治理 Phase 3.3（工作区 `architecture/fusion-config-opti-archi-1028.md` §Phase 3）。`start.sh start` 在端口占用检查之后、拉起 fm-server 之前校验自身 `port-registry.yaml` 登记：服务的 `FUSION_MEMORY_HTTP_PORT` 必须与 registry 中 `fusion-memory` 的 `port:` 一致，否则拒绝启动（exit 1）— 把 CI `check-ports.py` 的失败前移到首次启动。语义：registry 文件缺失（`FUSION_REGISTRY`，默认 `~/fusion/architecture/port-registry.yaml`）= warn 放行（无工作区 checkout 的 standalone 部署）；`FUSION_SKIP_REGISTRY_CHECK=1` 跳过并告警。纯 shell 补丁，无 Rust 代码/API 变更。验收以临时 registry 副本实测：未登记端口拒启（exit 1）、已登记端口正常 Running、bypass 与文件缺失路径 warn + 启动。
+
 ### v1.4.4 env 契约文档（issue #29）
 
 配置治理 Phase 2.2（工作区 `architecture/config-conventions.md` §1）。issue 对本仓的改名列**为空** — 所有命名已符合核心仓 `FUSION_MEMORY_*` 约定。check-env 唯一 finding（`[legacy] start.sh`）是 **checker 误报**：规则 2c 按行级子串匹配，合规名 `FUSION_MEMORY_MLX_API_KEY`（v1.4.1 API 契约，issue #23）含子串 `MLX_API_KEY`。已在工作区 checker（`scripts/check-env.py`）修复：规则 2c 改为提取 `FUSION_*` token 后按精确前缀匹配（别名链变体如 `FUSION_MLX_API_KEY_FILE` 仍命中；尾下划线 `FUSION_FUSION_` bug 模式与规则 2a 同源保持子串）。本仓交付：README/README_CN 新增"环境变量"汇总节 — 全量清单含默认值、来源文件与 env > TOML > secret 文件 > 默认 的优先级链。验收：`python scripts/check-env.py`（工作区根）本仓 0 findings。纯文档补丁，零代码变更，零 API 变更。
@@ -367,6 +371,8 @@ cargo llvm-cov --workspace \
 | `FUSION_MEMORY_IDENTITY_SERVICE_TOKEN` / `_FILE` | 空 | identity 校验调用方 service token |
 | `FUSION_MEMORY_DIM` | `1024` | 嵌入维度（须 > 0） |
 | `FUSION_MEMORY_STUB` | 未设 | `=1` 用 StubEmbedder（离线 FNV-1a）替代真 bge-m3 |
+| `FUSION_REGISTRY` | `~/fusion/architecture/port-registry.yaml` | start.sh 注册自检数据源（issue #31）；文件缺失 warn 放行 |
+| `FUSION_SKIP_REGISTRY_CHECK` | 未设 | `=1` 跳过 start.sh 注册自检（告警） |
 
 嵌入（fm-embed + fm-server `[embed]` TOML 镜像，同名 env 两者通吃且优先）：
 
