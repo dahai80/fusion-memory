@@ -108,4 +108,51 @@ pub trait FusionMemoryEngine: Send + Sync {
     async fn count_tenant(&self, scope: Option<&str>, _tenant: &str) -> MemoryResult<u64> {
         self.count(scope).await
     }
+
+    // #33 web surface (v1.5.0): browse/manage APIs for the web UI. Default impls
+    // unsupported (same pattern as delete_scope/count); production MemoryEngine
+    // overrides. tenant="" = default tenant.
+
+    /// #33: paged browse over memory items (created_timestamp ASC), optional
+    /// memory_type / namespace filters, optional tombstoned inclusion.
+    async fn list_memories(
+        &self,
+        _q: &crate::browse::ListQuery,
+        _tenant: &str,
+    ) -> MemoryResult<Vec<MemoryItem>> {
+        Err(crate::error::MemoryError::Unsupported(
+            "list_memories not implemented for this engine".into(),
+        ))
+    }
+
+    /// #33: latest audit_log entries (id DESC), capped by `limit`.
+    async fn list_audit_log(&self, _limit: usize) -> MemoryResult<Vec<crate::browse::AuditEntry>> {
+        Err(crate::error::MemoryError::Unsupported(
+            "list_audit_log not implemented for this engine".into(),
+        ))
+    }
+
+    /// #33: full merge_log (id DESC) for the merge console.
+    async fn list_merges(&self) -> MemoryResult<Vec<crate::browse::MergeEntry>> {
+        Err(crate::error::MemoryError::Unsupported(
+            "list_merges not implemented for this engine".into(),
+        ))
+    }
+
+    /// #33: undo one merge by merge_log id (source un-tombstoned, log row removed).
+    /// Returns whether the merge existed.
+    async fn unmerge(&self, _merge_id: u64) -> MemoryResult<bool> {
+        Err(crate::error::MemoryError::Unsupported(
+            "unmerge not implemented for this engine".into(),
+        ))
+    }
+
+    /// #33: cross-store reconciliation (SQLite ids ↔ store vectors); dangling
+    /// rows land in the reconcile report, tombstones physically deleted.
+    /// Returns reconciled row count.
+    async fn reconcile(&self) -> MemoryResult<usize> {
+        Err(crate::error::MemoryError::Unsupported(
+            "reconcile not implemented for this engine".into(),
+        ))
+    }
 }

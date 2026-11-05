@@ -3,10 +3,13 @@
 //! 路由（与 UDS 同语义）：
 //! POST /v1/memory/commit | retrieve | consolidate | audit | delete
 //! POST /v1/memory/delete_scope | count          (issue #2)
+//! POST /v1/memory/list | audit_log | merges | unmerge | reconcile   (#33 web surface)
+//! POST /v1/memory/import (agent-studio history import, HTTP-only)
 //! GET  /v1/memory/{id}
 //! GET  /v1/memory/version (公开, P2-4 版本协商)
 //! GET  /healthz (公开, §1.7 探活子系统)
-//! 所有 /v1/* (除 version) 强制 Bearer（B5）。delete/delete_scope 需 body.confirm=true。
+//! GET  /app | /app/*path (#33 web UI static shell, web/dist embedded at compile time)
+//! All /v1/* (except version) require Bearer (B5). delete/delete_scope/unmerge/reconcile need body.confirm=true.
 //! P2-4: API 版本控制 — HTTP 路径 /v1/ 钉版; RPC 方法 v1.<method> 前缀; jsonrpc=="2.0" 校验。
 
 use std::sync::Arc;
@@ -47,6 +50,9 @@ pub struct HttpState {
     pub multi_tenant: bool,
     /// #18: fusion-identity 验证器 (真实 HTTP + 测试 mock)。多租户模式必配。
     pub verifier: Arc<dyn IdentityVerifier>,
+    /// #33: server concrete engine (import route reuses it directly — shared SQLite WAL + store
+    /// handle avoids a second open hitting the sled lock; embedder matches the server's). None only in route-wiring unit tests (stub dyn engine).
+    pub concrete: Option<Arc<fm_engine::MemoryEngine>>,
 }
 
 /// 建 axum 路由。
@@ -61,6 +67,16 @@ pub fn app(state: HttpState) -> axum::Router {
         .route("/v1/memory/delete", post(delete))
         .route("/v1/memory/delete_scope", post(delete_scope))
         .route("/v1/memory/count", post(count))
+        // #33 web surface: browse/manage routes (shared by the web UI /app and scripts, same semantics as UDS).
+        .route("/v1/memory/list", post(list_route))
+        .route("/v1/memory/audit_log", post(audit_log_route))
+        .route("/v1/memory/merges", post(merges_route))
+        .route("/v1/memory/unmerge", post(unmerge_route))
+        .route("/v1/memory/reconcile", post(reconcile_route))
+        .route("/v1/memory/import", post(import_route))
+        // #33: web UI static assets (web/dist embedded at compile time, no runtime file dependency). Public shell; data goes through Bearer.
+        .route("/app", get(web_index))
+        .route("/app/*path", get(web_asset))
         // P2-4: 版本协商端点 (HTTP 对称 UDS version 方法)。无需 body, GET 直返 api_version。
         .route("/v1/memory/version", get(version))
         .route("/v1/memory/:id", get(get_memory))
@@ -210,6 +226,157 @@ async fn count(st: State<HttpState>, h: HeaderMap, j: Json<Value>) -> Response {
     handle_rpc(st, h, j).await
 }
 
+// #33 web surface: browse/manage thin routes (dispatch semantics identical to UDS; all go through handle_rpc).
+async fn list_route(st: State<HttpState>, h: HeaderMap, j: Json<Value>) -> Response {
+    handle_rpc(st, h, j).await
+}
+async fn audit_log_route(st: State<HttpState>, h: HeaderMap, j: Json<Value>) -> Response {
+    handle_rpc(st, h, j).await
+}
+async fn merges_route(st: State<HttpState>, h: HeaderMap, j: Json<Value>) -> Response {
+    handle_rpc(st, h, j).await
+}
+async fn unmerge_route(st: State<HttpState>, h: HeaderMap, j: Json<Value>) -> Response {
+    handle_rpc(st, h, j).await
+}
+async fn reconcile_route(st: State<HttpState>, h: HeaderMap, j: Json<Value>) -> Response {
+    handle_rpc(st, h, j).await
+}
+
+/// #33: agent-studio history import (HTTP version of `fm import`). Builds the import engine
+/// on the server's data_dir (same SQLite WAL + store dir as the service), runs synchronously and returns the report. Stub defaults to the server's embedder.
+/// Real embedding requires fusion-mlx to be reachable — long runs still return synchronously
+/// (report carries imported/skipped/failed counts); chunked progress streaming deferred (recorded as PRD deviation).
+async fn import_route(st: State<HttpState>, h: HeaderMap, j: Json<Value>) -> Response {
+    if !st.multi_tenant {
+        if let Err(resp) = check_bearer(&h, &st.api_key) {
+            st.metrics.incr_total();
+            st.metrics.incr_error();
+            return resp;
+        }
+    }
+    let _tenant = match crate::tenant::check_gateway_origin(
+        &h,
+        st.gateway_origin_required,
+        &st.default_tenant,
+        false,
+        "/v1/memory/import",
+    ) {
+        Ok(t) => t,
+        Err((code, body)) => {
+            st.metrics.incr_total();
+            st.metrics.incr_error();
+            return (code, body).into_response();
+        }
+    };
+    let p: Value = j.0;
+    let source = p
+        .get("source")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let source_db = match source {
+        Some(s) => s,
+        None => match std::env::var("HOME") {
+            Ok(hm) => format!("{hm}/.fusion-agent-studio/memory.db"),
+            Err(_) => {
+                st.metrics.incr_error();
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": "source required when HOME unset"})),
+                )
+                    .into_response();
+            }
+        },
+    };
+    if !std::path::Path::new(&source_db).exists() {
+        st.metrics.incr_error();
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": format!("source db not found: {source_db}")})),
+        )
+            .into_response();
+    }
+    // #33: reuse the server concrete engine directly — shared SQLite WAL + store handle (a second open
+    // hits the sled exclusive lock, verified in smoke), embedder matches the server (stub server = stub import).
+    let Some(engine) = st.concrete.as_ref() else {
+        st.metrics.incr_error();
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "import unavailable: engine is not the concrete MemoryEngine"})),
+        )
+            .into_response();
+    };
+    match fm_engine::import_studio::run_import(engine, &source_db).await {
+        Ok(report) => {
+            info!(
+                imported = report.imported,
+                failed = report.failed,
+                "http import done"
+            );
+            (
+                StatusCode::OK,
+                Json(serde_json::to_value(report).unwrap_or_default()),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            st.metrics.incr_error();
+            warn!(error = %e, "http import failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e})),
+            )
+                .into_response()
+        }
+    }
+}
+
+// ── #33: web UI static assets (crates/fm-server/web/dist embedded at compile time). Public shell (index/assets),
+// all data requests still go through Bearer-protected /v1/* — without a key the UI only renders the login state.
+static WEB_DIST: include_dir::Dir = include_dir::include_dir!("$CARGO_MANIFEST_DIR/web/dist");
+
+fn mime_for(path: &str) -> &'static str {
+    match path.rsplit('.').next().unwrap_or("") {
+        "html" => "text/html; charset=utf-8",
+        "js" => "application/javascript; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "json" => "application/json",
+        "svg" => "image/svg+xml",
+        "png" => "image/png",
+        "ico" => "image/x-icon",
+        "woff2" => "font/woff2",
+        _ => "application/octet-stream",
+    }
+}
+
+fn serve_embedded(file: &include_dir::File<'static>) -> Response {
+    let name = file.path().to_string_lossy().to_string();
+    (
+        [(axum::http::header::CONTENT_TYPE, mime_for(&name))],
+        file.contents().to_vec(),
+    )
+        .into_response()
+}
+
+async fn web_index() -> Response {
+    match WEB_DIST.get_file("index.html") {
+        Some(f) => serve_embedded(f),
+        None => (
+            StatusCode::NOT_FOUND,
+            "web UI not built (crates/fm-server/web/dist missing)",
+        )
+            .into_response(),
+    }
+}
+
+async fn web_asset(Path(path): Path<String>) -> Response {
+    match WEB_DIST.get_file(&path) {
+        Some(f) => serve_embedded(f),
+        // SPA hash routing needs no path fallback; unknown asset = build drift, fail visibly with 404.
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
 async fn get_memory(
     State(st): State<HttpState>,
     headers: HeaderMap,
@@ -352,6 +519,45 @@ mod tests {
         ) -> fm_core::MemoryResult<Vec<MemoryItem>> {
             Ok(vec![])
         }
+        // #33 web surface: canned browse/manage (route wiring tests).
+        async fn list_memories(
+            &self,
+            _q: &fm_core::ListQuery,
+            _tenant: &str,
+        ) -> fm_core::MemoryResult<Vec<MemoryItem>> {
+            Ok(vec![MemoryItem::new_turn_skeleton(
+                "m0".into(),
+                "ix0".into(),
+                0,
+                "s".into(),
+                String::new(),
+                fm_core::MemoryType::Episodic,
+                "browse me".into(),
+                1,
+            )])
+        }
+        async fn list_audit_log(
+            &self,
+            _limit: usize,
+        ) -> fm_core::MemoryResult<Vec<fm_core::AuditEntry>> {
+            Ok(vec![fm_core::AuditEntry {
+                id: 1,
+                at: 1,
+                actor: "test".into(),
+                action: "commit".into(),
+                target_id: "m0".into(),
+                detail: "{}".into(),
+            }])
+        }
+        async fn list_merges(&self) -> fm_core::MemoryResult<Vec<fm_core::MergeEntry>> {
+            Ok(vec![])
+        }
+        async fn unmerge(&self, _merge_id: u64) -> fm_core::MemoryResult<bool> {
+            Ok(true)
+        }
+        async fn reconcile(&self) -> fm_core::MemoryResult<usize> {
+            Ok(3)
+        }
     }
 
     fn test_state(api_key: &str) -> (HttpState, Arc<Mutex<Vec<String>>>) {
@@ -367,6 +573,7 @@ mod tests {
             default_tenant: Arc::new(String::new()),
             multi_tenant: false,
             verifier: crate::identity::noop_verifier(),
+            concrete: None,
         };
         (st, committed)
     }
@@ -444,6 +651,99 @@ mod tests {
             .unwrap();
         let resp = tower::ServiceExt::oneshot(app, r).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // ---- #33 web surface: browse/manage routes ----
+
+    #[tokio::test]
+    async fn list_route_ok() {
+        let (st, _) = test_state("sekret");
+        let (code, body) = req(
+            &app(st),
+            "/v1/memory/list",
+            r#"{"jsonrpc":"2.0","method":"list","params":{"offset":0,"limit":10},"id":1}"#,
+            Some("Bearer sekret"),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "body: {body}");
+        assert!(body.contains("browse me"), "body: {body}");
+    }
+
+    #[tokio::test]
+    async fn list_route_without_token_rejected() {
+        let (st, _) = test_state("sekret");
+        let (code, _) = req(&app(st), "/v1/memory/list", "{}", None).await;
+        assert_eq!(code, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn merges_and_reconcile_routes_ok() {
+        let (st, _) = test_state("sekret");
+        let (code, _) = req(
+            &app(st.clone()),
+            "/v1/memory/merges",
+            r#"{"jsonrpc":"2.0","method":"merges","params":{},"id":1}"#,
+            Some("Bearer sekret"),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+        let (code, body) = req(
+            &app(st.clone()),
+            "/v1/memory/reconcile",
+            r#"{"jsonrpc":"2.0","method":"reconcile","params":{"confirm":true},"id":1}"#,
+            Some("Bearer sekret"),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "body: {body}");
+        assert!(body.contains("reconciled"), "body: {body}");
+        let (code, _) = req(
+            &app(st),
+            "/v1/memory/reconcile",
+            r#"{"jsonrpc":"2.0","method":"reconcile","params":{},"id":1}"#,
+            Some("Bearer sekret"),
+        )
+        .await;
+        assert_eq!(code, StatusCode::BAD_REQUEST, "confirm required (B5)");
+    }
+
+    #[tokio::test]
+    async fn app_shell_served_and_unknown_asset_404() {
+        let (st, _) = test_state("sekret");
+        let a = app(st);
+        let r = Request::builder()
+            .method("GET")
+            .uri("/app")
+            .body(Body::empty())
+            .unwrap();
+        let resp = tower::ServiceExt::oneshot(a.clone(), r).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let html = String::from_utf8_lossy(&bytes).into_owned();
+        assert!(html.contains("fusion-memory console"), "index served");
+        // static shell is public (no Bearer); data plane /v1/* still requires Bearer (proven by list_without_token above).
+        let r = Request::builder()
+            .method("GET")
+            .uri("/app/assets/no-such-asset.js")
+            .body(Body::empty())
+            .unwrap();
+        let resp = tower::ServiceExt::oneshot(a, r).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn import_route_missing_source_404() {
+        let (st, _) = test_state("sekret");
+        let (code, body) = req(
+            &app(st),
+            "/v1/memory/import",
+            r#"{"source":"/tmp/fm-no-such-src-db/memory.db"}"#,
+            Some("Bearer sekret"),
+        )
+        .await;
+        assert_eq!(code, StatusCode::NOT_FOUND, "body: {body}");
+        assert!(body.contains("not found"), "body: {body}");
     }
 
     #[tokio::test]
@@ -724,6 +1024,7 @@ mod tests {
             default_tenant: Arc::new(String::new()),
             multi_tenant: false,
             verifier: crate::identity::noop_verifier(),
+            concrete: None,
         };
         let app = app(st);
         let r = Request::builder()
@@ -786,6 +1087,7 @@ mod tests {
             default_tenant: Arc::new(String::new()),
             multi_tenant: false,
             verifier: crate::identity::noop_verifier(),
+            concrete: None,
         };
         let app = app(st);
         let body = r#"{"jsonrpc":"2.0","method":"retrieve","params":{"text":"hi"},"id":1}"#;
@@ -923,6 +1225,7 @@ mod tests {
             default_tenant: Arc::new(String::new()),
             multi_tenant: false,
             verifier: crate::identity::noop_verifier(),
+            concrete: None,
         };
         let app = app(st);
 
@@ -994,6 +1297,7 @@ mod tests {
                 ok,
                 usage_calls: Arc::new(Mutex::new(vec![])),
             }),
+            concrete: None,
         }
     }
 

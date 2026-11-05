@@ -95,6 +95,8 @@ pub async fn serve(cfg: ServerConfig, opts: ServeOpts) -> Result<(), String> {
                 default_tenant: Arc::new(cfg.default_tenant.clone()),
                 multi_tenant: cfg.multi_tenant,
                 verifier,
+                // #33: import route reuses the server concrete engine (same SQLite WAL + store handle, avoids the sled lock conflict).
+                concrete: Some(engine.clone()),
             };
             http::serve(state, port, orx).await
         });
