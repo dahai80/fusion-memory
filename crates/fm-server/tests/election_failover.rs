@@ -63,14 +63,16 @@ async fn leader_down_auto_elects_new_leader() {
     std::env::remove_var("FUSION_MEMORY_ROLE");
 
     // 拓扑: 3 节点环回。candidate=self_id 1, peers 0/2 起 vote listener。
-    let p0 = free_port();
+    // bind port 0 一次并持有: free_port drop-then-rebind 存在竞态 (CI 并行进程可抢端口,
+    // 实测 AddrInUse 红一次), 持 listener 到 serve_votes 才无窗口。
+    let l0 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let l2 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let p1 = free_port();
-    let p2 = free_port();
     let dead_leader = format!("127.0.0.1:{}", free_port());
     let nodes = vec![
-        format!("127.0.0.1:{p0}"),
+        l0.local_addr().unwrap().to_string(),
         format!("127.0.0.1:{p1}"),
-        format!("127.0.0.1:{p2}"),
+        l2.local_addr().unwrap().to_string(),
     ];
     let token = "test-failover-token".to_string();
 
@@ -86,8 +88,8 @@ async fn leader_down_auto_elects_new_leader() {
     // peer vote listener 先起 (campaign 来请求时须就绪)。不读 env, 无需持锁。
     let seq: Arc<dyn LogSeqProvider> = Arc::new(ZeroSeq);
     let mut peer_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
-    for id in [0usize, 2] {
-        let listener = tokio::net::TcpListener::bind(&nodes[id]).await.unwrap();
+    for (id, listener) in [(0usize, l0), (2usize, l2)] {
+        // listener 已在拓扑构造时 bind 并持有 (免 rebind 竞态)。
         let election = Arc::new(Election::new(peer_ec(id)));
         let seq = seq.clone();
         peer_handles.push(tokio::spawn(async move {
