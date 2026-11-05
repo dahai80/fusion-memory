@@ -166,6 +166,12 @@ pub async fn dispatch(req: RpcRequest, engine: &EngineHandle, tenant: &str) -> R
         "delete_scope" => delete_scope(params, engine, tenant).await,
         "count" => count(params, engine, tenant).await,
         "audit" => audit(params, engine).await,
+        // #33 web surface: browse/manage methods (shared by the web UI /app and scripts).
+        "list" => list(params, engine, tenant).await,
+        "audit_log" => audit_log(params, engine).await,
+        "merges" => merges(engine).await,
+        "unmerge" => unmerge(params, engine).await,
+        "reconcile" => reconcile(params, engine).await,
         "health" => Ok(Value::String("ok".into())),
         // P2-4: version 方法 — 返当前 api_version 供客户端协商。
         "version" => Ok(serde_json::json!({"api_version": API_VERSION})),
@@ -462,6 +468,140 @@ async fn count(params: Value, engine: &EngineHandle, tenant: &str) -> Result<Val
         .map_err(|e| RpcError::internal(e.to_string()))
 }
 
+// ── #33 web surface (v1.5.0): browse/manage methods (list/audit_log/merges/unmerge/reconcile). ──
+// Pure browse/ops surface, consumed by the web UI (served at /app) and scripts. Writes (unmerge/reconcile) follow B5
+// confirm double-confirmation; reads scope tenant/namespace with the same semantics as retrieval.
+
+/// list params (web memory browser pagination). limit hard-capped at 200 (bounded response body, DoS guard).
+#[derive(Debug, Deserialize)]
+struct ListParams {
+    #[serde(default)]
+    offset: usize,
+    #[serde(default = "default_list_limit")]
+    limit: usize,
+    #[serde(default)]
+    memory_type: Option<String>,
+    #[serde(default)]
+    namespace: String,
+    #[serde(default)]
+    namespace_key: String,
+    #[serde(default)]
+    include_tombstoned: bool,
+}
+
+fn default_list_limit() -> usize {
+    50
+}
+
+async fn list(params: Value, engine: &EngineHandle, tenant: &str) -> Result<Value, RpcError> {
+    let p: ListParams =
+        serde_json::from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+    if p.limit == 0 || p.limit > 200 {
+        return Err(RpcError::invalid_params("limit must be 1..=200"));
+    }
+    if let Some(mt) = &p.memory_type {
+        if !matches!(mt.as_str(), "Episodic" | "Semantic" | "Procedural") {
+            return Err(RpcError::invalid_params(format!(
+                "memory_type must be Episodic|Semantic|Procedural, got {mt:?}"
+            )));
+        }
+    }
+    validate_namespace(&p.namespace)?;
+    let q = fm_core::ListQuery {
+        offset: p.offset,
+        limit: p.limit,
+        memory_type: p.memory_type,
+        namespace: p.namespace,
+        namespace_key: p.namespace_key,
+        include_tombstoned: p.include_tombstoned,
+    };
+    let items = engine
+        .list_memories(&q, tenant)
+        .await
+        .map_err(|e| RpcError::from_engine(&e))?;
+    serde_json::to_value(items).map_err(|e| RpcError::internal(e.to_string()))
+}
+
+/// audit_log params (web audit view). limit hard-capped at 500.
+#[derive(Debug, Deserialize)]
+struct AuditLogParams {
+    #[serde(default = "default_audit_log_limit")]
+    limit: usize,
+}
+
+fn default_audit_log_limit() -> usize {
+    100
+}
+
+async fn audit_log(params: Value, engine: &EngineHandle) -> Result<Value, RpcError> {
+    let p: AuditLogParams =
+        serde_json::from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+    if p.limit == 0 || p.limit > 500 {
+        return Err(RpcError::invalid_params("limit must be 1..=500"));
+    }
+    let rows = engine
+        .list_audit_log(p.limit)
+        .await
+        .map_err(|e| RpcError::from_engine(&e))?;
+    serde_json::to_value(rows).map_err(|e| RpcError::internal(e.to_string()))
+}
+
+/// merges: list the full merge_log. No params ({} / null both fine).
+async fn merges(engine: &EngineHandle) -> Result<Value, RpcError> {
+    let rows = engine
+        .list_merges()
+        .await
+        .map_err(|e| RpcError::from_engine(&e))?;
+    serde_json::to_value(rows).map_err(|e| RpcError::internal(e.to_string()))
+}
+
+/// unmerge params. confirm must be true (B5; reverts the merge, restoring the source).
+#[derive(Debug, Deserialize)]
+struct UnmergeParams {
+    id: u64,
+    #[serde(default)]
+    confirm: bool,
+}
+
+async fn unmerge(params: Value, engine: &EngineHandle) -> Result<Value, RpcError> {
+    let p: UnmergeParams =
+        serde_json::from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+    if !p.confirm {
+        return Err(RpcError::invalid_params(
+            "unmerge requires confirm=true (B5 double-confirmation)",
+        ));
+    }
+    let existed = engine
+        .unmerge(p.id)
+        .await
+        .map_err(|e| RpcError::from_engine(&e))?;
+    serde_json::to_value(serde_json::json!({"unmerged": existed}))
+        .map_err(|e| RpcError::internal(e.to_string()))
+}
+
+/// reconcile params. confirm must be true (B5; cross-store reconciliation includes tombstone physical delete).
+#[derive(Debug, Deserialize)]
+struct ReconcileParams {
+    #[serde(default)]
+    confirm: bool,
+}
+
+async fn reconcile(params: Value, engine: &EngineHandle) -> Result<Value, RpcError> {
+    let p: ReconcileParams =
+        serde_json::from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+    if !p.confirm {
+        return Err(RpcError::invalid_params(
+            "reconcile requires confirm=true (B5 double-confirmation)",
+        ));
+    }
+    let n = engine
+        .reconcile()
+        .await
+        .map_err(|e| RpcError::from_engine(&e))?;
+    serde_json::to_value(serde_json::json!({"reconciled": n}))
+        .map_err(|e| RpcError::internal(e.to_string()))
+}
+
 /// memory.retrieve_context params (issue #1/#4, fusion-event 冻结契约)。
 /// query 为文本串 (target_path|event_type), memory 内部 embed; trigger_id/node_id 仅透传留痕,
 /// 不影响检索结果 (node_id 多节点集群留待 M6+ 扩展, 当前本地全检索)。
@@ -691,6 +831,57 @@ mod tests {
             _e: &[String],
         ) -> fm_core::MemoryResult<Vec<MemoryItem>> {
             Ok(vec![])
+        }
+        // #33 web surface: canned browse/manage responses (wire-level tests only).
+        async fn list_memories(
+            &self,
+            q: &fm_core::ListQuery,
+            _tenant: &str,
+        ) -> fm_core::MemoryResult<Vec<MemoryItem>> {
+            let item = MemoryItem::new_turn_skeleton(
+                "m0".into(),
+                "ix0".into(),
+                0,
+                "s".into(),
+                String::new(),
+                fm_core::MemoryType::Episodic,
+                "browse me".into(),
+                1,
+            );
+            let n = if q.memory_type.as_deref() == Some("Semantic") {
+                0
+            } else {
+                1
+            };
+            Ok(vec![item; n])
+        }
+        async fn list_audit_log(
+            &self,
+            _limit: usize,
+        ) -> fm_core::MemoryResult<Vec<fm_core::AuditEntry>> {
+            Ok(vec![fm_core::AuditEntry {
+                id: 7,
+                at: 1,
+                actor: "test".into(),
+                action: "commit".into(),
+                target_id: "m0".into(),
+                detail: "{}".into(),
+            }])
+        }
+        async fn list_merges(&self) -> fm_core::MemoryResult<Vec<fm_core::MergeEntry>> {
+            Ok(vec![fm_core::MergeEntry {
+                id: 3,
+                at: 2,
+                source_id: "a".into(),
+                target_id: "b".into(),
+                reason: "dup".into(),
+            }])
+        }
+        async fn unmerge(&self, merge_id: u64) -> fm_core::MemoryResult<bool> {
+            Ok(merge_id == 3)
+        }
+        async fn reconcile(&self) -> fm_core::MemoryResult<usize> {
+            Ok(5)
         }
     }
 
@@ -940,6 +1131,111 @@ mod tests {
         )
         .await;
         assert_eq!(v["count"], 42);
+    }
+
+    // ---- #33 web surface: browse/manage dispatch tests ----
+
+    #[tokio::test]
+    async fn dispatch_list_browse() {
+        let (eng, _) = stub_handle();
+        let v = dispatch_ok(
+            &rpc(
+                "list",
+                serde_json::json!({"offset":0,"limit":10,"memory_type":"Episodic"}),
+                16,
+            ),
+            &eng,
+        )
+        .await;
+        assert_eq!(v.as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn dispatch_list_type_filter_empty() {
+        let (eng, _) = stub_handle();
+        let v = dispatch_ok(
+            &rpc("list", serde_json::json!({"memory_type":"Semantic"}), 17),
+            &eng,
+        )
+        .await;
+        assert_eq!(v.as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn dispatch_list_limit_capped() {
+        let (eng, _) = stub_handle();
+        let e = dispatch_err(&rpc("list", serde_json::json!({"limit":1000}), 18), &eng).await;
+        assert_eq!(e.code, -32602);
+    }
+
+    #[tokio::test]
+    async fn dispatch_list_bad_type_rejected() {
+        let (eng, _) = stub_handle();
+        let e = dispatch_err(
+            &rpc("list", serde_json::json!({"memory_type":"Bogus"}), 19),
+            &eng,
+        )
+        .await;
+        assert_eq!(e.code, -32602);
+    }
+
+    #[tokio::test]
+    async fn dispatch_list_bad_namespace_rejected() {
+        let (eng, _) = stub_handle();
+        let e = dispatch_err(&rpc("list", serde_json::json!({"namespace":"x"}), 20), &eng).await;
+        assert_eq!(e.code, -32602);
+    }
+
+    #[tokio::test]
+    async fn dispatch_audit_log() {
+        let (eng, _) = stub_handle();
+        let v = dispatch_ok(&rpc("audit_log", serde_json::json!({"limit":50}), 21), &eng).await;
+        assert_eq!(v[0]["action"], "commit");
+        assert_eq!(v[0]["target_id"], "m0");
+    }
+
+    #[tokio::test]
+    async fn dispatch_merges_list() {
+        let (eng, _) = stub_handle();
+        let v = dispatch_ok(&rpc("merges", serde_json::json!({}), 22), &eng).await;
+        assert_eq!(v[0]["id"], 3);
+        assert_eq!(v[0]["reason"], "dup");
+    }
+
+    #[tokio::test]
+    async fn dispatch_unmerge_with_confirm() {
+        let (eng, _) = stub_handle();
+        let v = dispatch_ok(
+            &rpc("unmerge", serde_json::json!({"id":3,"confirm":true}), 23),
+            &eng,
+        )
+        .await;
+        assert_eq!(v["unmerged"], true);
+    }
+
+    #[tokio::test]
+    async fn dispatch_unmerge_without_confirm_rejected() {
+        let (eng, _) = stub_handle();
+        let e = dispatch_err(&rpc("unmerge", serde_json::json!({"id":3}), 24), &eng).await;
+        assert_eq!(e.code, -32602);
+    }
+
+    #[tokio::test]
+    async fn dispatch_reconcile_with_confirm() {
+        let (eng, _) = stub_handle();
+        let v = dispatch_ok(
+            &rpc("reconcile", serde_json::json!({"confirm":true}), 25),
+            &eng,
+        )
+        .await;
+        assert_eq!(v["reconciled"], 5);
+    }
+
+    #[tokio::test]
+    async fn dispatch_reconcile_without_confirm_rejected() {
+        let (eng, _) = stub_handle();
+        let e = dispatch_err(&rpc("reconcile", serde_json::json!({}), 26), &eng).await;
+        assert_eq!(e.code, -32602);
     }
 
     #[tokio::test]

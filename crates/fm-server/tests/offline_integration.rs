@@ -22,9 +22,12 @@ fn stub_state() -> HttpState {
         ..Default::default()
     };
     let se = build_server_engine(&cfg, true).expect("stub engine build");
-    let engine = EngineHandle::new(Arc::new(se.engine));
+    // #33: import route reuses the server concrete engine (production serve() semantics).
+    let concrete = Arc::new(se.engine);
+    let engine = EngineHandle::new(concrete.clone());
     HttpState {
         engine,
+        concrete: Some(concrete),
         api_key: Arc::new("test-key".into()),
         metrics: fm_server::metrics::HttpMetrics::new(),
         gateway_origin_required: false,
@@ -195,4 +198,97 @@ async fn http_delete_without_confirm_rejected_on_real_engine() {
     let (code, body) = post(&app, "/v1/memory/delete", body, Some("Bearer test-key")).await;
     assert_eq!(code, 400);
     assert!(body.contains("-32602"), "delete body={body}");
+}
+
+// ---- #33 web surface: browse/import e2e on the real (stub-embed) engine ----
+
+#[tokio::test]
+async fn http_list_browse_roundtrip_on_real_engine() {
+    let st = stub_state();
+    let app = fm_server::http::app(st);
+    // commit 1 interaction (2 turns) → list returns turn-level entries.
+    let commit = r#"{"jsonrpc":"2.0","method":"commit","params":{"session_id":"s-web",
+        "interaction":{"id":"ix-web","session_id":"s-web","turns":[
+        {"turn_idx":0,"user_message":"hello rust","assistant_message":"ok","tool_calls":[]},
+        {"turn_idx":1,"user_message":"more rust","assistant_message":"sure","tool_calls":[]}],
+        "timestamp":1,"metadata":{}}},"id":1}"#;
+    let (code, _) = post(&app, "/v1/memory/commit", commit, Some("Bearer test-key")).await;
+    assert_eq!(code, 200);
+    let (code, body) = post(
+        &app,
+        "/v1/memory/list",
+        r#"{"jsonrpc":"2.0","method":"list","params":{"limit":10},"id":2}"#,
+        Some("Bearer test-key"),
+    )
+    .await;
+    assert_eq!(code, 200, "list body={body}");
+    let items: Vec<serde_json::Value> = serde_json::from_str(
+        &serde_json::from_str::<serde_json::Value>(&body).unwrap()["result"].to_string(),
+    )
+    .unwrap();
+    assert_eq!(items.len(), 2, "two turn-level entries");
+    assert!(items[0]["content"].as_str().unwrap().contains("rust"));
+    // merges empty + audit_log carries commit traces.
+    let (code, body) = post(
+        &app,
+        "/v1/memory/merges",
+        r#"{"jsonrpc":"2.0","method":"merges","params":{},"id":3}"#,
+        Some("Bearer test-key"),
+    )
+    .await;
+    assert_eq!(code, 200);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&body).unwrap()["result"],
+        serde_json::json!([])
+    );
+    let (code, body) = post(
+        &app,
+        "/v1/memory/audit_log",
+        r#"{"jsonrpc":"2.0","method":"audit_log","params":{"limit":10},"id":4}"#,
+        Some("Bearer test-key"),
+    )
+    .await;
+    assert_eq!(code, 200);
+    assert!(body.contains("commit"), "audit_log body={body}");
+}
+
+#[tokio::test]
+async fn http_import_roundtrip_on_real_engine() {
+    // build a synthetic agent-studio source db (1 long_term user row) → HTTP import → count +1.
+    let src_dir = tempdir().expect("tempdir");
+    let src_db = src_dir.path().join("memory.db");
+    {
+        let conn = rusqlite::Connection::open(&src_db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE memories (id TEXT PRIMARY KEY, content TEXT, scope TEXT, tags TEXT, \
+             importance INTEGER, created_at REAL, metadata TEXT, is_summary INTEGER, \
+             tier TEXT, memory_type TEXT);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO memories VALUES ('r1','i prefer rust over go','graph:lang','',7,1700000000.0,'{}',0,'long_term','user')",
+            [],
+        )
+        .unwrap();
+    }
+    let st = stub_state();
+    let app = fm_server::http::app(st);
+    // import route body IS the params object (not a JSON-RPC frame), matching the handler contract.
+    let body = serde_json::json!({ "source": src_db.as_path().to_str().unwrap() }).to_string();
+    let (code, body) = post(&app, "/v1/memory/import", &body, Some("Bearer test-key")).await;
+    assert_eq!(code, 200, "import body={body}");
+    // import route returns a bare report (not a JSON-RPC frame), matching the POST contract.
+    let report: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(report["imported"], 1, "report={report}");
+    assert_eq!(report["failed"], 0);
+    // the imported entry is browsable via list.
+    let (code, body) = post(
+        &app,
+        "/v1/memory/list",
+        r#"{"jsonrpc":"2.0","method":"list","params":{"limit":10},"id":2}"#,
+        Some("Bearer test-key"),
+    )
+    .await;
+    assert_eq!(code, 200);
+    assert!(body.contains("i prefer rust over go"), "list body={body}");
 }

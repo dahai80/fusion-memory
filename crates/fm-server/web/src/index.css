@@ -1,0 +1,6 @@
+@import "tailwindcss";
+
+/* #33: fusion-memory console — dark-first, slate/zinc neutrals + indigo accent. */
+:root {
+    color-scheme: dark;
+}

@@ -42,6 +42,7 @@ fn stub_state() -> HttpState {
         default_tenant: Arc::new(String::new()),
         multi_tenant: false,
         verifier: fm_server::identity::noop_verifier(),
+        concrete: None,
     }
 }
 

@@ -1379,6 +1379,91 @@ impl fm_core::FusionMemoryEngine for MemoryEngine {
             .audit_by_entities(entity_ids)
             .map_err(|e| e.to_memory())
     }
+
+    // #33 web surface (v1.5.0): browse/manage overrides over persist primitives.
+
+    async fn list_memories(
+        &self,
+        q: &fm_core::ListQuery,
+        tenant: &str,
+    ) -> fm_core::MemoryResult<Vec<MemoryItem>> {
+        let ns = if q.namespace.is_empty() {
+            NamespaceFilter::default()
+        } else {
+            NamespaceFilter::new(&q.namespace, &q.namespace_key)
+        };
+        // tenant scope + namespace visibility handled in SQL (list_all_by_tenant_scoped).
+        let mut items = self
+            .persist
+            .list_all_by_tenant_scoped(tenant, &ns)
+            .map_err(|e| e.to_memory())?;
+        if q.include_tombstoned {
+            // list_tombstoned has no tenant/namespace SQL filter — filter in memory to prevent cross-tenant/cross-scope leaks.
+            let dead = self.persist.list_tombstoned().map_err(|e| e.to_memory())?;
+            items.extend(dead.into_iter().filter(|i| {
+                (tenant.is_empty() || i.tenant == tenant)
+                    && ns.visible(&i.namespace, &i.namespace_key)
+            }));
+        }
+        if let Some(mt) = &q.memory_type {
+            items.retain(|i| memory_type_name(&i.memory_type) == mt);
+        }
+        items.sort_by_key(|i| i.created_timestamp);
+        Ok(items.into_iter().skip(q.offset).take(q.limit).collect())
+    }
+
+    async fn list_audit_log(
+        &self,
+        limit: usize,
+    ) -> fm_core::MemoryResult<Vec<fm_core::AuditEntry>> {
+        let rows = self
+            .persist
+            .list_audit(Some(limit as u64))
+            .map_err(|e| e.to_memory())?;
+        Ok(rows
+            .into_iter()
+            .map(|r| fm_core::AuditEntry {
+                id: r.id,
+                at: r.at,
+                actor: r.actor,
+                action: r.action,
+                target_id: r.target_id,
+                detail: r.detail,
+            })
+            .collect())
+    }
+
+    async fn list_merges(&self) -> fm_core::MemoryResult<Vec<fm_core::MergeEntry>> {
+        let rows = MemoryEngine::list_merges(self)?;
+        Ok(rows
+            .into_iter()
+            .map(|r| fm_core::MergeEntry {
+                id: r.id,
+                at: r.at,
+                source_id: r.source_id,
+                target_id: r.target_id,
+                reason: r.reason,
+            })
+            .collect())
+    }
+
+    async fn unmerge(&self, merge_id: u64) -> fm_core::MemoryResult<bool> {
+        // same-name methods: call the inherent method (trait override is just the RPC exit); UFCS avoids recursion.
+        MemoryEngine::unmerge(self, merge_id).await
+    }
+
+    async fn reconcile(&self) -> fm_core::MemoryResult<usize> {
+        MemoryEngine::reconcile(self)
+    }
+}
+
+/// MemoryType → RPC string (used for list_memories filtering).
+fn memory_type_name(t: &MemoryType) -> &'static str {
+    match t {
+        MemoryType::Episodic => "Episodic",
+        MemoryType::Semantic => "Semantic",
+        MemoryType::Procedural => "Procedural",
+    }
 }
 
 /// 取 groups 中各 kept block 对应 interaction 的 memory_id (供 touch_access)。

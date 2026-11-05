@@ -5,6 +5,22 @@ Internal path-dep private ecosystem (not on crates.io); versions tag + GitHub re
 
 ## [Unreleased]
 
+## [1.5.0] — 2026-11-05
+
+Web surface (issue #33): browse/manage REST APIs + embedded web console. MINOR release — additive RPC methods and HTTP routes only, frozen wire contract untouched (existing method set and `v1.<method>` prefix unchanged).
+
+### Added
+- **Browse/manage RPC methods** (UDS + HTTP, same dispatch): `list` (paged memory browse, filters `memory_type`/`namespace`/`namespace_key`/`include_tombstoned`, `offset`/`limit` hard-capped 1..=200), `audit_log` (latest N entries, limit 1..=500), `merges` (full merge log), `unmerge` (`confirm=true` required, B5), `reconcile` (`confirm=true` required, B5). Backed by five new additive `FusionMemoryEngine` trait methods (`list_memories`/`list_audit_log`/`list_merges`/`unmerge`/`reconcile`) with default `Unsupported` impls — same extension pattern as v1.2.0 tenant methods; production `MemoryEngine` overrides all five. Browse DTOs (`ListQuery`/`AuditEntry`/`MergeEntry`) live in fm-core (dependency direction respected: fm-core cannot depend on fm-persist row types). Tenant scoping: `list` filters in-memory on `list_tombstoned` (no SQL tenant filter upstream) to prevent cross-tenant leaks.
+- **Embedded web console** (`GET /app`, `/app/*path`): React 18 + Vite + Tailwind v4 + lucide-react thin client over the REST surface — Entries (paged browse + filters), Audit log, Merges (per-row unmerge + reconcile), Import (agent-studio history), Bearer key login (localStorage). UI source in `crates/fm-server/web/`, built `dist/` embedded at compile time via `include_dir` (no runtime file dependency, CI needs no bun); static shell is public, all data still flows through Bearer-guarded `/v1/*`.
+- **HTTP import route** (`POST /v1/memory/import`, HTTP-only): HTTP version of `fm import` — body IS the params object (`{"source": "..."}`, defaults to `~/.fusion-agent-studio/memory.db`), returns a bare import report. The route reuses the server's concrete `MemoryEngine` (shared SQLite WAL + store handle) — building a second engine hit the sled exclusive lock; embedder matches the server's (stub server = stub import). Core implementation moved fm-cli → fm-engine::import_studio (CLI and server share one implementation; CLI keeps home-resolution semantics).
+
+### Deviation (issue #33)
+- The issue suggested "chunked import with progress streaming"; delivered synchronous import returning the final report (imported/skipped_archive/skipped_empty/failed). Chunked progress streaming deferred — recorded here per Rule 12.
+
+### Acceptance
+- `cargo fmt --all --check` clean; `cargo clippy --workspace --all-targets -- -D warnings` clean; `cargo test --workspace` 496 passed (32 suites), `--features fm-store/store-fusion` 502 passed; live-compile ×3 (`fm-embed`/`fm-engine`/`fm-server` with `RUSTFLAGS="-D warnings" --features mlx-live`) clean.
+- Real-binary smoke (stub, port 11498): `/app` shell 200, `/app/assets/*.js` 200, `list` JSON-RPC roundtrip, `audit_log` roundtrip, `import` of a synthetic 1-row agent-studio db → `{"imported":1,...}`, imported entry visible via `list`.
+
 ## [1.4.5] — 2026-10-30
 
 start.sh registry self-check (issue #31, config governance Phase 3.3). Shell-only patch: no Rust code change, no API change.

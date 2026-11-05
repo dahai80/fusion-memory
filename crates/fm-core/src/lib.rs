@@ -3,6 +3,7 @@
 //! 零业务依赖，仅 serde/thiserror/ulid。供所有 crate 共享类型。
 //! 数据结构依据 PRD §5（刷新版），trait 依据 §11.1。
 
+pub mod browse;
 pub mod context;
 pub mod entity;
 pub mod error;
@@ -12,6 +13,7 @@ pub mod namespace;
 pub mod report;
 pub mod trait_def;
 
+pub use browse::{AuditEntry, ListQuery, MergeEntry};
 pub use context::{ContextBlock, FormattedContext, RetrieveQuery};
 pub use entity::{EntityNode, EntityType};
 pub use error::{MemoryError, MemoryResult};

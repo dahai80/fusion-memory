@@ -2,7 +2,7 @@
 
 > **[English](README.md)** | 中文
 
-> **当前版本：v1.4.5** — start.sh 注册自检（issue #31，配置治理 Phase 3.3）：`start.sh start` 启动前校验自身 `port-registry.yaml` 登记 — 端口未登记则拒绝启动（exit 1），把 CI check-ports 的失败前移到启动时。registry 文件缺失 = warn 放行（standalone 部署）；`FUSION_SKIP_REGISTRY_CHECK=1` 显式跳过。v1.4.4 env 契约文档（issue #29，配置治理 Phase 2.2）：本 README 汇总 `FUSION_MEMORY_*` 环境变量全表，另修 check-env 误报（合规名 `FUSION_MEMORY_MLX_API_KEY` 被子串匹配命中 legacy `MLX_API_KEY`；工作区 checker 改精确 token 匹配）。本仓零改名 — 验收 `python scripts/check-env.py`：0 findings。v1.4.3 CI 红修复（issue #27）：跨仓 path 依赖（`fg-redact` 依赖 fusion-guard、`fs-core` 依赖 fusion-store）破坏 CI 独立 checkout，全部换成 pin 的 git tag 依赖（与本地工作树零漂移），并以无兄弟目录的全新 lone clone 验证通过。v1.4.2 检索质量消融（issue #25）：全融合评分对纯 cosine **recall@5 +0.40**（0.8270 vs 0.4250，全量语料见 `docs/benchmarks/retrieval-quality-2026-10-25.md`）；benchmark 首测暴露融合衰减项缺陷并裁定 retune — 融合衰减项改用归一化新鲜度（实测原始 `W(t)` 融合反而*差于*纯 cosine）。CI 门禁：融合评分永不低于纯 cosine。v1.4.1 MLX embedding key TOML 镜像（issue #23）、v1.4.0 作用域命名空间（issue #21）、v1.3.0 fusion-identity 集成（issue #18）、v1.2.0 多租户隔离（issue #16）此前已落地。已知限制见 `CHANGELOG.md` "Known limitations"，非阻塞。
+> **当前版本：v1.5.0** — web 界面（issue #33）：浏览/管理 REST API（`list`/`audit_log`/`merges`/`unmerge`/`reconcile`，冻结线契约上的加法 RPC 方法）+ `GET /app` 内嵌 web 控制台（React 18 + Tailwind，编译期 `include_dir` 内嵌 — 无运行时文件依赖）+ HTTP 导入路由（`POST /v1/memory/import`，`fm import` 的 HTTP 版，复用服务 engine 避 sled 锁）。v1.4.5 start.sh 注册自检（issue #31，配置治理 Phase 3.3）：`start.sh start` 启动前校验自身 `port-registry.yaml` 登记 — 端口未登记则拒绝启动（exit 1），把 CI check-ports 的失败前移到启动时。registry 文件缺失 = warn 放行（standalone 部署）；`FUSION_SKIP_REGISTRY_CHECK=1` 显式跳过。v1.4.4 env 契约文档（issue #29，配置治理 Phase 2.2）：本 README 汇总 `FUSION_MEMORY_*` 环境变量全表，另修 check-env 误报（合规名 `FUSION_MEMORY_MLX_API_KEY` 被子串匹配命中 legacy `MLX_API_KEY`；工作区 checker 改精确 token 匹配）。本仓零改名 — 验收 `python scripts/check-env.py`：0 findings。v1.4.3 CI 红修复（issue #27）：跨仓 path 依赖（`fg-redact` 依赖 fusion-guard、`fs-core` 依赖 fusion-store）破坏 CI 独立 checkout，全部换成 pin 的 git tag 依赖（与本地工作树零漂移），并以无兄弟目录的全新 lone clone 验证通过。v1.4.2 检索质量消融（issue #25）：全融合评分对纯 cosine **recall@5 +0.40**（0.8270 vs 0.4250，全量语料见 `docs/benchmarks/retrieval-quality-2026-10-25.md`）；benchmark 首测暴露融合衰减项缺陷并裁定 retune — 融合衰减项改用归一化新鲜度（实测原始 `W(t)` 融合反而*差于*纯 cosine）。CI 门禁：融合评分永不低于纯 cosine。v1.4.1 MLX embedding key TOML 镜像（issue #23）、v1.4.0 作用域命名空间（issue #21）、v1.3.0 fusion-identity 集成（issue #18）、v1.2.0 多租户隔离（issue #16）此前已落地。已知限制见 `CHANGELOG.md` "Known limitations"，非阻塞。
 
 Fusion 生态（"一核九端"）系统级长/短期记忆与认知图谱中枢。解决 Agent 跨 session 状态断层、重复提问、context window 爆炸，目标：越用越懂用户。
 
@@ -227,6 +227,14 @@ PRD §14 M5 三部分，(a) store-fusion 可选切换、(b) fusion-guard DLP gat
 
 - **fuzz**：`cargo-fuzz` 目标 — JSON-RPC 请求解析（畸形 JSON / 超长 / 坏 UTF-8 / 类型混淆 / 嵌套深）、HTTP body 边界、实体抽取 JSON 解析。崩溃/panic 视为缺陷。`crates/fm-server/fuzz/`。
 - **负载压测**：扩 `retrieve_bench` — 100k 向量（基线 10k × 10）+ 并发梯度（1/10/50/100），记录 p50/p99/p999 + 吞吐。商用级负载验证。结果落 `benches/baseline-1.0.0-*.json`。
+
+### v1.5.0 web 界面（issue #33）
+
+浏览/管理 REST API + 内嵌 web 控制台。MINOR 发布：仅加法 RPC 方法 — 冻结线契约（UDS JSON-RPC 方法集 + `v1.<method>` 前缀）不动。
+
+- **新 RPC 方法**（UDS + HTTP 同 dispatch）：`list`（分页浏览；过滤 `memory_type` ∈ {Episodic, Semantic, Procedural}、`namespace`/`namespace_key`、`include_tombstoned`；`limit` 硬上限 1..=200）、`audit_log`（最近 N 条，limit 1..=500）、`merges`、`unmerge`（需 `confirm=true`，B5）、`reconcile`（需 `confirm=true`，B5）。底层为五个加法 `FusionMemoryEngine` trait 方法，默认 `Unsupported` impl（同 v1.2.0 租户方法模式）；DTO 落 fm-core（`fm_core::browse`）。`list` 对 tombstone 行做内存侧租户过滤（`list_tombstoned` 无 SQL 租户过滤 — 防跨租户泄漏）。
+- **Web 控制台** `GET /app`（React 18 + Vite + Tailwind v4 + lucide-react，暗色 zinc/indigo）：Entries（分页浏览 + 过滤）、Audit log、Merges（逐行 unmerge + 破坏性 reconcile）、Import、Bearer 登录（key 存 localStorage）。源码 `crates/fm-server/web/`，构建产物 `dist/` 经 `include_dir` 编译期内嵌 — fm-server 二进制无运行时文件依赖，CI 无需 bun。静态壳公开；所有数据请求仍需 Bearer key。
+- **HTTP 导入** `POST /v1/memory/import`（仅 HTTP）：请求体即参数对象（`{"source": "/path/to/memory.db"}`，默认 `~/.fusion-agent-studio/memory.db`），响应为裸报告 `{imported, skipped_archive, skipped_empty, failed}`。复用服务 concrete engine — 同 data_dir 二次 open 会撞 sled 排他锁；embedder 与服务一致（stub 服务即 stub 导入）。实现自 fm-cli 移入 `fm_engine::import_studio`（CLI 与 HTTP 共用同一实现）。偏离记录：分块进度流延后，导入同步返回最终报告（Rule 12 记录）。
 
 ### v1.4.5 start.sh 注册自检（issue #31）
 
@@ -493,7 +501,7 @@ cargo build --release -p fm-server   # 产出 target/release/fm-server
 #   FUSION_MEMORY_STUB=1 (StubEmbedder 离线, 不连 mlx)
 ```
 
-UDS JSON-RPC（sock 0600，B6）+ HTTP（axum 强制 Bearer，B5，端口 11435）并发。未配 `FUSION_MEMORY_API_KEY` 但 HTTP 端口开 → 拒启 HTTP（仅 UDS）。路由：`POST /v1/memory/{commit,retrieve,consolidate,audit,delete,delete_scope,count}`、`GET /v1/memory/{id}`、`GET /healthz`（公开）；`delete`/`delete_scope` 需 `params.confirm=true`。UDS method `memory.retrieve_context`（issue #1/#4 契约，`{trigger_id,query,top_k,node_id}` → `{context,memory_ids,cache_hit}`，复用 retrieve 引擎链）。
+UDS JSON-RPC（sock 0600，B6）+ HTTP（axum 强制 Bearer，B5，端口 11435）并发。未配 `FUSION_MEMORY_API_KEY` 但 HTTP 端口开 → 拒启 HTTP（仅 UDS）。路由：`POST /v1/memory/{commit,retrieve,consolidate,audit,delete,delete_scope,count,list,audit_log,merges,unmerge,reconcile,import}`、`GET /v1/memory/{id}`、`GET /healthz`（公开）、`GET /app` + `GET /app/*path`（公开 web 控制台壳，#33）；`delete`/`delete_scope`/`unmerge`/`reconcile` 需 `params.confirm=true`。RPC 请求体为 JSON-RPC 帧（`{"jsonrpc":"2.0","method":...,"params":...,"id":...}`）；`import` 收裸参数对象、返回裸报告。UDS method `memory.retrieve_context`（issue #1/#4 契约，`{trigger_id,query,top_k,node_id}` → `{context,memory_ids,cache_hit}`，复用 retrieve 引擎链）。
 
 ## 约定
 
