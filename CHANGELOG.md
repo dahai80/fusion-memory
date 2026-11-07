@@ -21,6 +21,18 @@ Internal path-dep private ecosystem (not on crates.io); versions tag + GitHub re
 
 ## [Unreleased]
 
+## [1.5.1] — 2026-11-07
+
+Docs-system adoption (fusion docs-system v1.1 contract, core x service). Docs-only patch: no Rust code change, no API change, all 12 crate versions bumped for release bookkeeping only.
+
+### Added
+- **docs/ page set**: `product-page`, `get-started`, `architecture`, `api-reference` (now documents `GET /healthz`, `/metrics`, `GET /v1/memory/version`), `config-reference`, `troubleshooting` — every page carries the docs-system frontmatter contract (`doc_id`/`doc_type`/`status`/`source_of_truth`).
+- **`ci/validate_docs.py`** (+ `.github/workflows/docs.yml`): docs-contract linter — frontmatter completeness, doc-type budgets, source-of-truth consistency; 14 docs scanned, 0 errors.
+- **AGENTS.md**: agent-facing working guide aligned with the same contract.
+
+### Changed
+- `CLAUDE.md` / `README.md` / `README_CN.md` / `clients/README.md` / `deploy/README.md` / `CHANGELOG.md` gain the docs-system frontmatter header; content semantics unchanged.
+
 ## [1.5.0] — 2026-11-05
 
 Web surface (issue #33): browse/manage REST APIs + embedded web console. MINOR release — additive RPC methods and HTTP routes only, frozen wire contract untouched (existing method set and `v1.<method>` prefix unchanged).
