@@ -1,3 +1,19 @@
+---
+doc_id: fusion-memory/readme
+product: fusion-memory
+class: core
+entry: service
+doc_type: readme
+title: { zh: "fusion-memory", en: "fusion-memory" }
+audience: engineer
+status: draft
+version: 1.5.0
+updated: 2026-11-07
+owner: @dahai
+source_of_truth:
+  - README_CN.md
+---
+
 # fusion-memory
 
 > **[English](README.md)** | 中文
@@ -62,7 +78,7 @@ Fusion 生态（"一核九端"）系统级长/短期记忆与认知图谱中枢�
 
 **M5 部分完成**（降级定位，非阻塞主线）：PRD §14 三部分 — (a) store-fusion 可选切换、(b) `audit_memory_access` → fusion-guard DLP gate、(c) perf 基线 p99<50ms + 并发。**(c) 已落地**：轻量手写 bench（`crates/fm-engine/benches/retrieve_bench.rs`，无 criterion 重依赖），store-stub 10k 条记忆 + StubEmbedder dim=64，单条 retrieve p99=14.3ms（<50ms ✅）、10 并发 p99=140ms（<200ms ✅）。基线 JSON 落 `benches/baseline-2026-08-27.json`。**(a)(b) 降级**：见 M5 PRD 偏离记录。**(c) 之外的 R8/§10.4 PII 正则脱敏已落地**（此前零脱敏的真空补齐）：`fm-engine/src/redact.rs` 五类 PII 正则（phone/email/idcard/bankcard/ipv4，regex crate 无 lookaround，顺序敏感替换避误吞），占位符 `[REDACTED:type]`，幂等。commit/import 写入路径在 embed+persist 前脱敏，故向量/图谱/检索全用脱敏后内容。env `FUSION_MEMORY_REDACT_PII=1` 开启（`MemoryEngine::with_redact()` + fm-server/fm-cli 导入路径同源 env）。13 脱敏测试绿。验收：perf bench 两 gate pass + 13 脱敏测试绿 + 301 离线测试全绿 + live 测试全绿（bge-m3 + Qwen3.8-27B-4bit，实体抽取 JSON 100%）+ 离线 regions 90.82% / live regions 92.47%（均 ≥90%）+ clippy/fmt clean。
 
-| 里程碑 | 内容 | 状态 |
+| 阶段 | 内容 | 状态 |
 |--------|------|------|
 | M0 | workspace + 核心类型 + trait + CI | ✅ |
 | M1 | store-stub 后端 + 引擎可跑（stub embedding）+ CLI | ✅ |
@@ -72,7 +88,7 @@ Fusion 生态（"一核九端"）系统级长/短期记忆与认知图谱中枢�
 | M5 | PII 脱敏 + perf 基线 + store-fusion/guard 降级 | ✅（部分） |
 | M6 | 集群同步 leader-follower | ✅ |
 
-> **里程碑全集 M0–M6（终态）**：落地架构 `~/fusion/fusion-memory-prd-plan-0826.md` §14 仅定义 M0–M6，M6 为最终里程碑，**无 M7+**。§15 未决项 6 项全部 ✅ 已裁定；§17 审计修正 E1（8 项）/E2（10 项）/E3（3 项）全部已落地或已决策，审计闭环无遗留。后续工作仅两类：(1) M5(b) 待上游 `fusion-guard#2` 补 PII 类后接正式 DLP gate；(2) PRD 外的运维/性能/消费方演进。
+> **阶段全集 M0–M6（终态）**：落地架构 `~/fusion/fusion-memory-prd-plan-0826.md` §14 仅定义 M0–M6，M6 为最终阶段，**无 M7+**。§15 未决项 6 项全部 ✅ 已裁定；§17 审计修正 E1（8 项）/E2（10 项）/E3（3 项）全部已落地或已决策，审计闭环无遗留。后续工作仅两类：(1) M5(b) 待上游 `fusion-guard#2` 补 PII 类后接正式 DLP gate；(2) PRD 外的运维/性能/消费方演进。
 
 ### 审计 P0–P3 修复记录（2026-08-27，全闭环）
 

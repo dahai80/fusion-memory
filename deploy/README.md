@@ -1,3 +1,19 @@
+---
+doc_id: fusion-memory/guide
+product: fusion-memory
+class: core
+entry: service
+doc_type: guide
+title: { zh: "部署工件说明", en: "Deploy artifacts" }
+audience: engineer
+status: draft
+version: 1.5.0
+updated: 2026-11-07
+owner: @dahai
+source_of_truth:
+  - deploy/README.md
+---
+
 # Deploy Artifacts (P0-1 / P0-6)
 
 进程守护 + 容器化部署制品。审计整改 P0-1 (无进程守护) + P0-6 (无部署制品)。

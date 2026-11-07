@@ -1,3 +1,19 @@
+---
+doc_id: fusion-memory/guide
+product: fusion-memory
+class: core
+entry: service
+doc_type: guide
+title: { zh: "Claude Code 工作指引", en: "Claude Code guidance" }
+audience: engineer
+status: draft
+version: 1.5.0
+updated: 2026-11-07
+owner: @dahai
+source_of_truth:
+  - CLAUDE.md
+---
+
 # CLAUDE.md
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.

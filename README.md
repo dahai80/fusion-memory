@@ -1,3 +1,19 @@
+---
+doc_id: fusion-memory/readme
+product: fusion-memory
+class: core
+entry: service
+doc_type: readme
+title: { zh: "fusion-memory", en: "fusion-memory" }
+audience: engineer
+status: draft
+version: 1.5.0
+updated: 2026-11-07
+owner: @dahai
+source_of_truth:
+  - README.md
+---
+
 # fusion-memory
 
 > **English** | **[中文](README_CN.md)**

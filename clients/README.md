@@ -1,3 +1,19 @@
+---
+doc_id: fusion-memory/readme
+product: fusion-memory
+class: core
+entry: service
+doc_type: readme
+title: { zh: "消费方参考客户端", en: "Consumer reference clients" }
+audience: engineer
+status: draft
+version: 1.5.0
+updated: 2026-11-07
+owner: @dahai
+source_of_truth:
+  - clients/README.md
+---
+
 # fusion-memory 消费方参考客户端
 
 M4 消费方接入参考实现。权威 PRD `architecture/fusion-memory-prd-0825.md` §10，落地架构 `~/fusion/fusion-memory-prd-plan-0826.md` §10。
