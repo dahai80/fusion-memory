@@ -1,3 +1,19 @@
+---
+doc_id: fusion-memory/changelog
+product: fusion-memory
+class: core
+entry: service
+doc_type: changelog
+title: { zh: "更新日志", en: "Changelog" }
+audience: engineer
+status: draft
+version: 1.5.0
+updated: 2026-11-07
+owner: @dahai
+source_of_truth:
+  - CHANGELOG.md
+---
+
 # Changelog
 
 All notable changes to fusion-memory. Format: Keep a Changelog. SemVer 2.0.0.

@@ -1,3 +1,19 @@
+---
+doc_id: fusion-memory/guide
+product: fusion-memory
+class: core
+entry: service
+doc_type: guide
+title: { zh: "检索质量消融报告", en: "Retrieval quality ablation report" }
+audience: engineer
+status: draft
+version: 1.5.0
+updated: 2026-11-07
+owner: @dahai
+source_of_truth:
+  - docs/benchmarks/retrieval-quality-2026-10-25.md
+---
+
 # Retrieval Quality Ablation — fusion scoring vs plain cosine (issue #25)
 
 Date: 2026-10-25 · Harness: `crates/fm-engine/tests/retrieval_quality.rs` · Deterministic seed `0x5eed25abcd100001`
