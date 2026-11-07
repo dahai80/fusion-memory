@@ -9,7 +9,7 @@ audience: engineer
 status: draft
 version: 1.5.0
 updated: 2026-11-07
-owner: @dahai
+owner: "@dahai"
 source_of_truth:
   - README.md
   - crates/fm-server/src/config.rs

@@ -9,7 +9,7 @@ audience: engineer
 status: draft
 version: 1.5.0
 updated: 2026-11-07
-owner: @dahai
+owner: "@dahai"
 source_of_truth:
   - docs/benchmarks/retrieval-quality-2026-10-25.md
 ---
