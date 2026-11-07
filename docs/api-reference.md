@@ -23,6 +23,10 @@ source_of_truth:
 
 | 路由 | confirm | 说明 |
 |---|---|---|
+| `GET /healthz` | — | 公开健康检查（无鉴权） |
+| `GET /metrics` | — | Prometheus 指标 |
+| `GET /v1/memory/version` | — | 服务版本 |
+|---|---|---|
 | `POST /v1/memory/commit` | — | 提交记忆片段，自动抽取实体入图谱 |
 | `POST /v1/memory/retrieve` | — | 检索并组装压缩上下文 |
 | `POST /v1/memory/consolidate` | — | 触发遗忘 + 巩固，返回报告 |
