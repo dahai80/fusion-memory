@@ -64,6 +64,14 @@ pub fn build_server_engine(cfg: &ServerConfig, stub: bool) -> Result<ServerEngin
         info!("PII redaction enabled (R8)");
     }
 
+    // M6 #45: 注入检测 — 本地规则层恒开 (离线 fail-safe); FUSION_MEMORY_INJECTION_URL
+    // 配置时叠加 fusion-security 委托 (仅 loopback, 防线 1)。未配置 = 零外联。
+    if let Ok(url) = std::env::var("FUSION_MEMORY_INJECTION_URL") {
+        if let Some(scanner) = resolve_injection_scanner(Some(&url))? {
+            engine = engine.with_scanner(Some(scanner));
+        }
+    }
+
     if !stub {
         // #23: extractor 与 embedder 共用同一份解析后配置 (TOML [embed] + env 覆盖)。
         let e = ecfg.as_ref().expect("non-stub 必有 embed cfg");
@@ -80,6 +88,25 @@ pub fn build_server_engine(cfg: &ServerConfig, stub: bool) -> Result<ServerEngin
     }
     info!(stub, dim, "server engine built");
     Ok(ServerEngine { engine })
+}
+
+/// M6 #45: 解析注入扫描器配置 — 非空 URL 必须为 loopback (防线 1), 否则拒启。
+/// 返回 None = 未配置/空串 (零外联, 仅本地规则层)。纯函数便于测试 (env 进程全局, 测试不碰)。
+fn resolve_injection_scanner(
+    url: Option<&str>,
+) -> Result<Option<std::sync::Arc<fm_engine::trust::HttpScanner>>, String> {
+    let Some(url) = url.map(str::trim).filter(|u| !u.is_empty()) else {
+        return Ok(None);
+    };
+    if !url.starts_with("http://127.0.0.1") && !url.starts_with("http://localhost") {
+        return Err(format!(
+            "FUSION_MEMORY_INJECTION_URL must be loopback (got {url}); ecosystem constraint: HTTP only to 127.0.0.1"
+        ));
+    }
+    let token = std::env::var("FUSION_MEMORY_INJECTION_TOKEN").ok();
+    Ok(Some(std::sync::Arc::new(
+        fm_engine::trust::HttpScanner::new(url.to_string(), token),
+    )))
 }
 
 #[cfg(test)]
@@ -101,6 +128,25 @@ mod tests {
         let se = build_server_engine(&cfg, true).expect("stub build");
         // 引擎可调 health（不 panic 即通过，证明 store/persist/embedder 都建好）
         let _ = se.engine;
+    }
+
+    // M6 #45 防线 1: 非回环拒启, 回环通过, 未配置零外联 (纯函数, 不碰进程 env)。
+    #[test]
+    fn injection_url_loopback_guard() {
+        assert!(resolve_injection_scanner(None).unwrap().is_none());
+        assert!(resolve_injection_scanner(Some("")).unwrap().is_none());
+        assert!(resolve_injection_scanner(Some("  ")).unwrap().is_none());
+        let err = match resolve_injection_scanner(Some(
+            "http://10.0.0.5:8800/api/v1/agent/injection-scan",
+        )) {
+            Err(e) => e,
+            Ok(_) => panic!("non-loopback injection url must be rejected"),
+        };
+        assert!(err.contains("loopback"), "err={err}");
+        let ok =
+            resolve_injection_scanner(Some("http://127.0.0.1:8800/api/v1/agent/injection-scan"))
+                .unwrap();
+        assert!(ok.is_some());
     }
 
     #[test]

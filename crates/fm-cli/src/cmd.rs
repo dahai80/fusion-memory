@@ -500,6 +500,7 @@ mod tests {
                 }],
             }],
             timestamp: 1,
+            owner: None,
             metadata: serde_json::json!({}),
         };
         serde_json::to_string(&ix).unwrap()
@@ -561,6 +562,7 @@ mod tests {
                     },
                 ],
                 timestamp: i as u64,
+                owner: None,
                 metadata: serde_json::json!({}),
             };
             let ids = eng.commit_episodic_memory("bulk", &ix).await.unwrap();
@@ -958,6 +960,7 @@ mod tests {
                     tool_calls: vec![],
                 }],
                 timestamp: 1,
+                owner: None,
                 metadata: serde_json::json!({}),
             };
             eng.commit_episodic_memory("s", &ix).await.unwrap();

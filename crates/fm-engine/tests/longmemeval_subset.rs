@@ -100,6 +100,7 @@ async fn build_corpus(engine: &MemoryEngine, rng: &mut Rng) -> Vec<Instance> {
                 })
                 .collect(),
             timestamp: 0,
+            owner: None,
             metadata: Default::default(),
         }
     }

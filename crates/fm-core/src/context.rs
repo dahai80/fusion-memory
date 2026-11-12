@@ -70,6 +70,10 @@ pub struct ContextBlock {
     pub turns_text: String,
     pub score: f64,
     pub source_entities: Vec<String>,
+    /// M5 #46 per-memory ACL: block 级 owner (取自块内首条记忆)。None = 共享。
+    /// 检索边界 (fm-server) 按调用方过滤; serde default 保旧 JSON 兼容。
+    #[serde(default)]
+    pub owner: Option<String>,
 }
 
 #[cfg(test)]

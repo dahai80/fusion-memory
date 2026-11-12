@@ -113,6 +113,26 @@ pub struct MemoryItem {
     pub provenance: Option<String>,
     pub tombstone: bool,
     pub entities_pending: bool,
+    /// M3 #44 事实有效期窗口: 生效起点 (epoch ms)。None = 无下界。
+    /// 旧数据无窗口 → 检索不受有效期影响 (serde default + 列可空)。
+    #[serde(default)]
+    pub valid_from: Option<u64>,
+    /// M3 #44 事实有效期窗口: 失效终点 (epoch ms)。None = 无上界。
+    /// 过期记忆降权不删除 — tombstone 仍只给显式删除。
+    #[serde(default)]
+    pub valid_until: Option<u64>,
+    /// M6 #45 信任链: 巩固产物置信度 (TRUSTMEM 传闻→置信度)。
+    /// None = 非巩固产物 (commit 直写)。0..1。
+    #[serde(default)]
+    pub confidence: Option<f32>,
+    /// M6 #45 溯源: 来源引用 (episodes)。
+    /// summarize 产物 = 来源 interaction ids; merge 产物 = 被并 item ids。空 = 无溯源。
+    #[serde(default)]
+    pub sources: Vec<String>,
+    /// M5 #46 per-memory ACL: owner user id (fusion-identity JWT sub)。
+    /// None = 共享/旧数据 (所有租户内调用方可见)。仅 multi_tenant+ACL 模式下由服务端权威写入。
+    #[serde(default)]
+    pub owner: Option<String>,
 }
 
 impl MemoryItem {
@@ -149,6 +169,11 @@ impl MemoryItem {
             provenance: None,
             tombstone: false,
             entities_pending: true,
+            valid_from: None,
+            valid_until: None,
+            confidence: None,
+            sources: Vec::new(),
+            owner: None,
         }
     }
 
@@ -156,6 +181,13 @@ impl MemoryItem {
     pub fn with_namespace(mut self, namespace: impl Into<String>, key: impl Into<String>) -> Self {
         self.namespace = namespace.into();
         self.namespace_key = key.into();
+        self
+    }
+
+    /// M3 #44: 挂事实有效期窗口 (None = 不设界)。
+    pub fn with_validity(mut self, valid_from: Option<u64>, valid_until: Option<u64>) -> Self {
+        self.valid_from = valid_from;
+        self.valid_until = valid_until;
         self
     }
 }

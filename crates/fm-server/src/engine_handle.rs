@@ -92,6 +92,7 @@ mod tests {
             namespace_key: String::new(),
             turns: vec![],
             timestamp: 0,
+            owner: None,
             metadata: Default::default(),
         };
         let ids = h.commit_episodic_memory("s", &ix).await.unwrap();

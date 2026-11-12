@@ -111,6 +111,7 @@ pub async fn serve(cfg: ServerConfig, opts: ServeOpts) -> Result<(), String> {
                 gateway_origin_required: cfg.gateway_origin_required,
                 default_tenant: Arc::new(cfg.default_tenant.clone()),
                 multi_tenant: cfg.multi_tenant,
+                acl: cfg.acl,
                 verifier,
                 // #33: import route reuses the server concrete engine (same SQLite WAL + store handle, avoids the sled lock conflict).
                 concrete: Some(engine.clone()),

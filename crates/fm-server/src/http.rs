@@ -25,7 +25,8 @@ use tracing::{info, warn};
 
 use crate::auth::check_bearer;
 use crate::engine_handle::EngineHandle;
-use crate::identity::{enforce_multi_tenant, IdentityVerifier};
+use crate::identity::{enforce_multi_tenant, CallerCtx, IdentityVerifier};
+use crate::jsonrpc::AclUser;
 use crate::jsonrpc::{dispatch, http_status_for_error, RpcRequest, RpcResponse};
 // P2-4: API 版本号 (jsonrpc::API_VERSION 单一来源)。
 use crate::jsonrpc::API_VERSION;
@@ -50,6 +51,8 @@ pub struct HttpState {
     pub multi_tenant: bool,
     /// #18: fusion-identity 验证器 (真实 HTTP + 测试 mock)。多租户模式必配。
     pub verifier: Arc<dyn IdentityVerifier>,
+    /// M5 #46: per-memory ACL 开关 (multi_tenant=true 时生效; owner 位来自 JWT sub)。
+    pub acl: bool,
     /// #33: server concrete engine (import route reuses it directly — shared SQLite WAL + store
     /// handle avoids a second open hitting the sled lock; embedder matches the server's). None only in route-wiring unit tests (stub dyn engine).
     pub concrete: Option<Arc<fm_engine::MemoryEngine>>,
@@ -73,6 +76,7 @@ pub fn app(state: HttpState) -> axum::Router {
         .route("/v1/memory/merges", post(merges_route))
         .route("/v1/memory/unmerge", post(unmerge_route))
         .route("/v1/memory/reconcile", post(reconcile_route))
+        .route("/v1/memory/provenance", post(provenance_route))
         .route("/v1/memory/import", post(import_route))
         // #33: web UI static assets (web/dist embedded at compile time, no runtime file dependency). Public shell; data goes through Bearer.
         .route("/app", get(web_index))
@@ -167,13 +171,30 @@ async fn handle_rpc(
         }
     };
     // #18: 多租户模式 — 验 caller JWT (fusion-identity) + 强制 tid==tenant + 拒空 tenant。
-    if let Err((code, body)) =
-        enforce_multi_tenant(st.verifier.as_ref(), &headers, &tenant, st.multi_tenant).await
+    let ctx: CallerCtx = match enforce_multi_tenant(
+        st.verifier.as_ref(),
+        &headers,
+        &tenant,
+        st.multi_tenant,
+    )
+    .await
     {
-        st.metrics.incr_total();
-        st.metrics.incr_error();
-        return (code, body).into_response();
-    }
+        Ok(c) => c,
+        Err((code, body)) => {
+            st.metrics.incr_total();
+            st.metrics.incr_error();
+            return (code, body).into_response();
+        }
+    };
+    // M5 #46: ACL 身份仅在 multi_tenant+acl 同时开启时生效 (JWT sub 为 owner 比对值)。
+    let acl_user = if st.acl && st.multi_tenant {
+        Some(AclUser {
+            sub: ctx.sub,
+            admin: ctx.role == "admin",
+        })
+    } else {
+        None
+    };
     let rpc: RpcRequest = match serde_json::from_value(req) {
         Ok(r) => r,
         Err(e) => {
@@ -190,7 +211,7 @@ async fn handle_rpc(
     };
     let method = rpc.method.clone();
     let start = std::time::Instant::now();
-    let resp: RpcResponse = dispatch(rpc, &st.engine, &tenant).await;
+    let resp: RpcResponse = dispatch(rpc, &st.engine, &tenant, acl_user.as_ref()).await;
     let elapsed = start.elapsed().as_secs_f64();
     st.metrics.incr_total();
     st.metrics.observe_duration(&method, elapsed);
@@ -240,6 +261,9 @@ async fn unmerge_route(st: State<HttpState>, h: HeaderMap, j: Json<Value>) -> Re
     handle_rpc(st, h, j).await
 }
 async fn reconcile_route(st: State<HttpState>, h: HeaderMap, j: Json<Value>) -> Response {
+    handle_rpc(st, h, j).await
+}
+async fn provenance_route(st: State<HttpState>, h: HeaderMap, j: Json<Value>) -> Response {
     handle_rpc(st, h, j).await
 }
 
@@ -406,13 +430,30 @@ async fn get_memory(
         }
     };
     // #18: GET 路径同样做多租户身份强制。
-    if let Err((code, body)) =
-        enforce_multi_tenant(st.verifier.as_ref(), &headers, &tenant, st.multi_tenant).await
+    let ctx: CallerCtx = match enforce_multi_tenant(
+        st.verifier.as_ref(),
+        &headers,
+        &tenant,
+        st.multi_tenant,
+    )
+    .await
     {
-        st.metrics.incr_total();
-        st.metrics.incr_error();
-        return (code, body).into_response();
-    }
+        Ok(c) => c,
+        Err((code, body)) => {
+            st.metrics.incr_total();
+            st.metrics.incr_error();
+            return (code, body).into_response();
+        }
+    };
+    // M5 #46: GET /v1/memory/:id 同 owner 过滤。
+    let acl_user = if st.acl && st.multi_tenant {
+        Some(AclUser {
+            sub: ctx.sub,
+            admin: ctx.role == "admin",
+        })
+    } else {
+        None
+    };
     let rpc = RpcRequest {
         jsonrpc: "2.0".into(),
         method: "get".into(),
@@ -420,7 +461,7 @@ async fn get_memory(
         id: Value::from(0i64),
     };
     let start = std::time::Instant::now();
-    let resp = dispatch(rpc, &st.engine, &tenant).await;
+    let resp = dispatch(rpc, &st.engine, &tenant, acl_user.as_ref()).await;
     st.metrics
         .observe_duration("get", start.elapsed().as_secs_f64());
     st.metrics.incr_total();
@@ -572,6 +613,7 @@ mod tests {
             gateway_origin_required: false,
             default_tenant: Arc::new(String::new()),
             multi_tenant: false,
+            acl: false,
             verifier: crate::identity::noop_verifier(),
             concrete: None,
         };
@@ -1023,6 +1065,7 @@ mod tests {
             gateway_origin_required: false,
             default_tenant: Arc::new(String::new()),
             multi_tenant: false,
+            acl: false,
             verifier: crate::identity::noop_verifier(),
             concrete: None,
         };
@@ -1086,6 +1129,7 @@ mod tests {
             gateway_origin_required: false,
             default_tenant: Arc::new(String::new()),
             multi_tenant: false,
+            acl: false,
             verifier: crate::identity::noop_verifier(),
             concrete: None,
         };
@@ -1224,6 +1268,7 @@ mod tests {
             gateway_origin_required: false,
             default_tenant: Arc::new(String::new()),
             multi_tenant: false,
+            acl: false,
             verifier: crate::identity::noop_verifier(),
             concrete: None,
         };
@@ -1267,7 +1312,11 @@ mod tests {
     impl crate::identity::IdentityVerifier for FixedTidVerifier {
         async fn verify(&self, _jwt: &str) -> crate::identity::VerifyResult {
             if self.ok {
-                Ok(self.tid.clone())
+                Ok(CallerCtx {
+                    tid: self.tid.clone(),
+                    sub: String::new(),
+                    role: String::new(),
+                })
             } else {
                 Err((
                     StatusCode::UNAUTHORIZED,
@@ -1292,6 +1341,7 @@ mod tests {
             gateway_origin_required: false,
             default_tenant: Arc::new(String::new()),
             multi_tenant: true,
+            acl: false,
             verifier: Arc::new(FixedTidVerifier {
                 tid: tid.into(),
                 ok,

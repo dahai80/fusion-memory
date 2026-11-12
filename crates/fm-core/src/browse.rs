@@ -66,3 +66,20 @@ pub struct MergeEntry {
     pub target_id: String,
     pub reason: String,
 }
+
+/// M6 #45: provenance report for one memory item — its own lineage plus
+/// reverse citations. Powers the poisoning-governance provenance query.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProvenanceReport {
+    pub id: String,
+    /// Forward lineage: source references (episode interaction ids for
+    /// summarize products, merged-away memory ids for merge products).
+    #[serde(default)]
+    pub sources: Vec<String>,
+    /// Consolidation confidence (None = direct commit, not a consolidation product).
+    #[serde(default)]
+    pub confidence: Option<f32>,
+    /// Reverse citations: live items whose `sources` contain this id.
+    #[serde(default)]
+    pub cited_by: Vec<String>,
+}

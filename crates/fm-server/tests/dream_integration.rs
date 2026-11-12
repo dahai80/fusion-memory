@@ -76,6 +76,7 @@ fn ix(id: &str, text: &str) -> Interaction {
             tool_calls: vec![],
         }],
         timestamp: 0,
+        owner: None,
         metadata: Default::default(),
     }
 }

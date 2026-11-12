@@ -155,4 +155,17 @@ pub trait FusionMemoryEngine: Send + Sync {
             "reconcile not implemented for this engine".into(),
         ))
     }
+
+    /// M6 #45: provenance lookup — a memory's own lineage (sources + confidence)
+    /// plus reverse citations (items whose `sources` contain this id).
+    /// Powers the web console provenance query (poisoning governance surface).
+    async fn provenance(
+        &self,
+        _id: &str,
+        _tenant: &str,
+    ) -> MemoryResult<crate::browse::ProvenanceReport> {
+        Err(crate::error::MemoryError::Unsupported(
+            "provenance not implemented for this engine".into(),
+        ))
+    }
 }

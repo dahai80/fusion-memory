@@ -152,6 +152,11 @@ impl Persist {
                 enc_entities,
                 item.namespace,
                 item.namespace_key,
+                item.valid_from.map(|v| v as i64),
+                item.valid_until.map(|v| v as i64),
+                item.confidence.map(|c| c as f64),
+                serde_json::to_string(&item.sources).expect("sources_json serialize"),
+                item.owner,
             ],
         )?;
         for e in &item.entities {
@@ -224,6 +229,11 @@ impl Persist {
                 enc_entities,
                 item.namespace,
                 item.namespace_key,
+                item.valid_from.map(|v| v as i64),
+                item.valid_until.map(|v| v as i64),
+                item.confidence.map(|c| c as f64),
+                serde_json::to_string(&item.sources).expect("sources_json serialize"),
+                item.owner,
             ],
         )?;
         for e in &item.entities {
@@ -1332,6 +1342,18 @@ fn row_to_memory(
         provenance: row.get("provenance")?,
         tombstone: tombstone_i != 0,
         entities_pending: pending_i != 0,
+        // M3 #44: 可空列 → Option; NULL = 无窗口 (旧行为)。
+        valid_from: row
+            .get::<_, Option<i64>>("valid_from")?
+            .map(|v| v.max(0) as u64),
+        valid_until: row
+            .get::<_, Option<i64>>("valid_until")?
+            .map(|v| v.max(0) as u64),
+        // M6 #45: 巩固产物置信度 + 溯源引用 (坏 JSON 静默降级空, 同 entities_json 语义)。
+        confidence: row.get::<_, Option<f64>>("confidence")?.map(|c| c as f32),
+        sources: serde_json::from_str(&row.get::<_, String>("sources_json")?).unwrap_or_default(),
+        // M5 #46: per-memory ACL owner (旧行 NULL = None)。
+        owner: row.get::<_, Option<String>>("owner")?,
     })
 }
 
@@ -1904,6 +1926,112 @@ mod tests {
                 .unwrap();
             assert_eq!(n, 2);
         }
+    }
+
+    // M3 #44: v6 加 valid_from/valid_until 列; 模拟 v5 旧库 (DROP COLUMN + 回退版本) → migrate 补列。
+    #[test]
+    fn schema_v6_validity_migration() {
+        let p = Persist::open_in_memory().unwrap();
+        {
+            let c = p.conn().unwrap();
+            c.execute_batch("ALTER TABLE memory_item DROP COLUMN valid_until")
+                .unwrap();
+            c.execute_batch("ALTER TABLE memory_item DROP COLUMN valid_from")
+                .unwrap();
+            c.execute_batch("PRAGMA user_version=5").unwrap();
+            schema::migrate(&c).unwrap();
+            assert_eq!(schema::user_version(&c).unwrap(), schema::SCHEMA_VERSION);
+            let n: i64 = c
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('memory_item') WHERE name IN ('valid_from','valid_until')",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 2, "v6 columns restored by migrate");
+        }
+    }
+
+    // M6 #45: v7 加 confidence/sources_json 列; 模拟 v6 旧库 (DROP COLUMN + 回退版本) → migrate 补列。
+    #[test]
+    fn schema_v7_trust_migration() {
+        let p = Persist::open_in_memory().unwrap();
+        {
+            let c = p.conn().unwrap();
+            c.execute_batch("ALTER TABLE memory_item DROP COLUMN sources_json")
+                .unwrap();
+            c.execute_batch("ALTER TABLE memory_item DROP COLUMN confidence")
+                .unwrap();
+            c.execute_batch("PRAGMA user_version=6").unwrap();
+            schema::migrate(&c).unwrap();
+            assert_eq!(schema::user_version(&c).unwrap(), schema::SCHEMA_VERSION);
+            let n: i64 = c
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('memory_item') WHERE name IN ('confidence','sources_json')",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 2, "v7 columns restored by migrate");
+        }
+    }
+
+    // M5 #46: v8 加 owner 列; 模拟 v7 旧库 (DROP COLUMN + 回退版本) → migrate 补列。
+    #[test]
+    fn schema_v8_owner_migration() {
+        let p = Persist::open_in_memory().unwrap();
+        {
+            let c = p.conn().unwrap();
+            c.execute_batch("ALTER TABLE memory_item DROP COLUMN owner")
+                .unwrap();
+            c.execute_batch("PRAGMA user_version=7").unwrap();
+            schema::migrate(&c).unwrap();
+            assert_eq!(schema::user_version(&c).unwrap(), schema::SCHEMA_VERSION);
+            let n: i64 = c
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('memory_item') WHERE name='owner'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 1, "v8 owner column restored by migrate");
+        }
+    }
+
+    // M6 #45 repro: put_memory_with_wop row visible to count() — trust column write path.
+    #[test]
+    fn wop_put_visible_to_count() {
+        let p = Persist::open_in_memory().unwrap();
+        let item = MemoryItem::new_turn_skeleton(
+            "w1".into(),
+            "ix".into(),
+            0,
+            "s".into(),
+            String::new(),
+            MemoryType::Episodic,
+            "hello rust".into(),
+            1000,
+        );
+        p.put_memory_with_wop(&item, "commit", "{}", 1000).unwrap();
+        assert_eq!(p.count().unwrap(), 1, "wop row must be visible");
+    }
+
+    // M3 #44: validity roundtrip — 窗口持久化 + 无窗口行 NULL → None (旧行为不变)。
+    #[test]
+    fn validity_roundtrip_and_null_defaults() {
+        let p = Persist::open_in_memory().unwrap();
+        let mut a = item_with_content("v1", "rotating credential for lab-router");
+        a.valid_from = Some(1_000);
+        a.valid_until = Some(2_000);
+        p.put_memory(&a).unwrap();
+        let got = p.get_memory("v1").unwrap().unwrap();
+        assert_eq!(got.valid_from, Some(1_000));
+        assert_eq!(got.valid_until, Some(2_000));
+        p.put_memory(&item_with_content("v2", "permanent note"))
+            .unwrap();
+        let got2 = p.get_memory("v2").unwrap().unwrap();
+        assert_eq!(got2.valid_from, None, "no window → NULL → None");
+        assert_eq!(got2.valid_until, None);
     }
 
     fn ns_item(id: &str, vec: u64, ns: &str, key: &str) -> MemoryItem {

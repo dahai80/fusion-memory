@@ -19,15 +19,32 @@ use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 /// fusion-identity `/verify` 返回体 (子集 — 仅取 tid + tenant_status)。
+/// M5 #46: 加取 sub (user id, per-memory ACL owner) + role (admin bypass)。
+/// 旧版 fusion-identity 无这两个字段 → serde default 空 (空 sub = ACL 全拒, fail-closed)。
 #[derive(Debug, Clone, Deserialize)]
 pub struct VerifyClaims {
     pub tid: String,
     pub tenant_status: String,
     pub revoked: bool,
+    /// M5 #46: caller user id (JWT sub)。per-memory ACL owner 位。
+    #[serde(default)]
+    pub sub: String,
+    /// M5 #46: caller role。"admin" 绕过 owner 检查; 其余/空 = 普通用户。
+    #[serde(default)]
+    pub role: String,
 }
 
-/// #18: identity 边界校验结果。Ok(tid) 或 Err((status, body)) 供 handler 直接返。
-pub type VerifyResult = Result<String, (axum::http::StatusCode, axum::Json<serde_json::Value>)>;
+/// #18/#46: identity 边界校验通过后的调用方权威身份。tenant 检查用 tid;
+/// ACL 检查用 sub/role (空 sub = 旧版 identity, ACL fail-closed 全拒)。
+#[derive(Debug, Clone)]
+pub struct CallerCtx {
+    pub tid: String,
+    pub sub: String,
+    pub role: String,
+}
+
+/// #18: identity 边界校验结果。Ok(CallerCtx) 或 Err((status, body)) 供 handler 直接返。
+pub type VerifyResult = Result<CallerCtx, (axum::http::StatusCode, axum::Json<serde_json::Value>)>;
 
 /// #18: identity 集成 trait — 真实 HTTP 验证器 + 测试 mock。
 #[async_trait]
@@ -81,7 +98,11 @@ impl IdentityVerifier for RealVerifier {
             g.get(jwt).filter(|(_, exp)| *exp > Instant::now()).cloned()
         };
         if let Some((tid, _)) = cached {
-            return Ok(tid);
+            return Ok(CallerCtx {
+                tid,
+                sub: String::new(),
+                role: String::new(),
+            });
         }
         // POST /api/v1/auth/verify, Authorization: Bearer <service_token>, body {"token": jwt}
         let url = format!("{}/api/v1/auth/verify", self.base_url);
@@ -119,21 +140,25 @@ impl IdentityVerifier for RealVerifier {
             warn!(tenant_status = claims.tenant_status, "tenant not active");
             return Err(Self::deny("tenant not active"));
         }
-        let tid = claims.tid.clone();
+        let ctx = CallerCtx {
+            tid: claims.tid.clone(),
+            sub: claims.sub.clone(),
+            role: claims.role.clone(),
+        };
         // 写缓存
         {
             let mut g = self.cache.lock().await;
             g.insert(
                 jwt.to_string(),
-                (tid.clone(), Instant::now() + self.cache_ttl),
+                (ctx.tid.clone(), Instant::now() + self.cache_ttl),
             );
         }
         info!(
-            tid,
+            tid = ctx.tid,
             "identity verify ok (cached {}s)",
             self.cache_ttl.as_secs()
         );
-        Ok(tid)
+        Ok(ctx)
     }
 
     async fn report_usage(&self, tenant: &str, metric: &str, value: u64) -> () {
@@ -176,7 +201,11 @@ pub struct NoopVerifier;
 #[async_trait]
 impl IdentityVerifier for NoopVerifier {
     async fn verify(&self, _jwt: &str) -> VerifyResult {
-        Ok(String::new())
+        Ok(CallerCtx {
+            tid: String::new(),
+            sub: String::new(),
+            role: String::new(),
+        })
     }
     async fn report_usage(&self, _t: &str, _m: &str, _v: u64) -> () {}
 }
@@ -196,7 +225,11 @@ pub async fn enforce_multi_tenant(
     multi_tenant: bool,
 ) -> VerifyResult {
     if !multi_tenant {
-        return Ok(tenant.to_string());
+        return Ok(CallerCtx {
+            tid: tenant.to_string(),
+            sub: String::new(),
+            role: String::new(),
+        });
     }
     // red line 1: 多租户模式拒空 tenant (无 default-tenant 降级)。
     if tenant.is_empty() {
@@ -225,11 +258,11 @@ pub async fn enforce_multi_tenant(
             ));
         }
     };
-    let tid = verifier.verify(&jwt).await?;
+    let ctx = verifier.verify(&jwt).await?;
     // red line 2: tid == tenant (cross-tenant denied)。
-    if tid != tenant {
+    if ctx.tid != tenant {
         warn!(
-            tid,
+            tid = ctx.tid,
             tenant, "cross-tenant denied: jwt tid != request tenant"
         );
         return Err((
@@ -239,7 +272,7 @@ pub async fn enforce_multi_tenant(
             })),
         ));
     }
-    Ok(tid)
+    Ok(ctx)
 }
 
 #[cfg(test)]
@@ -248,6 +281,8 @@ mod tests {
 
     struct MockVerifier {
         tid: String,
+        sub: String,
+        role: String,
         ok: bool,
     }
 
@@ -255,7 +290,11 @@ mod tests {
     impl IdentityVerifier for MockVerifier {
         async fn verify(&self, _jwt: &str) -> VerifyResult {
             if self.ok {
-                Ok(self.tid.clone())
+                Ok(CallerCtx {
+                    tid: self.tid.clone(),
+                    sub: self.sub.clone(),
+                    role: self.role.clone(),
+                })
             } else {
                 Err((
                     axum::http::StatusCode::UNAUTHORIZED,
@@ -281,18 +320,22 @@ mod tests {
     async fn multi_tenant_off_no_verify() {
         let v = MockVerifier {
             tid: "acme".into(),
+            sub: String::new(),
+            role: String::new(),
             ok: false,
         };
         // multi_tenant=false → 不验, 直接返 tenant (向后兼容)
         let r = enforce_multi_tenant(&v, &hdr(None, None), "", false).await;
         assert!(r.is_ok());
-        assert_eq!(r.unwrap(), "");
+        assert_eq!(r.unwrap().tid, "");
     }
 
     #[tokio::test]
     async fn multi_tenant_empty_tenant_rejected() {
         let v = MockVerifier {
             tid: "acme".into(),
+            sub: String::new(),
+            role: String::new(),
             ok: true,
         };
         let r = enforce_multi_tenant(&v, &hdr(Some("Bearer j"), None), "", true).await;
@@ -305,6 +348,8 @@ mod tests {
     async fn multi_tenant_missing_jwt_rejected() {
         let v = MockVerifier {
             tid: "acme".into(),
+            sub: String::new(),
+            role: String::new(),
             ok: true,
         };
         let r = enforce_multi_tenant(&v, &hdr(None, Some("acme")), "acme", true).await;
@@ -317,6 +362,8 @@ mod tests {
     async fn multi_tenant_cross_tenant_denied() {
         let v = MockVerifier {
             tid: "acme".into(),
+            sub: String::new(),
+            role: String::new(),
             ok: true,
         };
         // jwt tid=acme, request tenant=other → 403
@@ -331,17 +378,21 @@ mod tests {
     async fn multi_tenant_matching_tid_passes() {
         let v = MockVerifier {
             tid: "acme".into(),
+            sub: String::new(),
+            role: String::new(),
             ok: true,
         };
         let r = enforce_multi_tenant(&v, &hdr(Some("Bearer j"), Some("acme")), "acme", true).await;
         assert!(r.is_ok());
-        assert_eq!(r.unwrap(), "acme");
+        assert_eq!(r.unwrap().tid, "acme");
     }
 
     #[tokio::test]
     async fn multi_tenant_invalid_jwt_rejected() {
         let v = MockVerifier {
             tid: "acme".into(),
+            sub: String::new(),
+            role: String::new(),
             ok: false,
         };
         let r =
@@ -386,7 +437,7 @@ mod tests {
         let v = RealVerifier::new(format!("http://{}", addr), "svc-tok".into());
         let r = v.verify("good-jwt").await;
         assert!(r.is_ok(), "good-jwt should verify");
-        assert_eq!(r.unwrap(), "tenant-x");
+        assert_eq!(r.unwrap().tid, "tenant-x");
 
         // revoked → denied
         let r2 = v.verify("bad-jwt").await;
@@ -395,6 +446,57 @@ mod tests {
         // 缓存命中: 第二次 good-jwt 不再打 echo (无法直接断言, 但应仍 ok)
         let r3 = v.verify("good-jwt").await;
         assert!(r3.is_ok());
+    }
+
+    // M5 #46: verify 提取 sub/role (ACL 身份源)。旧 identity 无字段 → 空 (fail-closed)。
+    #[tokio::test]
+    async fn real_verifier_extracts_sub_and_role() {
+        use axum::{routing::post, Json, Router};
+
+        let app = Router::new().route(
+            "/api/v1/auth/verify",
+            post(|Json(_): Json<serde_json::Value>| async move {
+                Json(serde_json::json!({
+                    "tid": "tenant-x",
+                    "tenant_status": "active",
+                    "revoked": false,
+                    "sub": "user-42",
+                    "role": "admin"
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let v = RealVerifier::new(format!("http://{}", addr), "svc-tok".into());
+        let ctx = v.verify("jwt").await.unwrap();
+        assert_eq!(ctx.tid, "tenant-x");
+        assert_eq!(ctx.sub, "user-42");
+        assert_eq!(ctx.role, "admin");
+    }
+
+    // M5 #46: 旧版 identity 响应缺 sub/role → 空 (ACL fail-closed 语义)。
+    #[tokio::test]
+    async fn real_verifier_missing_sub_defaults_empty() {
+        use axum::{routing::post, Json, Router};
+
+        let app = Router::new().route(
+            "/api/v1/auth/verify",
+            post(|Json(_): Json<serde_json::Value>| async move {
+                Json(serde_json::json!({
+                    "tid": "tenant-x",
+                    "tenant_status": "active",
+                    "revoked": false
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let v = RealVerifier::new(format!("http://{}", addr), "svc-tok".into());
+        let ctx = v.verify("jwt").await.unwrap();
+        assert!(ctx.sub.is_empty());
+        assert!(ctx.role.is_empty());
     }
 
     // #18: RealVerifier 对不存在的 identity endpoint fail-closed。

@@ -45,6 +45,10 @@ pub struct ServerConfig {
     pub identity_url: String,
     /// #18: fusion-identity service token (gate /verify + /usage)。多租户模式必配。
     pub identity_service_token: String,
+    /// M5 #46: per-memory ACL 开关。true → multi_tenant 模式下 owner 位生效
+    /// (commit 权威写 JWT sub, get/delete/list/retrieve/provenance 按 owner 过滤)。
+    /// 仅 multi_tenant=true 时生效; 单独开 ACL 而无 identity 源 → validate 报错 (fail-closed)。
+    pub acl: bool,
     /// #23: MLX embedding base url (TOML [embed].mlx_url 镜像, env FUSION_MLX_URL 仍优先)。
     pub embed_mlx_url: String,
     /// #23: 嵌入模型名 (TOML [embed].embed_model, env FUSION_MEMORY_EMBED_MODEL 优先)。
@@ -81,6 +85,8 @@ pub struct ConfigFile {
     pub identity_service_token: Option<String>,
     /// #18: 读此文件内容作 identity_service_token (推荐, 文件权限 0600)。
     pub identity_service_token_file: Option<String>,
+    /// M5 #46: per-memory ACL 开关 (TOML 镜像)。
+    pub acl: Option<bool>,
     /// #23: MLX embedding 配置段。
     pub embed: Option<EmbedFileConfig>,
 }
@@ -144,6 +150,7 @@ impl Default for ServerConfig {
             multi_tenant: false,
             identity_url: "http://127.0.0.1:11470".into(),
             identity_service_token: String::new(),
+            acl: false,
             embed_mlx_url: EmbedConfig::default().mlx_url,
             embed_model: EmbedConfig::default().embed_model,
             mlx_api_key: String::new(),
@@ -253,6 +260,9 @@ impl ServerConfig {
         if let Some(t) = &f.identity_service_token {
             self.identity_service_token = t.clone();
         }
+        if let Some(a) = f.acl {
+            self.acl = a;
+        }
         // secret_file 路径暂存到临时字段? 不 — ConfigFile 不持有运行态。
         // 改: 在 fill_secrets_from_files 时无法再拿到路径 (ServerConfig 无 path 字段)。
         // 故此处直接读 secret_file 填密钥 (文件字段优先级 < env, env 后续覆盖)。
@@ -356,6 +366,16 @@ impl ServerConfig {
         if let Ok(v) = std::env::var("FUSION_MEMORY_IDENTITY_SERVICE_TOKEN") {
             self.identity_service_token = v;
         }
+        if let Ok(v) = std::env::var("FUSION_MEMORY_ACL") {
+            match v.parse::<bool>() {
+                Ok(b) => self.acl = b,
+                Err(e) => warn!(
+                    raw = %v,
+                    error = %e,
+                    "FUSION_MEMORY_ACL bad value (expect true/false), fallback default"
+                ),
+            }
+        }
         // #23: embedding env 覆盖 (与 fm-embed from_env 同名 env, 优先级最高)。
         if let Ok(v) = std::env::var("FUSION_MLX_URL") {
             self.embed_mlx_url = v;
@@ -439,6 +459,13 @@ impl ServerConfig {
                 "http_port={} 开但 api_key 未配 (B5 拒启 HTTP)。配 FUSION_MEMORY_API_KEY 或 api_key_file, 或关 HTTP (http_port=0)",
                 self.http_port
             ));
+        }
+        // M5 #46: ACL 无身份源无意义 — fail-visible 拒启 (不开绕过网关的身份通道)。
+        if self.acl && !self.multi_tenant {
+            return Err(
+                "acl=true requires multi_tenant=true (ACL owner bits come from the fusion-identity JWT sub; no bypass identity channel)"
+                    .into(),
+            );
         }
         // #18: multi_tenant 模式须配 identity_service_token + HTTP 开 (identity 验只在 HTTP 边界)。
         if self.multi_tenant {

@@ -296,6 +296,14 @@ pub async fn run_import(engine: &MemoryEngine, source_db: &str) -> Result<Import
             },
             tombstone: false,
             entities_pending: false,
+            // M3 #44: the studio legacy db has no validity concept; import window-free.
+            valid_from: None,
+            valid_until: None,
+            // M6 #45: imported rows are direct commits, not consolidation products.
+            confidence: None,
+            sources: Vec::new(),
+            // M5 #46: imported rows are shared (no ACL owner) — legacy data has no user identity.
+            owner: None,
         };
         if let Err(e) = engine.persist().put_memory(&item) {
             warn!(id = %row.id, error = %e, "persist failed");
