@@ -168,4 +168,16 @@ pub trait FusionMemoryEngine: Send + Sync {
             "provenance not implemented for this engine".into(),
         ))
     }
+
+    /// M8 #49: content revision history for one memory (newest first).
+    /// Additive (v1.8.0, default Unsupported — same pattern as provenance).
+    async fn list_revisions(
+        &self,
+        _id: &str,
+        _tenant: &str,
+    ) -> MemoryResult<Vec<crate::browse::MemoryRevision>> {
+        Err(crate::error::MemoryError::Unsupported(
+            "list_revisions not implemented for this engine".into(),
+        ))
+    }
 }

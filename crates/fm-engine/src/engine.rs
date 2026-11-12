@@ -1699,6 +1699,24 @@ impl fm_core::FusionMemoryEngine for MemoryEngine {
             cited_by,
         })
     }
+
+    async fn list_revisions(
+        &self,
+        id: &str,
+        tenant: &str,
+    ) -> fm_core::MemoryResult<Vec<fm_core::MemoryRevision>> {
+        // 租户作用域: 主体不在本租户可见 → NotFound (与 get 同语义, 不泄露存在性)。
+        let vis = self
+            .get_memory_tenant(id, tenant)
+            .await
+            .map_err(|e| fm_core::MemoryError::Store(e.to_string()))?;
+        if vis.is_none() {
+            return Err(fm_core::MemoryError::NotFound(id.to_string()));
+        }
+        self.persist
+            .list_revisions(id, 200)
+            .map_err(|e| fm_core::MemoryError::Store(e.to_string()))
+    }
 }
 
 /// MemoryType → RPC string (used for list_memories filtering).

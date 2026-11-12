@@ -159,6 +159,18 @@ CREATE INDEX IF NOT EXISTS idx_memory_namespace ON memory_item(namespace, namesp
 // B-1 interaction: content is ciphertext (enc:v1:) when field cipher is active —
 // such rows are NOT indexed (backfill skips them, put paths skip them, fts_search
 // returns empty in cipher mode). No plaintext tokens on disk in encrypted deployments.
+// M8 #49: 内容修订历史 — put_memory 内容变化时把旧内容快照进此表 (audit_log 之外的版本层)。
+pub const MEMORY_REVISION_DDL: &str = "\
+CREATE TABLE IF NOT EXISTS memory_revision (\
+  rev INTEGER PRIMARY KEY AUTOINCREMENT,\
+  memory_id TEXT NOT NULL,\
+  content TEXT NOT NULL,\
+  reason TEXT NOT NULL DEFAULT '',\
+  at INTEGER NOT NULL\
+)";
+pub const INDEX_MEMORY_REVISION_MID: &str = "\
+CREATE INDEX IF NOT EXISTS idx_memory_revision_mid ON memory_revision(memory_id, rev)";
+
 pub const MEMORY_FTS_DDL: &str = "\
 CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(\
 content, mem_id UNINDEXED, tokenize='trigram'\
@@ -183,6 +195,8 @@ pub const ALL_DDL: &[&str] = &[
     INDEX_MEMORY_TENANT,
     INDEX_MEMORY_NAMESPACE,
     MEMORY_FTS_DDL,
+    MEMORY_REVISION_DDL,
+    INDEX_MEMORY_REVISION_MID,
 ];
 
 pub const ALL_PRAGMAS: &[&str] = &[PRAGMA_BUSY, PRAGMA_SYNC, PRAGMA_FK];
@@ -196,7 +210,7 @@ pub const ALL_PRAGMAS: &[&str] = &[PRAGMA_BUSY, PRAGMA_SYNC, PRAGMA_FK];
 //     旧库 ALTER TABLE 补列 DEFAULT '' + 补索引。
 // v5: #39 加 memory_fts FTS5 虚表 (trigram 关键词路); 旧库迁移时回填全部明文行
 //     (enc:v1: 密文行不索引 — 加密部署不走 FTS, 无明文 token 落盘)。
-pub const SCHEMA_VERSION: u32 = 8;
+pub const SCHEMA_VERSION: u32 = 9;
 
 /// §1.10: 读旧库 user_version。新库/空 PRAGMA 返 0。
 pub fn user_version(conn: &rusqlite::Connection) -> rusqlite::Result<u32> {
@@ -326,6 +340,10 @@ pub fn migrate(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
                 tracing::info!(col, "migrate: added trust column to memory_item (v7)");
             }
         }
+    }
+    // v8 → v9: #49 修订历史表 — ALL_DDL 内 CREATE TABLE IF NOT EXISTS 幂等建表, 无 ALTER。
+    if from < 9 {
+        tracing::info!("migrate: ensured memory_revision table (v9)");
     }
     // v7 → v8: #46 per-memory ACL — owner user id 列 (可空, 旧行 NULL = 共享/旧数据)。
     if from < 8 {

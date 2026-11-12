@@ -67,6 +67,18 @@ pub struct MergeEntry {
     pub reason: String,
 }
 
+/// M8 #49: one content-revision row (browse DTO). Snapshot of the prior
+/// content taken when put_memory observed an actual content change.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryRevision {
+    pub rev: u64,
+    pub memory_id: String,
+    pub content: String,
+    #[serde(default)]
+    pub reason: String,
+    pub at: u64,
+}
+
 /// M6 #45: provenance report for one memory item — its own lineage plus
 /// reverse citations. Powers the poisoning-governance provenance query.
 #[derive(Debug, Clone, Serialize, Deserialize)]
