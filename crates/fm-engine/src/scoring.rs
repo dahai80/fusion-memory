@@ -53,6 +53,40 @@ pub const THETA_PROMOTE: f64 = 0.3;
 pub const EPISODIC_RECALL_PROMOTE: u64 = 2;
 pub const EPISODIC_RECALL_WINDOW_SECS: u64 = 7 * 86400;
 
+/// v1.9.0 #53: 治理面板参数快照 — 检索/遗忘调优常量的只读视图 (Rule 5: 确定性,
+/// 无模型调用)。`config` RPC 与 /app Governance 页共用。
+pub fn governance_snapshot() -> serde_json::Value {
+    serde_json::json!({
+        "fusion": {
+            "description": "four-way hybrid retrieval weights (fuse_score4)",
+            "cosine": W4_COSINE,
+            "bm25": W4_BM25,
+            "graph": W4_GRAPH,
+            "freshness": W4_FRESHNESS,
+        },
+        "three_way_ablation_arm": {
+            "description": "legacy three-way fusion (ablation comparison arm)",
+            "alpha_cosine": ALPHA,
+            "beta_decay": BETA,
+            "gamma_graph": GAMMA,
+        },
+        "validity": {
+            "description": "M3 validity-window stacking (defense line 3)",
+            "expired_factor": VALIDITY_EXPIRED_FACTOR,
+        },
+        "forgetting": {
+            "description": "forgetting-curve consolidation thresholds",
+            "theta_drop": THETA_DROP,
+            "theta_promote": THETA_PROMOTE,
+            "episodic_recall_promote": EPISODIC_RECALL_PROMOTE,
+            "episodic_recall_window_secs": EPISODIC_RECALL_WINDOW_SECS,
+        },
+        "graph": {
+            "hop_limit": GRAPH_HOP_LIMIT,
+        },
+    })
+}
+
 /// 纯函数融合评分 (无 DB)。query_entities/candidate_entities 的 id 用于 graph_affinity,
 /// graph_affinity 由 caller 预算传入 (避免本函数依赖 Persist)。
 pub fn fuse_score(cosine: f64, w_t: f64, graph_aff: f64) -> f64 {

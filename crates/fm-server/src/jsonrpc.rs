@@ -203,6 +203,8 @@ pub async fn dispatch(
         "export" => export(params, engine, tenant, acl).await,
         // M7 #48: procedural memory -> SKILL.md export (agent-studio / fusion-harness).
         "export_skills" => export_skills(params, engine, tenant, acl).await,
+        // v1.9.0 #53: governance panel — read-only scoring/forgetting parameter snapshot.
+        "config" => Ok(fm_engine::scoring::governance_snapshot()),
         "health" => Ok(Value::String("ok".into())),
         // P2-4: version 方法 — 返当前 api_version 供客户端协商。
         "version" => Ok(serde_json::json!({"api_version": API_VERSION})),

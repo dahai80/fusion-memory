@@ -42,7 +42,6 @@ pub fn spawn_cluster(
     data_dir: &Path,
     set: &mut JoinSet<Result<(), String>>,
 ) {
-    info!(role = %role, "cluster role detected");
     // v1.0.0 B-2: 选举配置 (集群 ≥2 节点)。存在 → 起各节点 vote listener (leader + follower 都监听)。
     let election_cfg = match ElectionConfig::from_env() {
         Ok(Some(c)) => {
@@ -59,6 +58,19 @@ pub fn spawn_cluster(
             None
         }
     };
+    spawn_cluster_with(engine, role, data_dir, set, election_cfg)
+}
+
+/// v1.9.0 #51: DI 变体 — 选举配置显式注入 (同进程多节点测试各自 self_id, 免全局 env 冲突)。
+/// 生产路径 spawn_cluster 从 env 读; 语义与本函数完全一致。
+pub fn spawn_cluster_with(
+    engine: Arc<MemoryEngine>,
+    role: NodeRole,
+    data_dir: &Path,
+    set: &mut JoinSet<Result<(), String>>,
+    election_cfg: Option<ElectionConfig>,
+) {
+    info!(role = %role, "cluster role detected");
     match role {
         NodeRole::Leader => {
             let cfg = ClusterConfig::with_home(data_dir);
@@ -167,6 +179,12 @@ async fn follower_orbit(
                     return Err(format!("follower run permanent error: {e}"));
                 }
                 warn!(error = %e, "leader down, initiating election campaign");
+                // v1.9.0 #51: 按 self_id 确定性错峰 (防同 term 锁步自投互拒 split-vote
+                // livelock — 实测两个 follower 每轮同 term 互 deny 无限循环)。
+                tokio::time::sleep(tokio::time::Duration::from_millis(
+                    election.cfg().self_id as u64 * 250,
+                ))
+                .await;
                 let won = election
                     .campaign(seq_provider.clone())
                     .await
