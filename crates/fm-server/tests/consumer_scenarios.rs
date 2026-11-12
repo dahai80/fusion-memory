@@ -41,6 +41,7 @@ fn stub_state() -> HttpState {
         gateway_origin_required: false,
         default_tenant: Arc::new(String::new()),
         multi_tenant: false,
+        acl: false,
         verifier: fm_server::identity::noop_verifier(),
         concrete: None,
     }

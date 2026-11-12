@@ -13,7 +13,7 @@ pub mod namespace;
 pub mod report;
 pub mod trait_def;
 
-pub use browse::{AuditEntry, ListQuery, MergeEntry};
+pub use browse::{AuditEntry, ListQuery, MergeEntry, ProvenanceReport};
 pub use context::{ContextBlock, FormattedContext, RetrieveQuery};
 pub use entity::{EntityNode, EntityType};
 pub use error::{MemoryError, MemoryResult};

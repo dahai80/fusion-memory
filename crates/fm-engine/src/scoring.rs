@@ -21,6 +21,30 @@ pub const W4_FRESHNESS: f64 = 0.1;
 
 pub const GRAPH_HOP_LIMIT: usize = 2;
 
+/// M3 #44: 过期记忆降权系数 (乘法叠加, 防线 3 — 只降不删)。
+/// 有效期窗口与遗忘曲线相乘: score = fuse_score4 × validity。
+/// 过期 ≠ tombstone — tombstone 仍只给显式删除; 过期项仍可被词法强匹配拉回。
+pub const VALIDITY_EXPIRED_FACTOR: f64 = 0.1;
+
+/// M3 #44: 事实有效期窗口因子 [0,1]。
+/// - 无窗口 (valid_from/valid_until 均 None) → 1.0 (旧行为, 消融基线不受影响)
+/// - 未生效 (now < valid_from) → 0.0 (未来事实不应浮出)
+/// - 已过期 (now > valid_until) → VALIDITY_EXPIRED_FACTOR (降权不删除)
+/// - 窗口内 → 1.0
+pub fn validity_of(item: &MemoryItem, now: u64) -> f64 {
+    if let Some(vf) = item.valid_from {
+        if now < vf {
+            return 0.0;
+        }
+    }
+    if let Some(vu) = item.valid_until {
+        if now > vu {
+            return VALIDITY_EXPIRED_FACTOR;
+        }
+    }
+    1.0
+}
+
 /// θ_drop: W(t) < 此值 → consolidate 回收 (tombstone)。
 pub const THETA_DROP: f64 = 0.05;
 /// θ_promote: Short→Long 晋升阈值 (Episodic W(t) 超此值可晋升)。
@@ -133,10 +157,12 @@ pub fn score_candidate4(
     } else {
         fm_graph::graph_affinity(store, query_entity_ids, &cand_ids, GRAPH_HOP_LIMIT)?
     };
-    let score = fuse_score4(cosine, bm25, graph_aff, freshness);
+    // M3 #44: 有效期窗口乘法叠加 (fuse_score4 已含加性 freshness 臂, validity 是独立乘性层)。
+    let validity = validity_of(item, now);
+    let score = fuse_score4(cosine, bm25, graph_aff, freshness) * validity;
     debug!(
         cosine,
-        bm25, graph_aff, freshness, score, "candidate scored (four-way)"
+        bm25, graph_aff, freshness, validity, score, "candidate scored (four-way)"
     );
     Ok(score)
 }
@@ -230,6 +256,53 @@ mod tests {
         let m1 = normalize_bm25(&[("x".to_string(), -3.0)]);
         assert!((m1["x"] - 1.0).abs() < 1e-9, "单命中 → 1.0");
         assert!(normalize_bm25(&[]).is_empty(), "空输入 → 空 map");
+    }
+
+    #[test]
+    fn validity_of_window_semantics() {
+        // M3 #44: 无窗口 → 1.0
+        let item = mk_item(1.0, 0, 0, 0, MemoryType::Episodic);
+        assert!(
+            (validity_of(&item, 5_000) - 1.0).abs() < 1e-9,
+            "no window → 1.0"
+        );
+        // 未生效: now < valid_from → 0.0
+        let fut = item.clone().with_validity(Some(9_000), None);
+        assert!(
+            (validity_of(&fut, 5_000) - 0.0).abs() < 1e-9,
+            "not yet valid → 0.0"
+        );
+        assert!(
+            (validity_of(&fut, 9_000) - 1.0).abs() < 1e-9,
+            "at valid_from → 1.0"
+        );
+        // 已过期: now > valid_until → 降权 0.1 (不删除)
+        let exp = item.clone().with_validity(None, Some(1_000));
+        assert!(
+            (validity_of(&exp, 5_000) - VALIDITY_EXPIRED_FACTOR).abs() < 1e-9,
+            "expired → 0.1"
+        );
+        // 窗口内 → 1.0
+        let inwin = item.with_validity(Some(1_000), Some(9_000));
+        assert!(
+            (validity_of(&inwin, 5_000) - 1.0).abs() < 1e-9,
+            "in window → 1.0"
+        );
+    }
+
+    #[test]
+    fn score_candidate4_multiplies_validity() {
+        // 消融: 同候选, 有过期窗口 → 分数 = 无窗口 × 0.1 (乘法叠加, 防线 3)
+        let dir = tempfile::tempdir().unwrap();
+        let persist = Persist::open(dir.path().join("m.db")).unwrap();
+        let base = mk_item(1.0, 0, 0, 0, MemoryType::Episodic);
+        let expired = base.clone().with_validity(None, Some(1));
+        let s_open = score_candidate4(&persist, 0.8, 0.0, &base, &[], 100_000).unwrap();
+        let s_exp = score_candidate4(&persist, 0.8, 0.0, &expired, &[], 100_000).unwrap();
+        assert!(
+            (s_exp - s_open * VALIDITY_EXPIRED_FACTOR).abs() < 1e-9,
+            "expired score = open × factor"
+        );
     }
 
     #[test]

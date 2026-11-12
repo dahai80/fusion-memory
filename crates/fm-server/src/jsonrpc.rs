@@ -126,7 +126,31 @@ pub const API_VERSION: u32 = 1;
 /// §3.8: dispatch 取 owned RpcRequest, 各 handler 取 owned params, 消除 `req.params.clone()` 深克隆。
 /// 旧版 8 handler 全 `serde_json::from_value(req.params.clone())` — 已反序列化的 params 再深克隆整树再解析。
 /// id 仍 clone 进响应 (Value 多为小整数/字符串, 克隆廉价, 响应需保留 id 不可避免)。
-pub async fn dispatch(req: RpcRequest, engine: &EngineHandle, tenant: &str) -> RpcResponse {
+/// M5 #46: per-memory ACL 调用方身份 (multi_tenant+ACL 模式下由 HTTP 边界从 JWT 构造)。
+/// UDS (本机可信) / 单租户 / ACL 关 → None = 不启用 owner 过滤 (旧行为)。
+#[derive(Debug, Clone)]
+pub struct AclUser {
+    /// fusion-identity JWT sub (owner 位比对值)。
+    pub sub: String,
+    /// role == "admin" → 绕过 owner 检查。
+    pub admin: bool,
+}
+
+/// M5 #46: owner 检查。deny 当且仅当调用方带 ACL 身份且记忆有 owner 且不匹配且非 admin。
+/// owner None = 共享记忆 (所有人可见); 调用方 sub 空 (旧版 identity 无 sub claim) = fail-closed 全拒。
+fn acl_denies(acl: Option<&AclUser>, owner: &Option<String>) -> bool {
+    match (acl, owner) {
+        (Some(u), Some(o)) => !u.admin && u.sub != *o,
+        _ => false,
+    }
+}
+
+pub async fn dispatch(
+    req: RpcRequest,
+    engine: &EngineHandle,
+    tenant: &str,
+    acl: Option<&AclUser>,
+) -> RpcResponse {
     // P2-4: jsonrpc 版本校验。非 "2.0" → -32600 invalid_request (spec), 旧版静默吞 (字段 _ 丢弃)。
     if req.jsonrpc != "2.0" {
         warn!(jsonrpc = %req.jsonrpc, "rpc rejected: jsonrpc field not 2.0");
@@ -155,23 +179,25 @@ pub async fn dispatch(req: RpcRequest, engine: &EngineHandle, tenant: &str) -> R
     };
     debug!(method = %method, "rpc dispatch");
     let res: Result<Value, RpcError> = match method.as_str() {
-        "commit" => commit(params, engine, tenant).await,
-        "retrieve" => retrieve(params, engine, tenant).await,
+        "commit" => commit(params, engine, tenant, acl).await,
+        "retrieve" => retrieve(params, engine, tenant, acl).await,
         // issue #1/#4: fusion-event 契约别名 (text-in, fused shape out)。
-        "memory.retrieve_context" => retrieve_context_contract(params, engine, tenant).await,
+        "memory.retrieve_context" => retrieve_context_contract(params, engine, tenant, acl).await,
         "consolidate" => consolidate(params, engine).await,
-        "get" => get(params, engine, tenant).await,
-        "delete" => delete(params, engine, tenant).await,
+        "get" => get(params, engine, tenant, acl).await,
+        "delete" => delete(params, engine, tenant, acl).await,
         // issue #2: fusion-agent-studio adapter 契约 (scope 批量删 + 计数)。
         "delete_scope" => delete_scope(params, engine, tenant).await,
         "count" => count(params, engine, tenant).await,
         "audit" => audit(params, engine).await,
         // #33 web surface: browse/manage methods (shared by the web UI /app and scripts).
-        "list" => list(params, engine, tenant).await,
+        "list" => list(params, engine, tenant, acl).await,
         "audit_log" => audit_log(params, engine).await,
         "merges" => merges(engine).await,
         "unmerge" => unmerge(params, engine).await,
         "reconcile" => reconcile(params, engine).await,
+        // M6 #45: poisoning-governance provenance query (lineage + reverse citations).
+        "provenance" => provenance(params, engine, tenant, acl).await,
         "health" => Ok(Value::String("ok".into())),
         // P2-4: version 方法 — 返当前 api_version 供客户端协商。
         "version" => Ok(serde_json::json!({"api_version": API_VERSION})),
@@ -251,7 +277,12 @@ struct CommitParams {
     namespace_key: Option<String>,
 }
 
-async fn commit(params: Value, engine: &EngineHandle, tenant: &str) -> Result<Value, RpcError> {
+async fn commit(
+    params: Value,
+    engine: &EngineHandle,
+    tenant: &str,
+    acl: Option<&AclUser>,
+) -> Result<Value, RpcError> {
     let mut p: CommitParams =
         serde_json::from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
     // #16: 权威租户取自请求 (gateway X-Fusion-Tenant), 覆盖 interaction 内任何客户端租户值。
@@ -267,6 +298,10 @@ async fn commit(params: Value, engine: &EngineHandle, tenant: &str) -> Result<Va
     validate_namespace(&p.interaction.namespace)?;
     if let Some(key) = p.namespace_key {
         p.interaction.namespace_key = key;
+    }
+    // M5 #46: owner 权威来源 = 服务端 JWT sub (同 tenant 模式 — 客户端自报值覆盖丢弃)。
+    if let Some(u) = acl {
+        p.interaction.owner = Some(u.sub.clone());
     }
     // P1-1: 返回详细结果 (memory_ids + failed_turns), 客户端可感知失败 turn 并重试。
     // 旧契约 result: ["id1","id2"] (纯数组) → 改 result: {"memory_ids":[...],"failed_turns":[...]}。
@@ -307,7 +342,12 @@ fn default_true() -> bool {
     true
 }
 
-async fn retrieve(params: Value, engine: &EngineHandle, tenant: &str) -> Result<Value, RpcError> {
+async fn retrieve(
+    params: Value,
+    engine: &EngineHandle,
+    tenant: &str,
+    acl: Option<&AclUser>,
+) -> Result<Value, RpcError> {
     let p: RetrieveParams =
         serde_json::from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
     let namespace = p.namespace.unwrap_or_default();
@@ -324,10 +364,12 @@ async fn retrieve(params: Value, engine: &EngineHandle, tenant: &str) -> Result<
         token_budget: p.token_budget,
         aggregate: p.aggregate,
     };
-    let ctx: FormattedContext = engine
+    let mut ctx: FormattedContext = engine
         .retrieve_context(&q)
         .await
         .map_err(|e| RpcError::from_engine(&e))?;
+    // M5 #46: 检索边界过滤 — 调用方不可见的 owner 块整体剔除 (post-filter, 引擎不感知身份)。
+    ctx.blocks.retain(|b| !acl_denies(acl, &b.owner));
     serde_json::to_value(ctx).map_err(|e| RpcError::internal(e.to_string()))
 }
 
@@ -369,7 +411,12 @@ struct GetParams {
     id: String,
 }
 
-async fn get(params: Value, engine: &EngineHandle, tenant: &str) -> Result<Value, RpcError> {
+async fn get(
+    params: Value,
+    engine: &EngineHandle,
+    tenant: &str,
+    acl: Option<&AclUser>,
+) -> Result<Value, RpcError> {
     let p: GetParams =
         serde_json::from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
     // #16: 按 tenant 取, 跨租户 → None。
@@ -377,6 +424,12 @@ async fn get(params: Value, engine: &EngineHandle, tenant: &str) -> Result<Value
         .get_memory_tenant(&p.id, tenant)
         .await
         .map_err(|e| RpcError::from_engine(&e))?;
+    // M5 #46: owner 不匹配 → NotFound (不泄露存在性, fail-closed)。
+    if let Some(item) = &m {
+        if acl_denies(acl, &item.owner) {
+            return Err(RpcError::not_found(&p.id));
+        }
+    }
     serde_json::to_value(m).map_err(|e| RpcError::internal(e.to_string()))
 }
 
@@ -388,13 +441,28 @@ struct DeleteParams {
     confirm: bool,
 }
 
-async fn delete(params: Value, engine: &EngineHandle, tenant: &str) -> Result<Value, RpcError> {
+async fn delete(
+    params: Value,
+    engine: &EngineHandle,
+    tenant: &str,
+    acl: Option<&AclUser>,
+) -> Result<Value, RpcError> {
     let p: DeleteParams =
         serde_json::from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
     if !p.confirm {
         return Err(RpcError::invalid_params(
             "delete requires confirm=true (B5 二次确认)",
         ));
+    }
+    // M5 #46: owner 不匹配 → NotFound, 不落删除 (先读后删, fail-closed)。
+    let existing: Option<MemoryItem> = engine
+        .get_memory_tenant(&p.id, tenant)
+        .await
+        .map_err(|e| RpcError::from_engine(&e))?;
+    if let Some(item) = &existing {
+        if acl_denies(acl, &item.owner) {
+            return Err(RpcError::not_found(&p.id));
+        }
     }
     // #16: 按 tenant 删, 跨租户 → NotFound。
     engine
@@ -493,7 +561,12 @@ fn default_list_limit() -> usize {
     50
 }
 
-async fn list(params: Value, engine: &EngineHandle, tenant: &str) -> Result<Value, RpcError> {
+async fn list(
+    params: Value,
+    engine: &EngineHandle,
+    tenant: &str,
+    acl: Option<&AclUser>,
+) -> Result<Value, RpcError> {
     let p: ListParams =
         serde_json::from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
     if p.limit == 0 || p.limit > 200 {
@@ -515,10 +588,12 @@ async fn list(params: Value, engine: &EngineHandle, tenant: &str) -> Result<Valu
         namespace_key: p.namespace_key,
         include_tombstoned: p.include_tombstoned,
     };
-    let items = engine
+    let mut items = engine
         .list_memories(&q, tenant)
         .await
         .map_err(|e| RpcError::from_engine(&e))?;
+    // M5 #46: 浏览边界同 owner 过滤 (可见条目少于 limit — 页内过滤语义, v1 接受)。
+    items.retain(|m| !acl_denies(acl, &m.owner));
     serde_json::to_value(items).map_err(|e| RpcError::internal(e.to_string()))
 }
 
@@ -602,6 +677,42 @@ async fn reconcile(params: Value, engine: &EngineHandle) -> Result<Value, RpcErr
         .map_err(|e| RpcError::internal(e.to_string()))
 }
 
+/// M6 #45: provenance params — one memory id; returns lineage + reverse citations.
+#[derive(Debug, Deserialize)]
+struct ProvenanceParams {
+    id: String,
+}
+
+async fn provenance(
+    params: Value,
+    engine: &EngineHandle,
+    tenant: &str,
+    acl: Option<&AclUser>,
+) -> Result<Value, RpcError> {
+    let p: ProvenanceParams =
+        serde_json::from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+    if p.id.trim().is_empty() {
+        return Err(RpcError::invalid_params(
+            "provenance requires a non-empty id",
+        ));
+    }
+    // M5 #46: 主体记忆 owner 不匹配 → NotFound (溯源不泄露他人记忆)。
+    let subject: Option<MemoryItem> = engine
+        .get_memory_tenant(&p.id, tenant)
+        .await
+        .map_err(|e| RpcError::from_engine(&e))?;
+    if let Some(item) = &subject {
+        if acl_denies(acl, &item.owner) {
+            return Err(RpcError::not_found(&p.id));
+        }
+    }
+    let rep = engine
+        .provenance(&p.id, tenant)
+        .await
+        .map_err(|e| RpcError::from_engine(&e))?;
+    serde_json::to_value(rep).map_err(|e| RpcError::internal(e.to_string()))
+}
+
 /// memory.retrieve_context params (issue #1/#4, fusion-event 冻结契约)。
 /// query 为文本串 (target_path|event_type), memory 内部 embed; trigger_id/node_id 仅透传留痕,
 /// 不影响检索结果 (node_id 多节点集群留待 M6+ 扩展, 当前本地全检索)。
@@ -627,6 +738,7 @@ async fn retrieve_context_contract(
     params: Value,
     engine: &EngineHandle,
     tenant: &str,
+    acl: Option<&AclUser>,
 ) -> Result<Value, RpcError> {
     let p: RetrieveContextContractParams =
         serde_json::from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
@@ -645,10 +757,12 @@ async fn retrieve_context_contract(
         token_budget: default_budget(),
         aggregate: true,
     };
-    let ctx: FormattedContext = engine
+    let mut ctx: FormattedContext = engine
         .retrieve_context(&q)
         .await
         .map_err(|e| RpcError::from_engine(&e))?;
+    // M5 #46: 同 retrieve — owner 不可见块剔除后再拼契约结果。
+    ctx.blocks.retain(|b| !acl_denies(acl, &b.owner));
     let context = ctx
         .blocks
         .iter()
@@ -918,13 +1032,13 @@ mod tests {
     }
 
     async fn dispatch_ok(req: &RpcRequest, eng: &EngineHandle) -> Value {
-        let resp = dispatch(req.clone(), eng, "").await;
+        let resp = dispatch(req.clone(), eng, "", None).await;
         assert!(resp.error.is_none(), "unexpected error: {:?}", resp.error);
         resp.result.expect("missing result")
     }
 
     async fn dispatch_err(req: &RpcRequest, eng: &EngineHandle) -> RpcError {
-        let resp = dispatch(req.clone(), eng, "").await;
+        let resp = dispatch(req.clone(), eng, "", None).await;
         resp.error.expect("expected error, got result")
     }
 
@@ -1288,6 +1402,7 @@ mod tests {
             rpc_with_version("1.0", "health", serde_json::json!({}), 1),
             &eng,
             "",
+            None,
         )
         .await;
         let err = resp.error.expect("non-2.0 应被拒");
@@ -1303,6 +1418,7 @@ mod tests {
             rpc_with_version("2.0", "v1.health", serde_json::json!({}), 2),
             &eng,
             "",
+            None,
         )
         .await;
         assert!(resp.error.is_none(), "v1. 前缀应路由成功");
@@ -1400,6 +1516,7 @@ mod tests {
                     memory_type: MemoryType::Episodic,
                     turns_text: txt.into(),
                     score: 0.0,
+                    owner: None,
                     source_entities: vec![],
                 };
                 Ok(FormattedContext {

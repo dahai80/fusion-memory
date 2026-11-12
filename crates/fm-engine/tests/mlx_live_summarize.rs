@@ -69,6 +69,7 @@ fn episodic_interaction(sess: &str, n: u32) -> Interaction {
         namespace_key: String::new(),
         turns: t,
         timestamp: 1000,
+        owner: None,
         metadata: serde_json::json!({}),
     }
 }

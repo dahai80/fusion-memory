@@ -7,13 +7,14 @@ import {
     FileClock,
     GitMerge,
     KeyRound,
+    Link2,
     LogIn,
     RefreshCw,
     RotateCcw,
     Upload,
 } from "lucide-react";
 import { api, ApiError, getApiKey, setApiKey } from "./api";
-import type { AuditEntryDto, ImportReportDto, MemoryItemDto, MergeEntryDto } from "./api";
+import type { AuditEntryDto, ImportReportDto, MemoryItemDto, MergeEntryDto, ProvenanceDto } from "./api";
 import { Badge, Button, Card, Input, Select, Tabs, Td, Th } from "./ui";
 
 function fmtTs(ms: number): string {
@@ -410,6 +411,84 @@ function ImportTab() {
     );
 }
 
+function ProvenanceTab() {
+    const [id, setId] = useState("");
+    const [rep, setRep] = useState<ProvenanceDto | null>(null);
+    const [err, setErr] = useState("");
+    const [busy, setBusy] = useState(false);
+    return (
+        <div className="max-w-2xl space-y-4">
+            <Card className="p-5">
+                <h2 className="mb-2 flex items-center gap-2 text-sm font-semibold text-zinc-200">
+                    <Link2 className="h-4 w-4 text-indigo-400" /> Provenance query
+                </h2>
+                <p className="mb-4 text-sm text-zinc-400">
+                    Lineage of one memory: consolidation sources (episodes / merged-away ids),
+                    confidence, and reverse citations. Poisoning-governance surface (M6).
+                </p>
+                <div className="flex flex-wrap items-center gap-2">
+                    <Input value={id} onChange={setId} placeholder="memory id" className="flex-1" />
+                    <Button
+                        disabled={busy || id.trim() === ""}
+                        onClick={async () => {
+                            setBusy(true);
+                            setErr("");
+                            setRep(null);
+                            const r = await withErr(() => api.provenance(id.trim()), setErr);
+                            setBusy(false);
+                            if (r) setRep(r);
+                        }}
+                    >
+                        <Link2 className="h-4 w-4" /> Trace
+                    </Button>
+                </div>
+                {err && <p className="mt-3 text-sm text-red-400">{err}</p>}
+                {rep && (
+                    <div className="mt-4 space-y-3 text-sm">
+                        <div className="flex flex-wrap items-center gap-2">
+                            <Badge tone="indigo">{rep.id}</Badge>
+                            {rep.confidence !== null && (
+                                <Badge tone={rep.confidence >= 0.75 ? "emerald" : "amber"}>
+                                    confidence {rep.confidence.toFixed(2)}
+                                </Badge>
+                            )}
+                            {rep.confidence === null && <Badge tone="zinc">direct commit</Badge>}
+                        </div>
+                        <div>
+                            <p className="mb-1 text-xs font-medium uppercase tracking-wide text-zinc-500">
+                                sources ({rep.sources.length})
+                            </p>
+                            {rep.sources.length === 0 ? (
+                                <p className="text-zinc-500">none</p>
+                            ) : (
+                                <ul className="space-y-1 font-mono text-xs text-zinc-300">
+                                    {rep.sources.map((x) => (
+                                        <li key={x}>{x}</li>
+                                    ))}
+                                </ul>
+                            )}
+                        </div>
+                        <div>
+                            <p className="mb-1 text-xs font-medium uppercase tracking-wide text-zinc-500">
+                                cited by ({rep.cited_by.length})
+                            </p>
+                            {rep.cited_by.length === 0 ? (
+                                <p className="text-zinc-500">none</p>
+                            ) : (
+                                <ul className="space-y-1 font-mono text-xs text-zinc-300">
+                                    {rep.cited_by.map((x) => (
+                                        <li key={x}>{x}</li>
+                                    ))}
+                                </ul>
+                            )}
+                        </div>
+                    </div>
+                )}
+            </Card>
+        </div>
+    );
+}
+
 export default function App() {
     const [authed, setAuthed] = useState(!!getApiKey());
     const [tab, setTab] = useState("entries");
@@ -439,6 +518,7 @@ export default function App() {
                             { id: "entries", label: "Entries", icon: <Database className="h-4 w-4" /> },
                             { id: "audit", label: "Audit log", icon: <FileClock className="h-4 w-4" /> },
                             { id: "merges", label: "Merges", icon: <GitMerge className="h-4 w-4" /> },
+                            { id: "provenance", label: "Provenance", icon: <Link2 className="h-4 w-4" /> },
                             { id: "import", label: "Import", icon: <Upload className="h-4 w-4" /> },
                         ]}
                     />
@@ -455,6 +535,7 @@ export default function App() {
                 {tab === "entries" && <EntriesTab />}
                 {tab === "audit" && <AuditTab />}
                 {tab === "merges" && <MergesTab />}
+                {tab === "provenance" && <ProvenanceTab />}
                 {tab === "import" && <ImportTab />}
             </div>
         </div>

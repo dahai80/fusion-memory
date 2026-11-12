@@ -19,6 +19,10 @@ pub struct Interaction {
     pub namespace_key: String,
     pub turns: Vec<Turn>,
     pub timestamp: u64,
+    /// M5 #46 per-memory ACL: owner user id。多租户+ACL 模式下由 fm-server 用 JWT sub
+    /// 权威覆盖 (客户端自报值不可信); 其余模式恒 None。serde default 保旧 JSON 兼容。
+    #[serde(default)]
+    pub owner: Option<String>,
     /// 消费方附加元数据，schema 约束见 InteractionMetadata（PRD §5.4.1）。
     pub metadata: serde_json::Value,
 }
@@ -98,6 +102,7 @@ mod tests {
             namespace_key: String::new(),
             turns: vec![],
             timestamp: 0,
+            owner: None,
             metadata: serde_json::json!({"project_path": "/p"}),
         };
         assert_eq!(ix.metadata_typed().project_path.as_deref(), Some("/p"));

@@ -25,15 +25,20 @@ CREATE TABLE IF NOT EXISTS memory_item (\
   entities_pending INTEGER NOT NULL DEFAULT 1,\
   entities_json TEXT NOT NULL DEFAULT '[]',\
   namespace TEXT NOT NULL DEFAULT '',\
-  namespace_key TEXT NOT NULL DEFAULT ''\
+  namespace_key TEXT NOT NULL DEFAULT '',\
+  valid_from INTEGER,\
+  valid_until INTEGER,\
+  confidence REAL,\
+  sources_json TEXT NOT NULL DEFAULT '[]',\
+  owner TEXT\
 )";
 
 pub const MEMORY_ITEM_DDL_INSERT: &str = "\
 INSERT OR REPLACE INTO memory_item(\
   id,interaction_id,turn_idx,session_id,tenant,memory_type,tier,content,vector_ref,weight,\
   access_count,last_accessed_timestamp,created_timestamp,provenance,tombstone,entities_pending,entities_json,\
-  namespace,namespace_key\
-) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)";
+  namespace,namespace_key,valid_from,valid_until,confidence,sources_json,owner\
+) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24)";
 
 pub const MEMORY_ITEM_DDL_SELECT_BY_ID: &str = "SELECT * FROM memory_item WHERE id=?1";
 
@@ -191,7 +196,7 @@ pub const ALL_PRAGMAS: &[&str] = &[PRAGMA_BUSY, PRAGMA_SYNC, PRAGMA_FK];
 //     旧库 ALTER TABLE 补列 DEFAULT '' + 补索引。
 // v5: #39 加 memory_fts FTS5 虚表 (trigram 关键词路); 旧库迁移时回填全部明文行
 //     (enc:v1: 密文行不索引 — 加密部署不走 FTS, 无明文 token 落盘)。
-pub const SCHEMA_VERSION: u32 = 5;
+pub const SCHEMA_VERSION: u32 = 8;
 
 /// §1.10: 读旧库 user_version。新库/空 PRAGMA 返 0。
 pub fn user_version(conn: &rusqlite::Connection) -> rusqlite::Result<u32> {
@@ -271,6 +276,68 @@ pub fn migrate(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
             [],
         )?;
         tracing::info!(rows = n, "migrate: backfilled memory_fts (v5)");
+    }
+    // v5 → v6: #44 加事实有效期窗口列 (可空, 旧行 NULL = 无窗口)。
+    if from < 6 {
+        for (col, ddl) in [
+            (
+                "valid_from",
+                "ALTER TABLE memory_item ADD COLUMN valid_from INTEGER",
+            ),
+            (
+                "valid_until",
+                "ALTER TABLE memory_item ADD COLUMN valid_until INTEGER",
+            ),
+        ] {
+            let has: i64 = conn.query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM pragma_table_info('memory_item') WHERE name='{col}'"
+                ),
+                [],
+                |r| r.get(0),
+            )?;
+            if has == 0 {
+                conn.execute_batch(ddl)?;
+                tracing::info!(col, "migrate: added validity column to memory_item (v6)");
+            }
+        }
+    }
+    // v6 → v7: #45 加信任链列 — 巩固产物 confidence + 溯源 sources_json。
+    if from < 7 {
+        for (col, ddl) in [
+            (
+                "confidence",
+                "ALTER TABLE memory_item ADD COLUMN confidence REAL",
+            ),
+            (
+                "sources_json",
+                "ALTER TABLE memory_item ADD COLUMN sources_json TEXT NOT NULL DEFAULT '[]'",
+            ),
+        ] {
+            let has: i64 = conn.query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM pragma_table_info('memory_item') WHERE name='{col}'"
+                ),
+                [],
+                |r| r.get(0),
+            )?;
+            if has == 0 {
+                conn.execute_batch(ddl)?;
+                tracing::info!(col, "migrate: added trust column to memory_item (v7)");
+            }
+        }
+    }
+    // v7 → v8: #46 per-memory ACL — owner user id 列 (可空, 旧行 NULL = 共享/旧数据)。
+    if from < 8 {
+        let has: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('memory_item') WHERE name='owner'",
+            [],
+            |r| r.get(0),
+        )?;
+        if has == 0 {
+            conn.execute_batch("ALTER TABLE memory_item ADD COLUMN owner TEXT")?;
+            tracing::info!("migrate: added owner column to memory_item (v8)");
+        }
     }
     set_user_version(conn, SCHEMA_VERSION)?;
     tracing::info!(from = from, to = SCHEMA_VERSION, "schema migrated");

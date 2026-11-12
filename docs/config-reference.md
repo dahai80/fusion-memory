@@ -41,6 +41,7 @@ source_of_truth:
 | `FUSION_MEMORY_IDENTITY_SERVICE_TOKEN` / `_FILE` | 空 | 校验调用用 service token |
 | `FUSION_MEMORY_GATEWAY_ORIGIN_REQUIRED` | `false` | 要求 `X-Fusion-Route` 网关头 |
 | `FUSION_MEMORY_DEFAULT_TENANT` | 空 | 调用方未带租户时的默认值 |
+| `FUSION_MEMORY_ACL` | `false` | M5 #46 per-memory ACL（仅 `multi_tenant=true` 时生效；owner 位取 JWT `sub`，commit 权威覆盖，get/delete/list/retrieve/provenance 按 owner 过滤，admin 角色旁路；单开 ACL 无 identity 源 → 拒启） |
 
 ## 嵌入（fm-embed，env 与 `[embed]` TOML 同源，env 胜出）
 
@@ -62,6 +63,8 @@ source_of_truth:
 | `FUSION_MEMORY_ENC_KEY_FILE` | unset | AES-256-GCM key 文件（0600，32B raw） |
 | `FUSION_MEMORY_ENC_PASSPHRASE` | unset | argon2id KDF passphrase（二选一 key 源） |
 | `FUSION_MEMORY_WOP_RETENTION` | 不裁剪 | 写操作日志保留上限（调用方侧裁剪） |
+| `FUSION_MEMORY_INJECTION_URL` | unset | M6 #45 注入检测 fusion-security 委托端点（仅 127.0.0.1/localhost loopback，否则拒启）；未设 = 仅本地规则层 |
+| `FUSION_MEMORY_INJECTION_TOKEN` | unset | 注入扫描 Bearer token（可选） |
 
 ## Dreaming 调度（fm-server，issue #40；默认关）
 

@@ -790,3 +790,109 @@ fn full_scale_run() {
         "full scale floor broken"
     );
 }
+
+// ---- M3 #44: 有效期窗口消融 ----
+
+/// 过期干扰项 + 无窗口相关项同词竞争。无有效期层时: 干扰项更新鲜 (created 更近)
+/// 且词法同分 → 排在相关项之上。乘 validity 后: 过期项 ×0.1 → 相关项反超。
+/// 同时验证 never-below: 无窗口候选两臂同分 (validity=1.0 恒等)。
+#[test]
+fn validity_window_ablation_never_below() {
+    let persist = Persist::open_in_memory().expect("open persist");
+    let topics = 40usize;
+    let mut items: Vec<(String, MemoryItem)> = Vec::new();
+
+    for t in 0..topics {
+        let kw = format!("zxkw{t:03}");
+        let content = format!("codename {kw} referenced in field log");
+
+        // 相关项: 无窗口, 30 天前
+        let mut rel = mk_item(
+            &format!("rel-{t}"),
+            MemoryType::Episodic,
+            NOW - 30 * DAY,
+            0,
+            vec![],
+            &content,
+        );
+        rel.content = content.clone();
+        // 过期干扰项: 同内容 (词法同分), 1 天前创建 (更新鲜 → 无 validity 层时必胜), 已过期
+        let mut exp = mk_item(
+            &format!("exp-{t}"),
+            MemoryType::Episodic,
+            NOW - DAY,
+            0,
+            vec![],
+            &content,
+        );
+        exp.content = content.clone();
+        exp.valid_until = Some(NOW - HOUR);
+        persist.put_memory(&rel).expect("put rel");
+        persist.put_memory(&exp).expect("put exp");
+        items.push((kw.clone(), rel));
+        items.push((kw, exp));
+    }
+
+    let mut valid_wins = 0usize;
+    let mut invalid_wins = 0usize;
+    let mut window_free_identical = true;
+    for t in 0..topics {
+        let kw = &items[2 * t].0;
+        let q_text = format!("codename {kw}");
+        let hits = persist
+            .fts_search(&q_text, 10_000, "", &NamespaceFilter::default())
+            .expect("fts_search");
+        let bm25 = normalize_bm25(&hits);
+        let rank_of = |id: &str, apply_validity: bool| -> usize {
+            let mut scored: Vec<(f64, &str)> = items
+                .iter()
+                .map(|(_, it)| {
+                    let s = fuse_score4(
+                        0.0,
+                        bm25.get(it.id.as_str()).copied().unwrap_or(0.0),
+                        0.0,
+                        freshness_of(it, NOW),
+                    );
+                    let s = if apply_validity {
+                        s * fm_engine::scoring::validity_of(it, NOW)
+                    } else {
+                        s
+                    };
+                    (s, it.id.as_str())
+                })
+                .collect();
+            scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap().then(a.1.cmp(b.1)));
+            scored.iter().position(|(_, id2)| id2 == &id).unwrap()
+        };
+        if rank_of(&format!("rel-{t}"), true) < rank_of(&format!("exp-{t}"), true) {
+            valid_wins += 1;
+        }
+        if rank_of(&format!("exp-{t}"), false) < rank_of(&format!("rel-{t}"), false) {
+            invalid_wins += 1;
+        }
+        // never-below: 无窗口项两臂同分
+        let it = &items[2 * t].1;
+        let s_open = fuse_score4(
+            0.0,
+            bm25.get(it.id.as_str()).copied().unwrap_or(0.0),
+            0.0,
+            freshness_of(it, NOW),
+        );
+        if (s_open * fm_engine::scoring::validity_of(it, NOW) - s_open).abs() > 1e-12 {
+            window_free_identical = false;
+        }
+    }
+
+    assert_eq!(
+        invalid_wins, topics,
+        "no-validity arm: expired-but-fresher distractor must outrank (setup check)"
+    );
+    assert_eq!(
+        valid_wins, topics,
+        "with validity: all valid items must outrank expired distractors"
+    );
+    assert!(
+        window_free_identical,
+        "never-below: window-free candidates must be identical with/without the factor"
+    );
+}

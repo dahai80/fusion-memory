@@ -10,6 +10,7 @@ pub mod entity_extract;
 pub mod import_studio;
 pub mod redact;
 pub mod scoring;
+pub mod trust;
 
 mod engine;
 

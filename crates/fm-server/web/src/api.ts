@@ -94,6 +94,13 @@ export interface ListParams {
     include_tombstoned?: boolean;
 }
 
+export interface ProvenanceDto {
+    id: string;
+    sources: string[];
+    confidence: number | null;
+    cited_by: string[];
+}
+
 export const api = {
     list: (p: ListParams) => call<MemoryItemDto[]>("POST", "/v1/memory/list", p),
     auditLog: (limit: number) => call<AuditEntryDto[]>("POST", "/v1/memory/audit_log", { limit }),
@@ -103,4 +110,5 @@ export const api = {
     importStudio: (source: string) =>
         call<ImportReportDto>("POST", "/v1/memory/import", { source: source || undefined }),
     count: () => call<{ count: number }>("POST", "/v1/memory/count", {}),
+    provenance: (id: string) => call<ProvenanceDto>("POST", "/v1/memory/provenance", { id }),
 };

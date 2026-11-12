@@ -50,6 +50,7 @@ async fn seed(engine: &MemoryEngine) {
                 })
                 .collect(),
             timestamp: i as u64,
+            owner: None,
             metadata: serde_json::json!({}),
         };
         engine

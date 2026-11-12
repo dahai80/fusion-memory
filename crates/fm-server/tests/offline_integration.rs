@@ -33,6 +33,7 @@ fn stub_state() -> HttpState {
         gateway_origin_required: false,
         default_tenant: Arc::new(String::new()),
         multi_tenant: false,
+        acl: false,
         verifier: fm_server::identity::noop_verifier(),
     }
 }
@@ -291,4 +292,62 @@ async fn http_import_roundtrip_on_real_engine() {
     .await;
     assert_eq!(code, 200);
     assert!(body.contains("i prefer rust over go"), "list body={body}");
+}
+
+// M6 #45: provenance RPC wire contract — real engine, commit then trace lineage.
+#[tokio::test]
+async fn http_provenance_roundtrip_on_real_engine() {
+    let st = stub_state();
+    let app = fm_server::http::app(st);
+    let (code, _) = post(
+        &app,
+        "/v1/memory/commit",
+        COMMIT_BODY,
+        Some("Bearer test-key"),
+    )
+    .await;
+    assert_eq!(code, 200);
+    // fetch the committed id via list
+    let (code, body) = post(
+        &app,
+        "/v1/memory/list",
+        r#"{"jsonrpc":"2.0","method":"list","params":{"limit":1},"id":2}"#,
+        Some("Bearer test-key"),
+    )
+    .await;
+    assert_eq!(code, 200);
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let id = v["result"][0]["id"].as_str().unwrap().to_string();
+    // provenance: direct commit → no sources, no confidence, no citations
+    let (code, body) = post(
+        &app,
+        "/v1/memory/provenance",
+        &format!(r#"{{"jsonrpc":"2.0","method":"provenance","params":{{"id":"{id}"}},"id":3}}"#),
+        Some("Bearer test-key"),
+    )
+    .await;
+    assert_eq!(code, 200, "body={body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["result"]["id"].as_str().unwrap(), id);
+    assert_eq!(v["result"]["sources"].as_array().unwrap().len(), 0);
+    assert!(v["result"]["confidence"].is_null());
+    assert_eq!(v["result"]["cited_by"].as_array().unwrap().len(), 0);
+    // unknown id → NotFound (-32001 → HTTP 404)
+    let (code, _) = post(
+        &app,
+        "/v1/memory/provenance",
+        r#"{"jsonrpc":"2.0","method":"provenance","params":{"id":"nope"},"id":4}"#,
+        Some("Bearer test-key"),
+    )
+    .await;
+    assert_eq!(code, 404, "unknown id must be NotFound");
+    // empty id → invalid params 400
+    let (code, _) = post(
+        &app,
+        "/v1/memory/provenance",
+        r#"{"jsonrpc":"2.0","method":"provenance","params":{"id":""},"id":5}"#,
+        Some("Bearer test-key"),
+    )
+    .await;
+    assert_eq!(code, 400);
 }

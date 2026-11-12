@@ -41,6 +41,7 @@ source_of_truth:
 | `POST /v1/memory/unmerge` | ✔ | 拆分合并（需 confirm） |
 | `POST /v1/memory/reconcile` | ✔ | 账目对账（需 confirm） |
 | `POST /v1/memory/import` | — | HTTP-only 导入（body 即 params 对象 `{"source":...}`，默认 `~/.fusion-agent-studio/memory.db`，返回裸报告；与 CLI 共用同一引擎实例） |
+| `POST /v1/memory/provenance` | — | M6 #45 溯源查询：`{id}` → `{id, sources, confidence, cited_by}`；他人 owner 记忆 → 404（ACL 开启时） |
 | `GET /app` + `/app/*path` | 壳公开 | 内嵌 Web 控制台（数据全部走 Bearer /v1/*） |
 
 ## JSON-RPC 方法（UDS）
@@ -62,3 +63,5 @@ Python 侧经 `fm-py` cdylib 调用引擎（不占 sled 独占锁的第二连接
 - `namespace` 参数在 commit/retrieve/consolidate 可选；非法 namespace 返回 `-32602`（fail-closed）。
 - 多租户模式：HTTP 边界先 `POST <identity_url>/api/v1/auth/verify` 验 JWT，tid↔tenant 不匹配 403、空租户 401。
 - 破坏性操作（delete/delete_scope/unmerge/reconcile）无 confirm 直接拒绝。
+- M3 #44：`interaction.metadata` 可带 `valid_from`/`valid_until`（epoch ms）；过期记忆检索降权不删除。
+- M5 #46：`FUSION_MEMORY_ACL=true`（须 multi_tenant）时 owner 位来自 JWT `sub`（服务端权威写入，客户端自报忽略）；不匹配的 get/delete/provenance 返回 404，retrieve/list 过滤；`role=admin` 旁路。
