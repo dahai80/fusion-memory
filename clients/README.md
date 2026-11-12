@@ -7,8 +7,8 @@ doc_type: readme
 title: { zh: "消费方参考客户端", en: "Consumer reference clients" }
 audience: engineer
 status: draft
-version: 1.5.0
-updated: 2026-11-07
+version: 1.9.1
+updated: 2026-11-13
 owner: "@dahai"
 source_of_truth:
   - clients/README.md
@@ -92,6 +92,19 @@ GET  /healthz             → "ok" (公开, 不鉴权)
 ### ⚠️ 端口冲突
 
 fusion-code `fusion-kb-client.ts` 已占 11435。TS 客户端默认 11440 避让；operator 也可 `FUSION_MEMORY_HTTP_PORT=11440 ./start.sh start` + `FUSION_MEMORY_BASE_URL=http://127.0.0.1:11440` 消费方侧覆盖。Python 消费方默认 11435（与 fusion-memory PRD 一致，无冲突）。
+
+## fusion-harness MemoryBridge 适配器 (issue #42)
+
+`python/harness_bridge.py` — fusion-harness `fusion_harness.memory_link` 协议（P3-2, G9）的结构化实现，走 fm-server HTTP。runtime_checkable Protocol，**无需 import fusion_harness**；消费方把文件 vendor 进仓库后即可 `MemoryBridge(sink=..., source=...)`。
+
+| 适配器 | 实现协议 | 语义 |
+|--------|---------|------|
+| `HarnessMemorySink` | `MemorySink.store(key, payload, metadata=None)` | 压缩摘要经 `commit` RPC 落一条 Episodic 记忆；`session_id` 取 metadata，缺省回落 key 的 `scope:<session_id>` 后缀 |
+| `HarnessMemorySource` | `MemorySource.retrieve(query, limit=5)` | `retrieve` RPC just-in-time 召回，返回 `[{payload, interaction_id, score}]`（`inject_context` 直接可读）；`top_k=limit` 有界；网络故障降级 `[]`（recall 是增强不是依赖） |
+
+同步 httpx 客户端（harness 协议是同步签名）。env 与上表一致（`FUSION_MEMORY_BASE_URL` / `FUSION_MEMORY_API_KEY`）。
+
+测试：`python/test_harness_bridge.py`（7 用例）— 协议符合性（真 fusion-harness 树 runtime_checkable isinstance，离线）/ 缺 key fail-closed / 真 server e2e（sink 落 → source 召回 → `persist_compaction`/`recall`/`inject_context` 全链路 → limit 有界 → 断连降级空）。e2e 需真 fm-server + fusion-mlx bge-m3（跳过条件见文件头）。
 
 ## 各消费方接入缝 (recon 确认)
 

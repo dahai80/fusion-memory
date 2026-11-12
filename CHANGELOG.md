@@ -21,6 +21,16 @@ Internal path-dep private ecosystem (not on crates.io); versions tag + GitHub re
 
 ## [Unreleased]
 
+## [1.9.1] — 2026-11-13
+
+PATCH release — new client adapter (no Rust code/API change, no schema change), plus a docs-only subset-qualifier fix (#55).
+
+### Added
+- **fusion-harness MemoryBridge adapters (issue #42)**: `clients/python/harness_bridge.py` — `HarnessMemorySink` (implements the harness `MemorySink` protocol structurally: `store(key, payload, metadata=None)` persists a compaction summary as one Episodic memory via the `commit` RPC; session id falls back to the `scope:<session_id>` key suffix) and `HarnessMemorySource` (implements `MemorySource`: `retrieve(query, limit=5)` returns `[{payload, interaction_id, score}]` shaped for `MemoryBridge.inject_context`, bounded `top_k=limit`, network outage degrades to `[]` — recall is an upgrade, never a dependency). Sync `httpx` adapters (the harness protocols are sync), vendored-consumer model identical to `fusion_memory_client.py`, no `fusion_harness` import required. Tests (`clients/python/test_harness_bridge.py`, 7 cases): offline protocol conformance against the real fusion-harness tree (`runtime_checkable` Protocol isinstance), missing-API-key fail-closed, and live e2e against a real fm-server + fusion-mlx bge-m3 — sink store → source recall → `MemoryBridge.persist_compaction`/`recall`/`inject_context` roundtrip → bounded limit → outage no-op.
+
+### Fixed
+- **LongMemEval subset qualifier (PR #55)**: release banners in README.md / README_CN.md now carry "subset"/"子集" on the LongMemEval CI-gate mention — external-facing benchmark claims must always carry the subset qualifier (defense line 6 counterpart); every other outward mention was already qualified.
+
 ## [1.9.0] — 2026-11-12
 
 Scale-and-finish (evolution plan 2026-11 phase 4, issues #51/#52/#53). MINOR release — additive only.
