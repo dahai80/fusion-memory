@@ -1,5 +1,15 @@
 //! fm-py: fusion-memory Python 绑定。PRD §11.3, C2 修正。
 //!
+//! **DEPRECATED (v1.9.0, M10 #52 decision record)**: repo-wide scan found zero
+//! code consumers — every project (fusion-trainer included) accesses
+//! fusion-memory via the fm-server service surface (HTTP `:11435 /v1/memory/*`
+//! or UDS JSON-RPC). The binding stays compiling under the API freeze (removal
+//! would be a breaking change) but receives no new feature investment.
+//! Migration path for any future Python consumer: run fm-server and use
+//! HTTP — `POST /v1/memory/commit` / `POST /v1/memory/retrieve` /
+//! `POST /v1/memory/retrieve_context` (Bearer API key, same semantics as the
+//! binding methods; multi-process safe, no exclusive data-dir lock).
+//!
 //! GIL 安全：同步签名内部 `py.allow_threads` 释放 GIL，tokio runtime block_on
 //! 跑 Rust future（mlx embedding/抽实体不持 GIL），Python 事件循环不冻结。
 //!

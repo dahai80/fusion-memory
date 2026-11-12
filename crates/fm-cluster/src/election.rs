@@ -229,6 +229,21 @@ impl Election {
             }
         }
         let mut st = self.state.lock().await;
+        // 判据 0 (v1.9.0 #51): 本节点已是 leader (本进程在任期内服务) → 拒绝投票。
+        // 防租约过期后陈旧竞选者以更高 term 抢票覆盖在任 leader (双晋升)。
+        // 真换届由多数派在其余节点间完成 (quorum 不依赖 leader 票)。
+        if st.state == ElectionState::Leader {
+            warn!(
+                term = st.current_term,
+                candidate = req.candidate_id,
+                "vote request denied: this node is the sitting leader"
+            );
+            return Ok(VoteResponse {
+                term: st.current_term,
+                granted: false,
+                voter_last_seq: st.last_seq,
+            });
+        }
         // 判据 1/2: term 比较。
         if req.term > st.current_term {
             info!(
@@ -297,6 +312,20 @@ impl Election {
         let quorum = self.cfg.quorum();
         {
             let mut st = self.state.lock().await;
+            // v1.9.0 #51 防活锁/双晋升: 本节点近期已把票投给其他候选 (授予即认可其领导)
+            // 且租约未过 → 不发起竞选。否则锁步同 term 自投互拒 (split vote livelock),
+            // 或租约过期后更高 term 抢票覆盖已胜出节点 (双晋升, epoch 连跳)。
+            if st.voted_for.is_some()
+                && st.voted_for != Some(self.cfg.self_id)
+                && st.last_heartbeat.elapsed() < self.cfg.lease()
+            {
+                info!(
+                    self_id = self.cfg.self_id,
+                    voted_for = ?st.voted_for,
+                    "recently voted for another candidate within lease, skip campaign"
+                );
+                return Ok(false);
+            }
             st.state = ElectionState::Candidate;
             st.current_term += 1;
             new_term = st.current_term;

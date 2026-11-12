@@ -80,6 +80,7 @@ pub fn app(state: HttpState) -> axum::Router {
         .route("/v1/memory/revisions", post(revisions_route))
         .route("/v1/memory/export", post(export_route))
         .route("/v1/memory/export_skills", post(export_skills_route))
+        .route("/v1/memory/config", post(config_route))
         .route("/v1/memory/import", post(import_route))
         // #33: web UI static assets (web/dist embedded at compile time, no runtime file dependency). Public shell; data goes through Bearer.
         .route("/app", get(web_index))
@@ -278,6 +279,10 @@ async fn export_route(st: State<HttpState>, h: HeaderMap, j: Json<Value>) -> Res
     handle_rpc(st, h, j).await
 }
 async fn export_skills_route(st: State<HttpState>, h: HeaderMap, j: Json<Value>) -> Response {
+    handle_rpc(st, h, j).await
+}
+// v1.9.0 #53: governance parameter snapshot (read-only).
+async fn config_route(st: State<HttpState>, h: HeaderMap, j: Json<Value>) -> Response {
     handle_rpc(st, h, j).await
 }
 

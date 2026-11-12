@@ -21,6 +21,17 @@ Internal path-dep private ecosystem (not on crates.io); versions tag + GitHub re
 
 ## [Unreleased]
 
+## [1.9.0] — 2026-11-12
+
+Scale-and-finish (evolution plan 2026-11 phase 4, issues #51/#52/#53). MINOR release — additive only.
+
+### Added
+- **Cluster auto-failover activation (M9, #51)**: `spawn_cluster_with` DI variant (per-node `ElectionConfig` injection — NODE_ID is process-global env, cannot express multiple self_ids in one process; env-reading `spawn_cluster` unchanged). Split-vote livelock fix: campaign stagger by `self_id` (deterministic, no rand dep) + campaign skip while a recently-granted vote to another candidate is inside its lease + sitting-leader vote-deny (prevents double promotion via higher-term vote churn). 3-node live e2e (`crates/fm-server/tests/cluster_failover_3node.rs`): leader serves WOP sync (commit replicates to both followers over real TCP) → live leader killed → followers detect LeaderDown → quorum (2/3) promotion → role=Leader + epoch++ → restart simulation: promoted node serves on the new epoch and a fresh follower expecting epoch 1 receives the post-failover commit. Known limitation (documented): replayed rows are applied directly without a wop append, so a promoted follower-leader's wop log holds post-promotion writes only — a fresh catch-up node receives post-failover data, not pre-failover history (snapshot/compaction is future work).
+- **Governance panel (issue #53)**: `config` RPC (UDS + HTTP `POST /v1/memory/config`) — read-only snapshot of the tuned scoring constants (`fm_engine::scoring::governance_snapshot()`: fusion weights 0.4/0.3/0.2/0.1, validity expired factor, θ_drop/θ_promote, episodic recall promotion, graph hop limit, three-way ablation arm). Web console: Governance tab rendering the snapshot; Audit tab gains an event filter (trust/injection-blocked, trust/injection-skipped, merge, cluster) — the poisoning-audit view on top of the v1.7.0 trust events. Provenance query (v1.7.0) cross-linked.
+
+### Deprecated
+- **fm-py (M10, #52 decision record)**: repo-wide scan found zero code consumers — every project (fusion-trainer included) accesses fusion-memory via the fm-server service surface (HTTP `:11435 /v1/memory/*` or UDS JSON-RPC). Per the plan rule, the binding is deprecated: stays compiling under the API freeze (removal would be breaking), no new feature investment; migration path documented in `fm-py` crate docs (run fm-server, use HTTP/UDS — multi-process safe, no exclusive data-dir lock).
+
 ## [1.8.0] — 2026-11-12
 
 Skills and export (evolution plan 2026-11 phase 3, issues #48/#49). MINOR release — additive only: schema v9 (`memory_revision` table, `CREATE IF NOT EXISTS` idempotent — no ALTER), serde-default fields, new RPC methods on the frozen wire contract.

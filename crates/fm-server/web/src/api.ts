@@ -70,6 +70,14 @@ export interface AuditEntryDto {
     detail: string;
 }
 
+export interface GovernanceConfigDto {
+    fusion: { description: string; cosine: number; bm25: number; graph: number; freshness: number };
+    three_way_ablation_arm: { description: string; alpha_cosine: number; beta_decay: number; gamma_graph: number };
+    validity: { description: string; expired_factor: number };
+    forgetting: { description: string; theta_drop: number; theta_promote: number; episodic_recall_promote: number; episodic_recall_window_secs: number };
+    graph: { hop_limit: number };
+}
+
 export interface MergeEntryDto {
     id: number;
     at: number;
@@ -104,6 +112,7 @@ export interface ProvenanceDto {
 export const api = {
     list: (p: ListParams) => call<MemoryItemDto[]>("POST", "/v1/memory/list", p),
     auditLog: (limit: number) => call<AuditEntryDto[]>("POST", "/v1/memory/audit_log", { limit }),
+    governanceConfig: () => call<GovernanceConfigDto>("POST", "/v1/memory/config", {}),
     merges: () => call<MergeEntryDto[]>("POST", "/v1/memory/merges", {}),
     unmerge: (id: number) => call<{ unmerged: boolean }>("POST", "/v1/memory/unmerge", { id, confirm: true }),
     reconcile: () => call<{ reconciled: number }>("POST", "/v1/memory/reconcile", { confirm: true }),

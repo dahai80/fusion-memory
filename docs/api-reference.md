@@ -45,7 +45,8 @@ source_of_truth:
 | `POST /v1/memory/revisions` | — | M8 #49 修订历史：`{id}` → `[{rev, memory_id, content, reason, at}]`（旧值密文存储读取时解密）；主体不可见或他人记忆 → 404 |
 | `POST /v1/memory/export` | — | M8 #49 标准导出：`{format: "jsonl"\|"markdown", limit 1..=1000, namespace?, memory_type?}` → `{format, count, body}`；渲染器内无条件 redact（防线 2）；排除 tombstone；ACL owner 过滤 |
 | `POST /v1/memory/export_skills` | — | M7 #48 SKILL.md 导出：Procedural 记忆 → `[{id, name, confidence?, markdown}]`（YAML frontmatter 契约 + Provenance 尾注）；limit 1..=50；ACL owner 过滤 |
-| `GET /app` + `/app/*path` | 壳公开 | 内嵌 Web 控制台（数据全部走 Bearer /v1/*） |
+| `POST /v1/memory/config` | — | v1.9.0 #53 治理面板：只读返回评分/遗忘调优常量快照（融合权重/有效期因子/θ 阈值/图跳数） |
+| `GET /app` + `/app/*path` | 壳公开 | 内嵌 Web 控制台（数据全部走 Bearer /v1/*；v1.9.0 增 Governance 页 + Audit 页 trust 事件过滤） |
 
 ## JSON-RPC 方法（UDS）
 

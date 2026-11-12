@@ -11,10 +11,11 @@ import {
     LogIn,
     RefreshCw,
     RotateCcw,
+    Shield,
     Upload,
 } from "lucide-react";
 import { api, ApiError, getApiKey, setApiKey } from "./api";
-import type { AuditEntryDto, ImportReportDto, MemoryItemDto, MergeEntryDto, ProvenanceDto } from "./api";
+import type { AuditEntryDto, GovernanceConfigDto, ImportReportDto, MemoryItemDto, MergeEntryDto, ProvenanceDto } from "./api";
 import { Badge, Button, Card, Input, Select, Tabs, Td, Th } from "./ui";
 
 function fmtTs(ms: number): string {
@@ -217,6 +218,7 @@ function EntriesTab() {
 function AuditTab() {
     const [rows, setRows] = useState<AuditEntryDto[]>([]);
     const [err, setErr] = useState("");
+    const [eventFilter, setEventFilter] = useState("all");
     const load = useCallback(async () => {
         setErr("");
         const r = await withErr(() => api.auditLog(200), setErr);
@@ -225,13 +227,27 @@ function AuditTab() {
     useEffect(() => {
         void load();
     }, [load]);
+    const shown = eventFilter === "all" ? rows : rows.filter((x) => x.action.startsWith(eventFilter));
     return (
         <div className="space-y-4">
-            <div className="flex items-center gap-2">
+            <div className="flex flex-wrap items-center gap-2">
                 <Button variant="ghost" onClick={() => void load()}>
                     <RefreshCw className="h-4 w-4" /> Refresh
                 </Button>
-                <span className="text-sm text-zinc-500">{rows.length} latest (max 200)</span>
+                <span className="text-sm text-zinc-500">{shown.length} shown / {rows.length} latest (max 200)</span>
+                <Select
+                    value={eventFilter}
+                    onChange={setEventFilter}
+                    className="w-56"
+                    options={[
+                        { value: "all", label: "all events" },
+                        { value: "trust/", label: "trust events (poison audit)" },
+                        { value: "trust/injection-blocked", label: "trust/injection-blocked" },
+                        { value: "trust/injection-skipped", label: "trust/injection-skipped" },
+                        { value: "merge", label: "merge events" },
+                        { value: "cluster", label: "cluster events" },
+                    ]}
+                />
             </div>
             {err && <p className="text-sm text-red-400">{err}</p>}
             <Card>
@@ -489,6 +505,70 @@ function ProvenanceTab() {
     );
 }
 
+function GovernanceTab() {
+    const [cfg, setCfg] = useState<GovernanceConfigDto | null>(null);
+    const [err, setErr] = useState("");
+    const load = useCallback(async () => {
+        setErr("");
+        const r = await withErr(() => api.governanceConfig(), setErr);
+        if (r) setCfg(r);
+    }, []);
+    useEffect(() => {
+        void load();
+    }, [load]);
+    return (
+        <div className="max-w-2xl space-y-4">
+            <Card className="p-5">
+                <h2 className="mb-2 flex items-center gap-2 text-sm font-semibold text-zinc-200">
+                    <Shield className="h-4 w-4 text-indigo-400" /> Scoring and forgetting parameters
+                </h2>
+                <p className="mb-4 text-sm text-zinc-400">
+                    Read-only view of the tuned retrieval/fusion and forgetting-curve constants
+                    (v1.9.0 governance surface). Poisoning lineage lives in the Provenance tab;
+                    poisoning audit events in the Audit log trust filter.
+                </p>
+                {err && <p className="text-sm text-red-400">{err}</p>}
+                {cfg && (
+                    <div className="space-y-4 text-sm">
+                        <div>
+                            <p className="mb-1 text-xs font-medium uppercase tracking-wide text-zinc-500">{cfg.fusion.description}</p>
+                            <div className="flex flex-wrap gap-2">
+                                <Badge tone="indigo">cosine {cfg.fusion.cosine}</Badge>
+                                <Badge tone="indigo">bm25 {cfg.fusion.bm25}</Badge>
+                                <Badge tone="indigo">graph {cfg.fusion.graph}</Badge>
+                                <Badge tone="indigo">freshness {cfg.fusion.freshness}</Badge>
+                            </div>
+                        </div>
+                        <div>
+                            <p className="mb-1 text-xs font-medium uppercase tracking-wide text-zinc-500">{cfg.validity.description}</p>
+                            <div className="flex flex-wrap gap-2">
+                                <Badge tone="amber">expired factor {cfg.validity.expired_factor}</Badge>
+                            </div>
+                        </div>
+                        <div>
+                            <p className="mb-1 text-xs font-medium uppercase tracking-wide text-zinc-500">{cfg.forgetting.description}</p>
+                            <div className="flex flex-wrap gap-2">
+                                <Badge tone="emerald">theta drop {cfg.forgetting.theta_drop}</Badge>
+                                <Badge tone="emerald">theta promote {cfg.forgetting.theta_promote}</Badge>
+                                <Badge tone="emerald">recall promote {cfg.forgetting.episodic_recall_promote} in {Math.round(cfg.forgetting.episodic_recall_window_secs / 86400)}d</Badge>
+                            </div>
+                        </div>
+                        <div>
+                            <p className="mb-1 text-xs font-medium uppercase tracking-wide text-zinc-500">{cfg.three_way_ablation_arm.description}</p>
+                            <div className="flex flex-wrap gap-2">
+                                <Badge tone="zinc">alpha {cfg.three_way_ablation_arm.alpha_cosine}</Badge>
+                                <Badge tone="zinc">beta {cfg.three_way_ablation_arm.beta_decay}</Badge>
+                                <Badge tone="zinc">gamma {cfg.three_way_ablation_arm.gamma_graph}</Badge>
+                                <Badge tone="zinc">graph hops {cfg.graph.hop_limit}</Badge>
+                            </div>
+                        </div>
+                    </div>
+                )}
+            </Card>
+        </div>
+    );
+}
+
 export default function App() {
     const [authed, setAuthed] = useState(!!getApiKey());
     const [tab, setTab] = useState("entries");
@@ -519,6 +599,7 @@ export default function App() {
                             { id: "audit", label: "Audit log", icon: <FileClock className="h-4 w-4" /> },
                             { id: "merges", label: "Merges", icon: <GitMerge className="h-4 w-4" /> },
                             { id: "provenance", label: "Provenance", icon: <Link2 className="h-4 w-4" /> },
+                            { id: "governance", label: "Governance", icon: <Shield className="h-4 w-4" /> },
                             { id: "import", label: "Import", icon: <Upload className="h-4 w-4" /> },
                         ]}
                     />
@@ -536,6 +617,7 @@ export default function App() {
                 {tab === "audit" && <AuditTab />}
                 {tab === "merges" && <MergesTab />}
                 {tab === "provenance" && <ProvenanceTab />}
+                {tab === "governance" && <GovernanceTab />}
                 {tab === "import" && <ImportTab />}
             </div>
         </div>
