@@ -77,6 +77,9 @@ pub fn app(state: HttpState) -> axum::Router {
         .route("/v1/memory/unmerge", post(unmerge_route))
         .route("/v1/memory/reconcile", post(reconcile_route))
         .route("/v1/memory/provenance", post(provenance_route))
+        .route("/v1/memory/revisions", post(revisions_route))
+        .route("/v1/memory/export", post(export_route))
+        .route("/v1/memory/export_skills", post(export_skills_route))
         .route("/v1/memory/import", post(import_route))
         // #33: web UI static assets (web/dist embedded at compile time, no runtime file dependency). Public shell; data goes through Bearer.
         .route("/app", get(web_index))
@@ -264,6 +267,17 @@ async fn reconcile_route(st: State<HttpState>, h: HeaderMap, j: Json<Value>) -> 
     handle_rpc(st, h, j).await
 }
 async fn provenance_route(st: State<HttpState>, h: HeaderMap, j: Json<Value>) -> Response {
+    handle_rpc(st, h, j).await
+}
+
+// M8/M7: revisions + export thin routes (dispatch semantics identical to UDS).
+async fn revisions_route(st: State<HttpState>, h: HeaderMap, j: Json<Value>) -> Response {
+    handle_rpc(st, h, j).await
+}
+async fn export_route(st: State<HttpState>, h: HeaderMap, j: Json<Value>) -> Response {
+    handle_rpc(st, h, j).await
+}
+async fn export_skills_route(st: State<HttpState>, h: HeaderMap, j: Json<Value>) -> Response {
     handle_rpc(st, h, j).await
 }
 

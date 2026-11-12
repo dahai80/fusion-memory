@@ -198,6 +198,11 @@ pub async fn dispatch(
         "reconcile" => reconcile(params, engine).await,
         // M6 #45: poisoning-governance provenance query (lineage + reverse citations).
         "provenance" => provenance(params, engine, tenant, acl).await,
+        // M8 #49: content revision history + standard export (JSONL / Markdown).
+        "revisions" => revisions(params, engine, tenant, acl).await,
+        "export" => export(params, engine, tenant, acl).await,
+        // M7 #48: procedural memory -> SKILL.md export (agent-studio / fusion-harness).
+        "export_skills" => export_skills(params, engine, tenant, acl).await,
         "health" => Ok(Value::String("ok".into())),
         // P2-4: version 方法 — 返当前 api_version 供客户端协商。
         "version" => Ok(serde_json::json!({"api_version": API_VERSION})),
@@ -711,6 +716,152 @@ async fn provenance(
         .await
         .map_err(|e| RpcError::from_engine(&e))?;
     serde_json::to_value(rep).map_err(|e| RpcError::internal(e.to_string()))
+}
+
+/// M8 #49: revisions params — one memory id; returns its content-revision history.
+#[derive(Debug, Deserialize)]
+struct RevisionsParams {
+    id: String,
+}
+
+async fn revisions(
+    params: Value,
+    engine: &EngineHandle,
+    tenant: &str,
+    acl: Option<&AclUser>,
+) -> Result<Value, RpcError> {
+    let p: RevisionsParams =
+        serde_json::from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+    // ACL: someone else's memory → NotFound (history must not leak either).
+    let subject: Option<MemoryItem> = engine
+        .get_memory_tenant(&p.id, tenant)
+        .await
+        .map_err(|e| RpcError::from_engine(&e))?;
+    if let Some(item) = &subject {
+        if acl_denies(acl, &item.owner) {
+            return Err(RpcError::not_found(&p.id));
+        }
+    } else {
+        return Err(RpcError::not_found(&p.id));
+    }
+    let rows = engine
+        .list_revisions(&p.id, tenant)
+        .await
+        .map_err(|e| RpcError::from_engine(&e))?;
+    serde_json::to_value(rows).map_err(|e| RpcError::internal(e.to_string()))
+}
+
+/// M8 #49: export params. format = "jsonl" | "markdown"; optional namespace +
+/// memory_type scoping; limit hard-capped (bounded response body, DoS guard).
+#[derive(Debug, Deserialize)]
+struct ExportParams {
+    format: String,
+    #[serde(default = "default_export_limit")]
+    limit: usize,
+    #[serde(default)]
+    namespace: String,
+    #[serde(default)]
+    namespace_key: String,
+    #[serde(default)]
+    memory_type: Option<String>,
+}
+
+fn default_export_limit() -> usize {
+    500
+}
+
+async fn export(
+    params: Value,
+    engine: &EngineHandle,
+    tenant: &str,
+    acl: Option<&AclUser>,
+) -> Result<Value, RpcError> {
+    let p: ExportParams =
+        serde_json::from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+    if !matches!(p.format.as_str(), "jsonl" | "markdown") {
+        return Err(RpcError::invalid_params("format must be jsonl|markdown"));
+    }
+    if p.limit == 0 || p.limit > 1000 {
+        return Err(RpcError::invalid_params("limit must be 1..=1000"));
+    }
+    if let Some(mt) = &p.memory_type {
+        if !matches!(mt.as_str(), "Episodic" | "Semantic" | "Procedural") {
+            return Err(RpcError::invalid_params(format!(
+                "memory_type must be Episodic|Semantic|Procedural, got {mt:?}"
+            )));
+        }
+    }
+    validate_namespace(&p.namespace)?;
+    let q = fm_core::ListQuery {
+        offset: 0,
+        limit: p.limit,
+        memory_type: p.memory_type,
+        namespace: p.namespace,
+        namespace_key: p.namespace_key,
+        include_tombstoned: false,
+    };
+    let mut items = engine
+        .list_memories(&q, tenant)
+        .await
+        .map_err(|e| RpcError::from_engine(&e))?;
+    // M5 #46: export respects the owner filter — other users' memories never leave.
+    items.retain(|m| !acl_denies(acl, &m.owner));
+    // M8 defense line 2: redact applies unconditionally inside the renderers.
+    let body = if p.format == "jsonl" {
+        fm_engine::export::export_jsonl(&items)
+    } else {
+        fm_engine::export::export_markdown(&items)
+    };
+    Ok(serde_json::json!({
+        "format": p.format,
+        "count": items.len(),
+        "body": body,
+    }))
+}
+
+/// M7 #48: export_skills params — Procedural memories rendered as SKILL.md docs.
+#[derive(Debug, Deserialize)]
+struct ExportSkillsParams {
+    #[serde(default = "default_skills_limit")]
+    limit: usize,
+    #[serde(default)]
+    namespace: String,
+    #[serde(default)]
+    namespace_key: String,
+}
+
+fn default_skills_limit() -> usize {
+    20
+}
+
+async fn export_skills(
+    params: Value,
+    engine: &EngineHandle,
+    tenant: &str,
+    acl: Option<&AclUser>,
+) -> Result<Value, RpcError> {
+    let p: ExportSkillsParams =
+        serde_json::from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+    if p.limit == 0 || p.limit > 50 {
+        return Err(RpcError::invalid_params("limit must be 1..=50"));
+    }
+    validate_namespace(&p.namespace)?;
+    let q = fm_core::ListQuery {
+        offset: 0,
+        limit: p.limit,
+        memory_type: Some("Procedural".into()),
+        namespace: p.namespace,
+        namespace_key: p.namespace_key,
+        include_tombstoned: false,
+    };
+    let mut items = engine
+        .list_memories(&q, tenant)
+        .await
+        .map_err(|e| RpcError::from_engine(&e))?;
+    // M5 #46: skills built from someone else's memories must not leak either.
+    items.retain(|m| !acl_denies(acl, &m.owner));
+    let docs = fm_engine::export::render_skills(&items);
+    serde_json::to_value(&docs).map_err(|e| RpcError::internal(e.to_string()))
 }
 
 /// memory.retrieve_context params (issue #1/#4, fusion-event 冻结契约)。

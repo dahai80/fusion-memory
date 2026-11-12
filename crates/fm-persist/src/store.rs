@@ -12,7 +12,8 @@ use tracing::{debug, info, warn};
 use crate::error::{PersistError, PersistResult};
 use crate::schema;
 use fm_core::{
-    ConsolidationReport, EntityNode, MemoryItem, MemoryTier, MemoryType, NamespaceFilter,
+    ConsolidationReport, EntityNode, MemoryItem, MemoryRevision, MemoryTier, MemoryType,
+    NamespaceFilter,
 };
 
 // P4: 递归 CTE 结果集扇出上限 (graph_affinity 远端节点贡献 0.5^h 指数衰减, 截断无损精度)。
@@ -122,6 +123,38 @@ impl Persist {
         Ok(bytes)
     }
 
+    /// M8 #49: 内容变化时把旧内容快照进 memory_revision (audit_log 之外的版本层)。
+    /// 快照用解密后的明文? 不 — 直接存旧 enc 列值 (同加密语义, 明文不额外落盘)。
+    /// 仅当旧行存在且内容不同才记 (INSERT OR REPLACE 幂等重放不产生重复修订)。
+    fn maybe_record_revision(
+        tx: &rusqlite::Transaction,
+        memory_id: &str,
+        new_enc_content: &str,
+        reason: &str,
+        at: u64,
+    ) -> PersistResult<()> {
+        let old: Option<String> = tx
+            .query_row(
+                "SELECT content FROM memory_item WHERE id=?1",
+                params![memory_id],
+                |r| r.get(0),
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(other),
+            })?;
+        if let Some(old_enc) = old {
+            if old_enc != new_enc_content {
+                tx.execute(
+                    "INSERT INTO memory_revision(memory_id,content,reason,at) VALUES(?1,?2,?3,?4)",
+                    params![memory_id, old_enc, reason, at as i64],
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn put_memory(&self, item: &MemoryItem) -> PersistResult<()> {
         // H1: memory_item + entity + memory_entity 三类 INSERT 包进单 transaction,
         // 中途任一失败 → rollback, 不留半截实体行 (无事务时 insert 成功后 entity 循环失败留孤儿)。
@@ -130,6 +163,13 @@ impl Persist {
         let entities_json = serde_json::to_string(&item.entities)?;
         let enc_content = crate::crypto::encrypt_field(self.cipher.as_ref(), &item.content)?;
         let enc_entities = crate::crypto::encrypt_field(self.cipher.as_ref(), &entities_json)?;
+        Self::maybe_record_revision(
+            &tx,
+            &item.id,
+            &enc_content,
+            "put",
+            item.last_accessed_timestamp,
+        )?;
         tx.execute(
             schema::MEMORY_ITEM_DDL_INSERT,
             params![
@@ -207,6 +247,13 @@ impl Persist {
         let entities_json = serde_json::to_string(&item.entities)?;
         let enc_content = crate::crypto::encrypt_field(self.cipher.as_ref(), &item.content)?;
         let enc_entities = crate::crypto::encrypt_field(self.cipher.as_ref(), &entities_json)?;
+        Self::maybe_record_revision(
+            &tx,
+            &item.id,
+            &enc_content,
+            "put",
+            item.last_accessed_timestamp,
+        )?;
         tx.execute(
             schema::MEMORY_ITEM_DDL_INSERT,
             params![
@@ -269,6 +316,38 @@ impl Persist {
         tx.commit()?;
         debug!(seq, op = wop_op, "put_memory_with_wop atomic");
         Ok(seq)
+    }
+
+    /// M8 #49: 内容修订历史 (旧内容快照, 新→旧)。content 按当前 cipher 解密 —
+    /// 修订行存的是写入当时的 enc 值, cipher 轮换后旧 rev 可能解不开 (fail-visible 落原文)。
+    pub fn list_revisions(
+        &self,
+        memory_id: &str,
+        limit: u64,
+    ) -> PersistResult<Vec<MemoryRevision>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT rev, memory_id, content, reason, at FROM memory_revision              WHERE memory_id=?1 ORDER BY rev DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![memory_id, limit as i64], |r| {
+            Ok(MemoryRevision {
+                rev: r.get::<_, i64>(0)?.max(0) as u64,
+                memory_id: r.get(1)?,
+                content: r.get(2)?,
+                reason: r.get(3)?,
+                at: r.get::<_, i64>(4)?.max(0) as u64,
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            let mut m = r?;
+            m.content = self
+                .cipher
+                .as_ref()
+                .map_or_else(|| m.content.clone(), |c| c.decrypt(&m.content));
+            out.push(m);
+        }
+        Ok(out)
     }
 
     pub fn get_memory(&self, id: &str) -> PersistResult<Option<MemoryItem>> {
@@ -1974,6 +2053,59 @@ mod tests {
                 .unwrap();
             assert_eq!(n, 2, "v7 columns restored by migrate");
         }
+    }
+
+    // M8 #49: v9 修订历史表 — 模拟 v8 旧库 → migrate 建表 (IF NOT EXISTS 幂等)。
+    #[test]
+    fn schema_v9_revisions_migration() {
+        let p = Persist::open_in_memory().unwrap();
+        {
+            let c = p.conn().unwrap();
+            c.execute_batch("DROP TABLE memory_revision").unwrap();
+            c.execute_batch("PRAGMA user_version=8").unwrap();
+            schema::migrate(&c).unwrap();
+            assert_eq!(schema::user_version(&c).unwrap(), schema::SCHEMA_VERSION);
+            let n: i64 = c
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='memory_revision'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 1, "v9 revision table restored by migrate");
+        }
+    }
+
+    // M8 #49: 内容变化才记修订 — 重放相同内容不产生重复行。
+    #[test]
+    fn revision_recorded_on_content_change_only() {
+        let p = Persist::open_in_memory().unwrap();
+        let mut item = MemoryItem::new_turn_skeleton(
+            "r1".into(),
+            "ix".into(),
+            0,
+            "s".into(),
+            String::new(),
+            MemoryType::Episodic,
+            "original content".into(),
+            1000,
+        );
+        p.put_memory(&item).unwrap();
+        assert!(
+            p.list_revisions("r1", 10).unwrap().is_empty(),
+            "first put: no revision"
+        );
+        // content change → revision snapshot of the old content
+        item.content = "updated content".into();
+        item.last_accessed_timestamp = 2000;
+        p.put_memory(&item).unwrap();
+        let revs = p.list_revisions("r1", 10).unwrap();
+        assert_eq!(revs.len(), 1, "one revision after content change");
+        assert_eq!(revs[0].content, "original content");
+        assert_eq!(revs[0].reason, "put");
+        // replay identical content → no duplicate revision
+        p.put_memory(&item).unwrap();
+        assert_eq!(p.list_revisions("r1", 10).unwrap().len(), 1);
     }
 
     // M5 #46: v8 加 owner 列; 模拟 v7 旧库 (DROP COLUMN + 回退版本) → migrate 补列。

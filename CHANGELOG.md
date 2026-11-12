@@ -21,6 +21,21 @@ Internal path-dep private ecosystem (not on crates.io); versions tag + GitHub re
 
 ## [Unreleased]
 
+## [1.8.0] — 2026-11-12
+
+Skills and export (evolution plan 2026-11 phase 3, issues #48/#49). MINOR release — additive only: schema v9 (`memory_revision` table, `CREATE IF NOT EXISTS` idempotent — no ALTER), serde-default fields, new RPC methods on the frozen wire contract.
+
+### Added
+- **SKILL.md export (M7, #48)**: Procedural memories render as skills-contract documents — YAML frontmatter (`name` from first attached entity, fallback to memory id; `description` = first content line, ≤160 chars; `version: 1`; `source: fusion-memory`; `license: Apache-2.0`) + redacted body + `## Provenance` footer (`episode:`/`confidence:` lines) so consumers can judge trust. Deterministic template, no model call (Rule 5). `export_skills` RPC (UDS + HTTP `POST /v1/memory/export_skills`, limit 1..=50 default 20, namespace scoping, ACL owner filter).
+- **Standard export (M8, #49)**: `export` RPC (UDS + HTTP `POST /v1/memory/export`) with `format: jsonl|markdown`, limit 1..=1000 default 500, optional namespace/namespace_key/memory_type scoping, tombstones excluded. JSONL = one serde round-trippable item per line (vector_ref blanked — local store handle meaningless off-node). Markdown = wikilink graph projection (`[[memory-id]]` + `[[entity-name]]`, Basic Memory / memU file-style boundary) with Sources/Confidence/Validity lines.
+- **Revision history (M8, #49)**: schema v9 `memory_revision` (rev PK AUTOINCREMENT, memory_id, content, reason, at) — `put_memory`/`put_memory_with_wop` snapshot the PRIOR content via `maybe_record_revision` when it actually changes (idempotent replay safe; the old value is stored encrypted, decrypted on read — no extra plaintext at rest). `list_revisions` trait method (additive, default Unsupported) + `revisions` RPC (UDS + HTTP `POST /v1/memory/revisions`): subject invisible → 404; ACL: someone else's history → 404 (no leak). Merge write-back records revisions through the same put path.
+- **Export redact gate (defense line 2)**: every export path (JSONL/Markdown/SKILL.md) applies `redact_text()` unconditionally inside the renderers — `FUSION_MEMORY_REDACT_PII=0` only covers the commit/import ingestion path, never egress. Acceptance tests assert no raw PII (phone/email) in any exported body.
+
+### Changed
+- fm-core: `MemoryRevision` DTO; `FusionMemoryEngine::list_revisions` additive trait method (default Unsupported).
+- fm-persist: schema v9 (+ `idx_memory_revision_mid`); `list_revisions` store method.
+- fm-engine: `export` module (`export_jsonl`/`export_markdown`/`render_skill`/`render_skills`).
+
 ## [1.7.0] — 2026-11-12
 
 Time and trust (evolution plan 2026-11 phase 2, issues #44/#45/#46). MINOR release — additive only: schema v6 (validity columns) / v7 (confidence + sources_json) / v8 (owner) incremental guarded migrations, serde-default data fields, boundary-level ACL. Frozen wire contract untouched.

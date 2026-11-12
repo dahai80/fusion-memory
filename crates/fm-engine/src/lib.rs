@@ -7,6 +7,7 @@
 //! - get/delete/audit
 
 pub mod entity_extract;
+pub mod export;
 pub mod import_studio;
 pub mod redact;
 pub mod scoring;
