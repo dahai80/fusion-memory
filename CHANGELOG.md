@@ -7,8 +7,8 @@ doc_type: changelog
 title: { zh: "更新日志", en: "Changelog" }
 audience: engineer
 status: draft
-version: 1.5.0
-updated: 2026-11-07
+version: 1.6.0
+updated: 2026-11-12
 owner: "@dahai"
 source_of_truth:
   - CHANGELOG.md
@@ -20,6 +20,19 @@ All notable changes to fusion-memory. Format: Keep a Changelog. SemVer 2.0.0.
 Internal path-dep private ecosystem (not on crates.io); versions tag + GitHub release.
 
 ## [Unreleased]
+
+## [1.6.0] — 2026-11-12
+
+Retrieval and consolidation (evolution plan 2026-11 phase 1, issues #39/#40/#41). MINOR release — additive only: schema v5 (FTS5 virtual table), new optional scheduler task (default off), new test harnesses. Frozen wire contract untouched.
+
+### Added
+- **Four-way hybrid retrieval (M1, #39)**: FTS5 trigram keyword index (`memory_fts`, schema v5 with backfill migration) fused with cosine / graph affinity / freshness — weights 0.4 / 0.3 / 0.2 / 0.1 (`fuse_score4`). Lexical candidates oversampled 4x and reranked; FTS term extraction dual-track (raw punctuated tokens + alphanumeric runs, ≥3 chars). Cipher deployments keep no plaintext token index (FTS sync skipped on write, `fts_search` fail-safe empty — B-1 field encryption stays airtight). Ablation: full-scale recall@5 cosine 0.2496 → three-way 0.5443 → four-way 0.6779, lexical recovery 40/40 vs 0/40 (`docs/benchmarks/retrieval-quality-m1-fourway-2026-11-12.md`); CI gates `ablation_four_way_never_below` + `lexical_hits_recovered_by_four_way`.
+- **Dreaming scheduler (M2, #40)**: idle-triggered background consolidation in fm-server — tokio timer + in-flight gate (`MemoryEngine::inflight_count`, RAII guard on retrieve/commit) + pending-entity threshold (`pending_count`); trigger calls the same `consolidate_memories()` entry as the manual RPC (consolidate_lock serializes both; saga kernel untouched). Boundary events (trigger/complete/fail) land in audit_log via `dream_audit`. Default off: `FUSION_MEMORY_DREAM_INTERVAL_SECS` (0 = disabled) / `FUSION_MEMORY_DREAM_PENDING_THRESHOLD`.
+- **LongMemEval-subset CI gate (M4, #41)**: LongMemEval-shaped synthetic corpus (20 needle instances, near-miss adversarial sessions, filler haystack) through the real engine path; dual embedder mode (StubEmbedder CI floor / real bge-m3 live, feature `mlx-live`); committed baseline JSONs + never-below asserts + `FM_LME_UPDATE=1` regeneration. Stub and live both recall@5 1.0 / MRR 1.0 (`docs/benchmarks/longmemeval-subset-2026-11-12.md`).
+
+### Changed
+- `SCHEMA_VERSION` 4 → 5 (memory_fts virtual table + plaintext-row backfill migration).
+- FTS term/punctuation fix recorded in bring-up: trailing punctuation must not glue onto rare terms (see benchmark doc notes).
 
 ## [1.5.1] — 2026-11-07
 

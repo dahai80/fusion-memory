@@ -147,6 +147,18 @@ CREATE INDEX IF NOT EXISTS idx_memory_tenant ON memory_item(tenant, tombstone)";
 pub const INDEX_MEMORY_NAMESPACE: &str = "\
 CREATE INDEX IF NOT EXISTS idx_memory_namespace ON memory_item(namespace, namespace_key, tombstone)";
 
+// M1 #39: FTS5 keyword index over memory_item content (standalone virtual table).
+// trigram tokenizer — substring matching, works for CJK text (unicode61 would only
+// match whole space-delimited tokens, useless for Chinese). mem_id UNINDEXED joins
+// back to memory_item for tenant/namespace/tombstone filtering at query time.
+// B-1 interaction: content is ciphertext (enc:v1:) when field cipher is active —
+// such rows are NOT indexed (backfill skips them, put paths skip them, fts_search
+// returns empty in cipher mode). No plaintext tokens on disk in encrypted deployments.
+pub const MEMORY_FTS_DDL: &str = "\
+CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(\
+content, mem_id UNINDEXED, tokenize='trigram'\
+)";
+
 pub const ALL_DDL: &[&str] = &[
     MEMORY_ITEM_DDL,
     ENTITY_DDL,
@@ -165,6 +177,7 @@ pub const ALL_DDL: &[&str] = &[
     INDEX_MEMORY_VECTOR_REF,
     INDEX_MEMORY_TENANT,
     INDEX_MEMORY_NAMESPACE,
+    MEMORY_FTS_DDL,
 ];
 
 pub const ALL_PRAGMAS: &[&str] = &[PRAGMA_BUSY, PRAGMA_SYNC, PRAGMA_FK];
@@ -176,7 +189,9 @@ pub const ALL_PRAGMAS: &[&str] = &[PRAGMA_BUSY, PRAGMA_SYNC, PRAGMA_FK];
 // v3: #16 加 tenant 列 + idx_memory_tenant 索引 (多租户隔离); 旧库 ALTER TABLE 补列 DEFAULT '' + 补索引。
 // v4: #21 加 namespace/namespace_key 列 + idx_memory_namespace 索引 (作用域命名空间);
 //     旧库 ALTER TABLE 补列 DEFAULT '' + 补索引。
-pub const SCHEMA_VERSION: u32 = 4;
+// v5: #39 加 memory_fts FTS5 虚表 (trigram 关键词路); 旧库迁移时回填全部明文行
+//     (enc:v1: 密文行不索引 — 加密部署不走 FTS, 无明文 token 落盘)。
+pub const SCHEMA_VERSION: u32 = 5;
 
 /// §1.10: 读旧库 user_version。新库/空 PRAGMA 返 0。
 pub fn user_version(conn: &rusqlite::Connection) -> rusqlite::Result<u32> {
@@ -245,6 +260,17 @@ pub fn migrate(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
     // 其余表 + 全部索引 (IF NOT EXISTS 幂等; namespace/tenant 列此时已就位)。
     for ddl in ALL_DDL {
         conn.execute_batch(ddl)?;
+    }
+    // v4 → v5: #39 FTS 回填 — 只索引明文行; 幂等靠 NOT IN (已索引的 mem_id 不重插)。
+    if from < 5 {
+        let n = conn.execute(
+            "INSERT INTO memory_fts(mem_id, content) \
+             SELECT id, content FROM memory_item \
+             WHERE tombstone=0 AND content NOT LIKE 'enc:v1:%' \
+             AND id NOT IN (SELECT mem_id FROM memory_fts)",
+            [],
+        )?;
+        tracing::info!(rows = n, "migrate: backfilled memory_fts (v5)");
     }
     set_user_version(conn, SCHEMA_VERSION)?;
     tracing::info!(from = from, to = SCHEMA_VERSION, "schema migrated");

@@ -63,6 +63,13 @@ source_of_truth:
 | `FUSION_MEMORY_ENC_PASSPHRASE` | unset | argon2id KDF passphrase（二选一 key 源） |
 | `FUSION_MEMORY_WOP_RETENTION` | 不裁剪 | 写操作日志保留上限（调用方侧裁剪） |
 
+## Dreaming 调度（fm-server，issue #40；默认关）
+
+| 环境变量 | 默认 | 用途 |
+|-----|---------|---------|
+| `FUSION_MEMORY_DREAM_INTERVAL_SECS` | `0`（关） | 调度 tick 秒数；`0`/未设 = 完全禁用 dreaming 任务 |
+| `FUSION_MEMORY_DREAM_PENDING_THRESHOLD` | `1` | 触发巩固的最小 pending 实体数 |
+
 ## 注意事项
 
 - 开 HTTP 必须同时设 `FUSION_MEMORY_API_KEY`，否则服务拒绝启动 HTTP。
