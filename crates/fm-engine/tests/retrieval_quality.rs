@@ -12,8 +12,11 @@
 
 use std::collections::HashMap;
 
+use fm_core::namespace::NamespaceFilter;
 use fm_core::{EntityNode, EntityType, MemoryItem, MemoryTier, MemoryType};
-use fm_engine::scoring::{freshness_of, fuse_score, weight_of, GRAPH_HOP_LIMIT};
+use fm_engine::scoring::{
+    freshness_of, fuse_score, fuse_score4, normalize_bm25, weight_of, GRAPH_HOP_LIMIT,
+};
 use fm_graph::affinity::affinity_from_reachability;
 use fm_persist::Persist;
 
@@ -65,6 +68,8 @@ struct Query {
     entity_ids: Vec<String>,
     relevant: Vec<String>,
     topic: usize,
+    /// M1 #39: query 自然文本 (词法臂 FTS5 BM25 用)
+    text: String,
 }
 
 struct Corpus {
@@ -72,6 +77,8 @@ struct Corpus {
     queries: Vec<Query>,
     /// topic -> (fresh ids, stale ids) — 时序有效性检查用
     temporal: Vec<(Vec<String>, Vec<String>)>,
+    /// M1 #39: topic -> lexical-only 相关项 id (向量与 query 无关, 仅词法可召回)
+    lexical: Vec<Vec<String>>,
     persist: Persist,
 }
 
@@ -82,6 +89,8 @@ struct CorpusParams {
     distract_per_topic: usize,
     /// 带 query 实体的主题占比 (其余 query 无实体, graph 臂只作用这部分)
     entity_query_ratio: usize,
+    /// M1 #39: 每主题 lexical-only 相关项数 (语义路必然漏, 只能 BM25 找回)
+    lexical_per_topic: usize,
 }
 
 fn gate_params() -> CorpusParams {
@@ -92,6 +101,7 @@ fn gate_params() -> CorpusParams {
         distract_per_topic: 3,
         // 每隔 2 个主题 1 个带实体 query → 50% query 携带实体
         entity_query_ratio: 2,
+        lexical_per_topic: 2,
     }
 }
 
@@ -102,6 +112,7 @@ fn full_params() -> CorpusParams {
         stale_per_topic: 5,
         distract_per_topic: 3,
         entity_query_ratio: 2,
+        lexical_per_topic: 2,
     }
 }
 
@@ -124,6 +135,7 @@ fn mk_item(
     created: u64,
     access: u64,
     entities: Vec<EntityNode>,
+    content: &str,
 ) -> MemoryItem {
     let mut m = MemoryItem::new_turn_skeleton(
         id.into(),
@@ -132,7 +144,7 @@ fn mk_item(
         "rq-session".into(),
         String::new(),
         mt,
-        format!("content of {id}"),
+        content.into(),
         created,
     );
     m.tier = MemoryTier::Short;
@@ -145,11 +157,15 @@ fn mk_item(
 
 /// 构造合成语料。
 ///
-/// 主题 t: 基向量 b_t + 2 实体 (e1_t, e2_t, 库内 relation 边 e1_t-e2_t)。
-///   fresh (相关): created 近 12h, 带主题实体, access 0..3
-///   stale (干扰): 同主题同词 (高 cosine) 但 created 30-60 天前 (过时版本), 无实体
+/// 主题 t: 基向量 b_t + 2 实体 (e1_t, e2_t, 库内 relation 边 e1_t-e2_t) + 词法代号 kw_t。
+///   fresh (相关): created 近 12h, 带主题实体, access 0..3, content 含 kw_t
+///   stale (干扰): 同主题 (高 cosine) 但 created 30-60 天前 (过时版本), 无实体,
+///                 content 不含 kw_t (旧版本用旧代号 — 词法路不替 stale 加权)
 ///   distract (干扰): 0.8*b_t + 0.6*b_(t+1) 混合 (cosine 混淆), 实体来自无关主题
-/// query: 0.9*b_t + 噪声; 相关 = fresh ids; 偶数主题 query 携带主题实体。
+///   lexical (M1 #39, 相关): 向量取无关主题 (语义路必然漏), content 含 kw_t —
+///                 只能被 FTS5 词法臂找回, 专有名词/代号类 case 的结构化复刻
+/// query: 0.9*b_t + 噪声, text 含 kw_t; 相关 = fresh + lexical ids; 偶数主题带实体。
+/// 全部候选 put_memory 落库 (FTS5 索引随写路径同步)。
 fn build_corpus(p: &CorpusParams) -> Corpus {
     let mut rng = Rng::new(SEED);
     let persist = Persist::open_in_memory().expect("in-memory persist");
@@ -157,15 +173,18 @@ fn build_corpus(p: &CorpusParams) -> Corpus {
     let mut candidates: Vec<Candidate> = Vec::new();
     let mut queries: Vec<Query> = Vec::new();
     let mut temporal: Vec<(Vec<String>, Vec<String>)> = Vec::new();
+    let mut lexical: Vec<Vec<String>> = Vec::new();
 
-    // 主题基向量 + 实体 + 图边
+    // 主题基向量 + 实体 + 图边 + 词法代号
     let mut bases = Vec::with_capacity(p.n_topics);
     let mut topic_entities = Vec::with_capacity(p.n_topics);
+    let mut topic_kws = Vec::with_capacity(p.n_topics);
     for t in 0..p.n_topics {
         bases.push(unit_vec(&mut rng));
         let e1 = format!("ent-{t}-a");
         let e2 = format!("ent-{t}-b");
         topic_entities.push((e1.clone(), e2.clone()));
+        topic_kws.push(format!("zxkw{t:03}"));
         // 主题内实体关系边 (graph 亲和来源)
         persist
             .put_relation(&e1, &e2, "co_occurs", 1.0, 1, NOW)
@@ -186,10 +205,11 @@ fn build_corpus(p: &CorpusParams) -> Corpus {
 
     for t in 0..p.n_topics {
         let base = &bases[t];
+        let kw = &topic_kws[t];
         let mut fresh_ids = Vec::new();
         let mut stale_ids = Vec::new();
 
-        // fresh 相关: 近 12h 创建, 带主题实体
+        // fresh 相关: 近 12h 创建, 带主题实体, content 含主题代号
         for _ in 0..p.fresh_per_topic {
             let id = next_id("fresh");
             let noise: Vec<f32> = (0..DIM).map(|_| rng.normal() as f32 * 0.15).collect();
@@ -208,14 +228,20 @@ fn build_corpus(p: &CorpusParams) -> Corpus {
                 EntityNode::new(e1.clone(), e1.clone(), EntityType::Tech),
                 EntityNode::new(e2.clone(), e2.clone(), EntityType::Tech),
             ];
-            candidates.push(Candidate {
-                item: mk_item(&id, mt, created, access, entities),
-                vector: v,
-            });
+            let item = mk_item(
+                &id,
+                mt,
+                created,
+                access,
+                entities,
+                &format!("record {kw} operational note topic {t}"),
+            );
+            persist.put_memory(&item).expect("put fresh");
+            candidates.push(Candidate { item, vector: v });
             fresh_ids.push(id);
         }
 
-        // stale 干扰: 同主题同词 (高 cosine), 30-60 天前 (过时版本), 无实体
+        // stale 干扰: 同主题 (高 cosine), 30-60 天前 (过时版本), 无实体, 无新代号
         for _ in 0..p.stale_per_topic {
             let id = next_id("stale");
             let noise: Vec<f32> = (0..DIM).map(|_| rng.normal() as f32 * 0.15).collect();
@@ -228,11 +254,16 @@ fn build_corpus(p: &CorpusParams) -> Corpus {
             );
             let created = NOW - (30.0 * DAY as f64 + rng.next_f64() * 30.0 * DAY as f64) as u64;
             let access = rng.next_u64() % 2;
-            candidates.push(Candidate {
-                // 过时条目多为 Episodic (τ=1d, 衰减最狠)
-                item: mk_item(&id, MemoryType::Episodic, created, access, Vec::new()),
-                vector: v,
-            });
+            let item = mk_item(
+                &id,
+                MemoryType::Episodic,
+                created,
+                access,
+                Vec::new(),
+                &format!("outdated record note topic {t}"),
+            );
+            persist.put_memory(&item).expect("put stale");
+            candidates.push(Candidate { item, vector: v });
             stale_ids.push(id);
         }
 
@@ -258,15 +289,50 @@ fn build_corpus(p: &CorpusParams) -> Corpus {
             let wrong_topic = (t + 2) % p.n_topics;
             let (e1, _) = &topic_entities[wrong_topic];
             let entities = vec![EntityNode::new(e1.clone(), e1.clone(), EntityType::Tech)];
-            candidates.push(Candidate {
-                item: mk_item(&id, MemoryType::Semantic, created, 0, entities),
-                vector: v,
-            });
+            let item = mk_item(
+                &id,
+                MemoryType::Semantic,
+                created,
+                0,
+                entities,
+                &format!("record {} mixed note", topic_kws[wrong_topic]),
+            );
+            persist.put_memory(&item).expect("put distract");
+            candidates.push(Candidate { item, vector: v });
+        }
+
+        // M1 #39 lexical 相关: 向量取无关主题 (语义路必然漏), content 含主题代号
+        let mut lex_ids = Vec::new();
+        for _ in 0..p.lexical_per_topic {
+            let id = next_id("lex");
+            let far_base = &bases[(t + 7) % p.n_topics];
+            let noise: Vec<f32> = (0..DIM).map(|_| rng.normal() as f32 * 0.15).collect();
+            let v = normalize(
+                far_base
+                    .iter()
+                    .zip(noise.iter())
+                    .map(|(b, n)| b + n)
+                    .collect::<Vec<f32>>()
+                    .as_slice(),
+            );
+            let created = NOW - (rng.next_f64() * 24.0 * HOUR as f64) as u64;
+            let item = mk_item(
+                &id,
+                MemoryType::Semantic,
+                created,
+                0,
+                Vec::new(),
+                &format!("codename {kw} referenced in field log"),
+            );
+            persist.put_memory(&item).expect("put lexical");
+            candidates.push(Candidate { item, vector: v });
+            lex_ids.push(id);
         }
 
         temporal.push((fresh_ids.clone(), stale_ids));
+        lexical.push(lex_ids);
 
-        // query: 0.9*b_t + 噪声; 相关 = fresh; 偶数主题带实体
+        // query: 0.9*b_t + 噪声, text 含主题代号; 相关 = fresh + lexical; 偶数主题带实体
         let qnoise: Vec<f32> = (0..DIM).map(|_| rng.normal() as f32 * 0.12).collect();
         let qv = normalize(
             base.iter()
@@ -281,11 +347,15 @@ fn build_corpus(p: &CorpusParams) -> Corpus {
         } else {
             Vec::new()
         };
+        let text = format!("codename {kw}");
+        let mut relevant = fresh_ids.clone();
+        relevant.extend(lexical[t].clone());
         queries.push(Query {
             vector: qv,
             entity_ids,
-            relevant: fresh_ids,
+            relevant,
             topic: t,
+            text,
         });
     }
 
@@ -293,6 +363,7 @@ fn build_corpus(p: &CorpusParams) -> Corpus {
         candidates,
         queries,
         temporal,
+        lexical,
         persist,
     }
 }
@@ -307,6 +378,8 @@ enum Arm {
     FullFusion,
     /// #25 裁定证据: retune 前的原始 W(t) 融合 (含 w0 类型差), 已弃用 — 仅作对照记录。
     FusionRawW,
+    /// M1 #39: 四路融合 cosine+BM25+graph+freshness (0.4/0.3/0.2/0.1), 生产主路径。
+    FourWay,
 }
 
 impl Arm {
@@ -317,6 +390,7 @@ impl Arm {
             Arm::CosineGraph => "cosine+graph",
             Arm::FullFusion => "full fusion",
             Arm::FusionRawW => "fusion raw-W (pre-retune, deprecated)",
+            Arm::FourWay => "four-way (M1)",
         }
     }
 }
@@ -335,6 +409,17 @@ fn rank_query(
     arm: Arm,
     reachable_cache: &HashMap<String, Vec<(String, usize)>>,
 ) -> Vec<String> {
+    // M1 #39 词法臂: 真实 FTS5 BM25 (语料已 put_memory 落库), 归一化 [0,1]
+    let bm25_map: HashMap<String, f64> = match arm {
+        Arm::FourWay => {
+            let hits = corpus
+                .persist
+                .fts_search(&q.text, 10_000, "", &NamespaceFilter::default())
+                .expect("fts_search");
+            normalize_bm25(&hits)
+        }
+        _ => HashMap::new(),
+    };
     // graph 臂: 预计算 query 实体可达集 (cache 跨候选复用)
     let mut scored: Vec<(f64, &str)> = corpus
         .candidates
@@ -350,11 +435,13 @@ fn rank_query(
                 Arm::PlainCosine | Arm::CosineDecay => 0.0,
                 _ => affinity_for(&q.entity_ids, &c.item, reachable_cache),
             };
+            let bm = bm25_map.get(c.item.id.as_str()).copied().unwrap_or(0.0);
             let score = match arm {
                 Arm::PlainCosine => cos,
                 Arm::CosineDecay => fuse_score(cos, w, 0.0),
                 Arm::CosineGraph => fuse_score(cos, 0.0, aff),
                 Arm::FullFusion | Arm::FusionRawW => fuse_score(cos, w, aff),
+                Arm::FourWay => fuse_score4(cos, bm, aff, w),
             };
             (score, c.item.id.as_str())
         })
@@ -460,6 +547,7 @@ fn run_ablation(params: &CorpusParams) -> (Vec<(Arm, Metrics)>, Corpus) {
         Arm::CosineGraph,
         Arm::FullFusion,
         Arm::FusionRawW,
+        Arm::FourWay,
     ];
     let results: Vec<(Arm, Metrics)> = arms
         .iter()
@@ -534,6 +622,82 @@ fn ablation_full_fusion_never_below_plain_cosine() {
         graph.recall5 >= plain.recall5 - 1e-9,
         "graph 臂拖后腿: {graph:?} vs {plain:?}"
     );
+}
+
+/// M1 #39 gate: 四路 ≥ 三路 ≥ 纯 cosine (recall@5 / nDCG@10 / MRR, evolution plan §2.1)。
+#[test]
+fn ablation_four_way_never_below() {
+    let params = gate_params();
+    let (results, _corpus) = run_ablation(&params);
+
+    let four = metrics_of(&results, Arm::FourWay);
+    let three = metrics_of(&results, Arm::FullFusion);
+    let plain = metrics_of(&results, Arm::PlainCosine);
+
+    assert!(
+        four.recall5 >= three.recall5 - 1e-9,
+        "four-way recall@5 {four:?} < three-way {three:?}"
+    );
+    assert!(
+        three.recall5 >= plain.recall5 - 1e-9,
+        "three-way recall@5 {three:?} < plain {plain:?}"
+    );
+    assert!(
+        four.ndcg10 >= three.ndcg10 - 1e-9,
+        "four-way nDCG@10 {four:?} < three-way {three:?}"
+    );
+    assert!(
+        four.mrr >= three.mrr - 1e-9,
+        "four-way MRR {four:?} < three-way {three:?}"
+    );
+    // 词法路存在性: 语料含 lexical-only 相关项, 四路必须严格优于纯 cosine
+    assert!(
+        four.recall5 > plain.recall5,
+        "four-way recall@5 {four:?} 未超 plain {plain:?} — BM25 臂未生效"
+    );
+}
+
+/// M1 #39 词法命中专测: 专有名词/代号 case — 语义路必然漏 (向量无关),
+/// 四路经 FTS5 BM25 找回。逐 query 统计 top-10 内 lexical 命中率对比
+/// (top-5 已被同主题 fresh 相关项占满, 词法增益体现在 top-10 窗口)。
+#[test]
+fn lexical_hits_recovered_by_four_way() {
+    let params = gate_params();
+    let (results, corpus) = run_ablation(&params);
+    let cache = build_reachable_cache(&corpus);
+
+    let mut four_recovered = 0usize;
+    let mut plain_recovered = 0usize;
+    let n = corpus.queries.len();
+    for q in &corpus.queries {
+        let lex: std::collections::HashSet<&str> =
+            corpus.lexical[q.topic].iter().map(|s| s.as_str()).collect();
+        let has_lex_top10 = |arm: Arm| -> bool {
+            rank_query(&corpus, q, arm, &cache)
+                .iter()
+                .take(10)
+                .any(|id| lex.contains(id.as_str()))
+        };
+        if has_lex_top10(Arm::FourWay) {
+            four_recovered += 1;
+        }
+        if has_lex_top10(Arm::PlainCosine) {
+            plain_recovered += 1;
+        }
+    }
+    println!(
+        "\nlexical recovery: four-way {four_recovered}/{n}, plain cosine {plain_recovered}/{n}"
+    );
+    assert!(
+        four_recovered as f64 >= 0.9 * n as f64,
+        "four-way lexical recovery 仅 {four_recovered}/{n}"
+    );
+    assert!(
+        four_recovered > plain_recovered,
+        "four-way {four_recovered} 未超 plain {plain_recovered} — 词法增益非噪声"
+    );
+    // 表格里也带上四路指标 (bench 记录用)
+    print_table(&params, &results);
 }
 
 /// 时序有效性: 同主题 fresh vs stale 竞争, decay 应把 fresh 排前面。

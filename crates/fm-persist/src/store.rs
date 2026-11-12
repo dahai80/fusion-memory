@@ -169,6 +169,18 @@ impl Persist {
                 params![item.id, e.id],
             )?;
         }
+        // #39: FTS5 keyword index sync (plaintext mode only — cipher mode leaves no
+        // plaintext tokens on disk, B-1 field encryption stays airtight).
+        // DELETE-then-INSERT keeps the index correct on re-put (merge overwrite).
+        if self.cipher.is_none() {
+            tx.execute("DELETE FROM memory_fts WHERE mem_id=?1", params![item.id])?;
+            if !item.tombstone {
+                tx.execute(
+                    "INSERT INTO memory_fts(mem_id, content) VALUES(?1,?2)",
+                    params![item.id, item.content],
+                )?;
+            }
+        }
         tx.commit()?;
         Ok(())
     }
@@ -228,6 +240,16 @@ impl Persist {
                 "INSERT OR IGNORE INTO memory_entity(memory_id,entity_id) VALUES(?1,?2)",
                 params![item.id, e.id],
             )?;
+        }
+        // #39: FTS5 keyword index sync (same plaintext-only rule as put_memory).
+        if self.cipher.is_none() {
+            tx.execute("DELETE FROM memory_fts WHERE mem_id=?1", params![item.id])?;
+            if !item.tombstone {
+                tx.execute(
+                    "INSERT INTO memory_fts(mem_id, content) VALUES(?1,?2)",
+                    params![item.id, item.content],
+                )?;
+            }
         }
         tx.execute(
             "INSERT INTO wop_log(op,payload,at) VALUES(?1,?2,?3)",
@@ -375,6 +397,102 @@ impl Persist {
         );
         let mut stmt = conn.prepare(&sql)?;
         let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = refs_str
+            .iter()
+            .map(|s| Box::new(s.clone()) as Box<dyn rusqlite::ToSql>)
+            .collect();
+        params_vec.push(Box::new(tenant.to_string()));
+        params_vec.extend(
+            ns_params
+                .into_iter()
+                .map(|s| Box::new(s) as Box<dyn rusqlite::ToSql>),
+        );
+        let params_refs: Vec<&dyn rusqlite::ToSql> =
+            params_vec.iter().map(|p| p.as_ref()).collect();
+        let rows = stmt.query_map(params_refs.as_slice(), |r| {
+            row_to_memory(r, self.cipher.as_ref())
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// M1 #39: FTS5 keyword search (BM25). Returns (mem_id, bm25_rank) pairs ordered
+    /// best-first (rank ASC — bm25() returns negative values, more negative = better).
+    /// Cipher mode returns empty (no plaintext token index on disk, B-1).
+    /// Terms shorter than 3 chars are dropped (trigram tokenizer minimum).
+    pub fn fts_search(
+        &self,
+        query: &str,
+        limit: usize,
+        tenant: &str,
+        ns: &NamespaceFilter,
+    ) -> PersistResult<Vec<(String, f64)>> {
+        if self.cipher.is_some() {
+            tracing::debug!("fts_search skipped: field cipher active (B-1, no plaintext index)");
+            return Ok(Vec::new());
+        }
+        let terms = fts_terms(query);
+        if terms.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn()?;
+        let match_q = terms.join(" OR ");
+        // placeholder layout: ?1 match, ?2 tenant, ns keys from ?3, LIMIT last
+        let ns_start = 3usize;
+        let (pred, ns_params) = ns_predicate(ns, ns_start)?;
+        let limit_pos = ns_start + ns_params.len();
+        let sql = format!(
+            "SELECT f.mem_id, bm25(memory_fts) \
+             FROM memory_fts f JOIN memory_item m ON m.id=f.mem_id \
+             WHERE memory_fts MATCH ?1 AND m.tombstone=0 AND m.tenant=?2{pred} \
+             ORDER BY 2 ASC LIMIT ?{limit_pos}"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> =
+            vec![Box::new(match_q.clone()), Box::new(tenant.to_string())];
+        params_vec.extend(
+            ns_params
+                .into_iter()
+                .map(|s| Box::new(s) as Box<dyn rusqlite::ToSql>),
+        );
+        params_vec.push(Box::new(limit as i64));
+        let params_refs: Vec<&dyn rusqlite::ToSql> =
+            params_vec.iter().map(|p| p.as_ref()).collect();
+        let rows = stmt.query_map(params_refs.as_slice(), |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        tracing::debug!(hits = out.len(), terms = %match_q, "fts_search done");
+        Ok(out)
+    }
+
+    /// M1 #39: tenant + namespace scoped load by primary id set (FTS hit backfill).
+    pub fn get_by_ids_tenant_scoped(
+        &self,
+        ids: &[String],
+        tenant: &str,
+        ns: &NamespaceFilter,
+    ) -> PersistResult<Vec<MemoryItem>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn()?;
+        let placeholders = (0..ids.len())
+            .map(|i| format!("?{}", i + 1))
+            .collect::<Vec<_>>()
+            .join(",");
+        let tenant_pos = ids.len() + 1;
+        let (pred, ns_params) = ns_predicate(ns, tenant_pos + 1)?;
+        let sql = format!(
+            "SELECT * FROM memory_item WHERE tombstone=0 AND tenant=?{tenant_pos}{pred} AND id IN ({placeholders})"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = ids
             .iter()
             .map(|s| Box::new(s.clone()) as Box<dyn rusqlite::ToSql>)
             .collect();
@@ -987,6 +1105,18 @@ ORDER BY first_hop ASC LIMIT ?3";
         Ok(())
     }
 
+    /// M2 #40: pending 实体抽取行数 (entities_pending=1, 未 tombstone)。
+    /// dreaming 调度触发条件的数据源。
+    pub fn count_pending(&self) -> PersistResult<u64> {
+        let conn = self.conn()?;
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM memory_item WHERE entities_pending=1 AND tombstone=0",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(n as u64)
+    }
+
     /// P1-3: 追加审计日志 (核心路径 who/when/what)。失败仅 warn 不阻断核心路径。
     pub fn append_audit(
         &self,
@@ -1111,6 +1241,32 @@ fn ns_predicate(ns: &NamespaceFilter, base: usize) -> PersistResult<(String, Vec
     Ok((pred, key_params))
 }
 
+/// M1 #39: build FTS5 MATCH expression from free text.
+/// Two term tracks per whitespace token: the raw token (punctuated forms like
+/// "QF-7" are exactly the codenames the keyword path targets) AND its
+/// alphanumeric runs ("lab-router?" trailing punctuation must not glue onto the
+/// rare term and starve the BM25 arm). Terms <3 chars dropped — trigram minimum.
+/// Terms are double-quoted (FTS5 string syntax) and joined with OR, deduped.
+/// Empty result = caller should skip the FTS arm.
+fn fts_terms(query: &str) -> Vec<String> {
+    let mut terms: Vec<String> = Vec::new();
+    for tok in query.split_whitespace() {
+        let tok = tok.trim_matches('"');
+        if tok.chars().count() >= 3 && !terms.contains(&tok.to_string()) {
+            terms.push(tok.to_string());
+        }
+        for part in tok.split(|c: char| !c.is_alphanumeric()) {
+            if part.chars().count() >= 3 && !terms.iter().any(|t| t == part) {
+                terms.push(part.to_string());
+            }
+        }
+    }
+    terms
+        .into_iter()
+        .map(|t| format!("\"{}\"", t.replace('"', "\"\"")))
+        .collect()
+}
+
 fn row_to_memory(
     row: &rusqlite::Row,
     cipher: Option<&crate::crypto::Cipher>,
@@ -1197,6 +1353,139 @@ mod tests {
         );
         m.tier = MemoryTier::Short;
         m
+    }
+
+    fn item_with_content(id: &str, content: &str) -> MemoryItem {
+        let mut m = MemoryItem::new_turn_skeleton(
+            id.into(),
+            format!("ix-{id}"),
+            0,
+            "sess-1".into(),
+            String::new(),
+            MemoryType::Semantic,
+            content.into(),
+            1_000,
+        );
+        m.tier = MemoryTier::Short;
+        m
+    }
+
+    // M1 #39: FTS5 keyword path — English token hit.
+    #[test]
+    fn fts_search_hits_english_token() {
+        let p = Persist::open_in_memory().unwrap();
+        p.put_memory(&item_with_content("f1", "deploy the kubernetes cluster"))
+            .unwrap();
+        p.put_memory(&item_with_content("f2", "buy groceries tomorrow"))
+            .unwrap();
+        let hits = p
+            .fts_search("kubernetes", 10, "", &NamespaceFilter::default())
+            .unwrap();
+        assert_eq!(hits.len(), 1, "only f1 matches: {hits:?}");
+        assert_eq!(hits[0].0, "f1");
+        let items = p
+            .get_by_ids_tenant_scoped(&["f1".into()], "", &NamespaceFilter::default())
+            .unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].id, "f1");
+    }
+
+    // M1 #39: trigram tokenizer — CJK substring match (unicode61 would miss this).
+    // Known limit: terms <3 chars cannot trigram-match (trigram minimum); short common
+    // words stay covered by the semantic path. Keyword path targets codenames/long terms.
+    #[test]
+    fn fts_search_hits_cjk_substring() {
+        let p = Persist::open_in_memory().unwrap();
+        p.put_memory(&item_with_content("c1", "熔断器 QF-7 部署在机架A3"))
+            .unwrap();
+        p.put_memory(&item_with_content("c2", "完全无关的内容"))
+            .unwrap();
+        let hits = p
+            .fts_search("QF-7", 10, "", &NamespaceFilter::default())
+            .unwrap();
+        assert_eq!(hits.len(), 1, "CJK/codename substring hit: {hits:?}");
+        assert_eq!(hits[0].0, "c1");
+        // 3-char CJK substring
+        let hits2 = p
+            .fts_search("机架A3", 10, "", &NamespaceFilter::default())
+            .unwrap();
+        assert_eq!(hits2.len(), 1);
+        assert_eq!(hits2[0].0, "c1");
+        let hits3 = p
+            .fts_search("熔断器", 10, "", &NamespaceFilter::default())
+            .unwrap();
+        assert_eq!(hits3.len(), 1);
+        assert_eq!(hits3[0].0, "c1");
+    }
+
+    // M1 #39: terms <3 chars are dropped (trigram minimum) — no crash, no bogus hits.
+    #[test]
+    fn fts_search_drops_short_terms() {
+        let p = Persist::open_in_memory().unwrap();
+        p.put_memory(&item_with_content("s1", "ab cd efgh"))
+            .unwrap();
+        let hits = p
+            .fts_search("ab", 10, "", &NamespaceFilter::default())
+            .unwrap();
+        assert!(hits.is_empty(), "2-char term cannot trigram-match");
+    }
+
+    // M1 #39: tombstoned rows are filtered at query time (index row remains, join filters).
+    #[test]
+    fn fts_search_excludes_tombstoned() {
+        let p = Persist::open_in_memory().unwrap();
+        p.put_memory(&item_with_content("t1", "unique codename zx-99"))
+            .unwrap();
+        p.tombstone_memory("t1").unwrap();
+        let hits = p
+            .fts_search("zx-99", 10, "", &NamespaceFilter::default())
+            .unwrap();
+        assert!(hits.is_empty(), "tombstoned row must not match: {hits:?}");
+    }
+
+    // M1 #39: tenant scoping — tenant A keyword hit must not leak tenant B rows.
+    #[test]
+    fn fts_search_tenant_scoped() {
+        let p = Persist::open_in_memory().unwrap();
+        let mut a = item_with_content("ta", "shared keyword alphabravo");
+        a.tenant = "tenant-a".into();
+        let mut b = item_with_content("tb", "shared keyword alphabravo");
+        b.tenant = "tenant-b".into();
+        p.put_memory(&a).unwrap();
+        p.put_memory(&b).unwrap();
+        let hits = p
+            .fts_search("alphabravo", 10, "tenant-a", &NamespaceFilter::default())
+            .unwrap();
+        assert_eq!(hits.len(), 1, "tenant scope enforced: {hits:?}");
+        assert_eq!(hits[0].0, "ta");
+    }
+
+    // M1 #39 + B-1: cipher mode leaves NO plaintext token index — fts_search returns
+    // empty and new puts skip the FTS table entirely.
+    #[test]
+    fn fts_disabled_under_field_cipher() {
+        let cipher = crate::crypto::Cipher::from_raw([7u8; 32]);
+        let p = Persist::open_in_memory()
+            .expect("open")
+            .with_cipher(Some(cipher));
+        p.put_memory(&item_with_content("e1", "secret codename zx-42"))
+            .unwrap();
+        let hits = p
+            .fts_search("zx-42", 10, "", &NamespaceFilter::default())
+            .unwrap();
+        assert!(hits.is_empty(), "cipher mode: no keyword path");
+        // raw table must be empty — no plaintext tokens at rest
+        let n: i64 = p
+            .conn()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM memory_fts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0, "no plaintext FTS rows under cipher");
+        // and retrieval by id still decrypts fine
+        assert_eq!(
+            p.get_memory("e1").unwrap().unwrap().content,
+            "secret codename zx-42"
+        );
     }
 
     #[test]
@@ -1605,7 +1894,7 @@ mod tests {
                 .unwrap();
             c.execute_batch("PRAGMA user_version=3").unwrap();
             schema::migrate(&c).unwrap();
-            assert_eq!(schema::user_version(&c).unwrap(), 4);
+            assert_eq!(schema::user_version(&c).unwrap(), schema::SCHEMA_VERSION);
             let n: i64 = c
                 .query_row(
                     "SELECT COUNT(*) FROM pragma_table_info('memory_item') WHERE name IN ('namespace','namespace_key')",

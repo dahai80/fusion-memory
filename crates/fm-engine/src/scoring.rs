@@ -12,6 +12,13 @@ pub const ALPHA: f64 = 0.5; // cosine
 pub const BETA: f64 = 0.3; // 衰减 W(t)
 pub const GAMMA: f64 = 0.2; // graph_affinity
 
+// M1 #39: 四路融合权重 (evolution plan §2.1)。cosine 0.4 / bm25 0.3 / graph 0.2 / freshness 0.1。
+// 三路 fuse_score (α/β/γ) 保留作消融对照臂, 生产检索走 fuse_score4。
+pub const W4_COSINE: f64 = 0.4;
+pub const W4_BM25: f64 = 0.3;
+pub const W4_GRAPH: f64 = 0.2;
+pub const W4_FRESHNESS: f64 = 0.1;
+
 pub const GRAPH_HOP_LIMIT: usize = 2;
 
 /// θ_drop: W(t) < 此值 → consolidate 回收 (tombstone)。
@@ -26,6 +33,32 @@ pub const EPISODIC_RECALL_WINDOW_SECS: u64 = 7 * 86400;
 /// graph_affinity 由 caller 预算传入 (避免本函数依赖 Persist)。
 pub fn fuse_score(cosine: f64, w_t: f64, graph_aff: f64) -> f64 {
     ALPHA * cosine + BETA * w_t + GAMMA * graph_aff
+}
+
+/// M1 #39: 四路融合评分。bm25 为调用方归一化后的 [0,1] 词法分 (normalize_bm25)。
+pub fn fuse_score4(cosine: f64, bm25: f64, graph_aff: f64, freshness: f64) -> f64 {
+    W4_COSINE * cosine + W4_BM25 * bm25 + W4_GRAPH * graph_aff + W4_FRESHNESS * freshness
+}
+
+/// M1 #39: 归一化 fts_search 的 BM25 rank 到 [0,1]。输入按 best-first 排序
+/// (rank ASC, 越负越好)。best=1.0, worst=0.0, 线性内插; 单命中=1.0; 空输入返空 map。
+pub fn normalize_bm25(ranks: &[(String, f64)]) -> std::collections::HashMap<String, f64> {
+    let mut out = std::collections::HashMap::with_capacity(ranks.len());
+    if ranks.is_empty() {
+        return out;
+    }
+    let best = ranks[0].1;
+    let worst = ranks[ranks.len() - 1].1;
+    let span = worst - best;
+    for (id, r) in ranks {
+        let norm = if span.abs() < 1e-12 {
+            1.0
+        } else {
+            (worst - r) / span
+        };
+        out.insert(id.clone(), norm);
+    }
+    out
 }
 
 /// 算某 MemoryItem 当前 W(t)。t = now - created_timestamp。
@@ -80,6 +113,31 @@ pub fn score_candidate(
     };
     let score = fuse_score(cosine, w_t, graph_aff);
     debug!(cosine, w_t, graph_aff, score, "candidate scored");
+    Ok(score)
+}
+
+/// M1 #39: 四路评分 (检索主路径)。bm25 由 caller 从 fts_search+normalize_bm25 得出,
+/// 候选未命中词路时传 0.0。graph_affinity 逻辑与三路版相同。
+pub fn score_candidate4(
+    store: &dyn GraphStore,
+    cosine: f64,
+    bm25: f64,
+    item: &MemoryItem,
+    query_entity_ids: &[String],
+    now: u64,
+) -> GraphResult<f64> {
+    let freshness = freshness_of(item, now);
+    let cand_ids = entity_ids(&item.entities);
+    let graph_aff = if query_entity_ids.is_empty() || cand_ids.is_empty() {
+        0.0
+    } else {
+        fm_graph::graph_affinity(store, query_entity_ids, &cand_ids, GRAPH_HOP_LIMIT)?
+    };
+    let score = fuse_score4(cosine, bm25, graph_aff, freshness);
+    debug!(
+        cosine,
+        bm25, graph_aff, freshness, score, "candidate scored (four-way)"
+    );
     Ok(score)
 }
 
@@ -142,6 +200,36 @@ mod tests {
         assert!((s - 1.0).abs() < 1e-9, "全 1.0 → 1.0");
         let s2 = fuse_score(0.8, 0.0, 0.0);
         assert!((s2 - 0.4).abs() < 1e-9, "纯 cosine 0.8 → 0.4");
+    }
+
+    #[test]
+    fn fuse_score4_weights() {
+        // #39: 全 1.0 → 权重和 1.0
+        let s = fuse_score4(1.0, 1.0, 1.0, 1.0);
+        assert!((s - 1.0).abs() < 1e-9, "四路全 1.0 → 1.0");
+        // 纯词法命中 (FTS-only candidate, cosine=0): 0.3*1 + 0.1*fresh
+        let s2 = fuse_score4(0.0, 1.0, 0.0, 0.5);
+        assert!((s2 - 0.35).abs() < 1e-9, "bm25=1 fresh=0.5 → 0.35");
+    }
+
+    #[test]
+    fn normalize_bm25_best_first() {
+        let ranks = vec![
+            ("a".to_string(), -7.5),
+            ("b".to_string(), -4.5),
+            ("c".to_string(), -1.5),
+        ];
+        let m = normalize_bm25(&ranks);
+        assert!((m["a"] - 1.0).abs() < 1e-9, "best → 1.0");
+        assert!((m["c"] - 0.0).abs() < 1e-9, "worst → 0.0");
+        assert!((m["b"] - 0.5).abs() < 1e-9, "mid → 0.5");
+    }
+
+    #[test]
+    fn normalize_bm25_single_and_empty() {
+        let m1 = normalize_bm25(&[("x".to_string(), -3.0)]);
+        assert!((m1["x"] - 1.0).abs() < 1e-9, "单命中 → 1.0");
+        assert!(normalize_bm25(&[]).is_empty(), "空输入 → 空 map");
     }
 
     #[test]

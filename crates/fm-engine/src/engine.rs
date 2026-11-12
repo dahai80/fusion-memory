@@ -56,6 +56,25 @@ pub struct MemoryEngine {
     /// (gateway X-Fusion-Tenant), 此字段用于无 interaction 的内部路径 (summarize/consolidate/
     /// retrieve/scope/count)。空 = 默认租户 (单租户向后兼容)。fm-server 按请求租户重建引擎。
     tenant: String,
+    /// M2 #40: 在飞请求计数 (retrieve/commit 窗口)。dreaming 调度空闲判定用:
+    /// inflight==0 才允许触发后台巩固。RAII guard 进入 +1 / drop -1。
+    inflight: std::sync::atomic::AtomicUsize,
+}
+
+/// M2 #40: 在飞请求 RAII guard。构造 +1, drop -1, early-return / 错误路径均不漏计。
+struct InflightGuard<'a>(&'a std::sync::atomic::AtomicUsize);
+
+impl InflightGuard<'_> {
+    fn enter(c: &std::sync::atomic::AtomicUsize) -> InflightGuard<'_> {
+        c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        InflightGuard(c)
+    }
+}
+
+impl Drop for InflightGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 impl MemoryEngine {
@@ -76,6 +95,29 @@ impl MemoryEngine {
             stale_flag: std::sync::atomic::AtomicBool::new(false),
             last_sync_at: std::sync::atomic::AtomicU64::new(0),
             tenant: String::new(),
+            inflight: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// M2 #40: 当前在飞 retrieve/commit 请求数 (dreaming 空闲判定)。
+    pub fn inflight_count(&self) -> usize {
+        self.inflight.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// M2 #40: pending 实体抽取增量 (entities_pending=1 且未 tombstone 的行数)。
+    /// dreaming 触发条件 = 此值达到阈值。
+    pub fn pending_count(&self) -> fm_core::MemoryResult<u64> {
+        self.persist
+            .count_pending()
+            .map_err(|e| fm_core::MemoryError::Store(e.to_string()))
+    }
+
+    /// M2 #40: dreaming 边界审计 (触发/跳过/完成/失败)。actor="dream", 与巩固自身
+    /// 写入的 audit 条目互不重叠。非致命: 失败 warn 不阻塞主流程。
+    pub fn dream_audit(&self, action: &str, detail: &str) {
+        let now = Self::now_ms();
+        if let Err(e) = self.persist.append_audit(now, "dream", action, "-", detail) {
+            tracing::warn!(error = %e, "dream audit append failed, non-fatal");
         }
     }
 
@@ -650,6 +692,8 @@ impl MemoryEngine {
         session_id: &str,
         interaction: &Interaction,
     ) -> fm_core::MemoryResult<fm_core::CommitOutcome> {
+        // M2 #40: 在飞计数 — dreaming 空闲判定窗口
+        let _inflight = InflightGuard::enter(&self.inflight);
         let mut ids = Vec::with_capacity(interaction.turns.len());
         let mut failed_turns: Vec<fm_core::TurnFailure> = Vec::new();
         let now = Self::now_ms();
@@ -1059,6 +1103,8 @@ impl fm_core::FusionMemoryEngine for MemoryEngine {
         &self,
         query: &RetrieveQuery,
     ) -> fm_core::MemoryResult<FormattedContext> {
+        // M2 #40: 在飞计数 — dreaming 空闲判定窗口
+        let _inflight = InflightGuard::enter(&self.inflight);
         let now = Self::now_ms();
         // L1: 抽 query 实体 → 传 score_candidate 接通 graph_affinity (γ=0.2, PRD §6.4)。
         // 有 extractor 则抽, 无则空 (graph_aff=0, 退化为二因子, 落 debug 留痕)。
@@ -1108,11 +1154,33 @@ impl fm_core::FusionMemoryEngine for MemoryEngine {
                 by_vec_ref.insert(vr, m);
             }
         }
-        // 按 interaction 聚合 + 融合评分
+        // M1 #39: FTS5 词法路 (四路融合第 2 信号)。trigram 关键词命中 KNN top-k 漏掉的
+        // 专有名词/代号类候选。cipher 模式/短词返回空 (B-1: 加密部署不落明文 token)。
+        // 4x 超采样同 KNN namespace 超采样逻辑: BM25 排序廉价, 词法候选欠采样会漏命中,
+        // 多取候选交四路重排吸收。
+        let fts_limit = knn_k.saturating_mul(4);
+        let fts_hits = self
+            .persist
+            .fts_search(&query.text, fts_limit, &query.tenant, &ns_filter)
+            .map_err(|e| e.to_memory())?;
+        let bm25_norm = scoring::normalize_bm25(&fts_hits);
+        let fts_items = if bm25_norm.is_empty() {
+            Vec::new()
+        } else {
+            let fts_ids: Vec<String> = bm25_norm.keys().cloned().collect();
+            self.persist
+                .get_by_ids_tenant_scoped(&fts_ids, &query.tenant, &ns_filter)
+                .map_err(|e| e.to_memory())?
+        };
+        debug!(fts_hits = fts_hits.len(), "fts arm done");
+        // 按 interaction 聚合 + 融合评分 (四路: cosine / bm25 / graph / freshness)
         let mut groups: std::collections::BTreeMap<String, Vec<MemoryItem>> =
             std::collections::BTreeMap::new();
         let mut best_score: std::collections::HashMap<String, f64> =
             std::collections::HashMap::new();
+        // 候选装配: (item, cosine, bm25) — KNN 命中在前, FTS-only 补充在后
+        let mut cands: Vec<(MemoryItem, f64, f64)> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         for (vec_id, sim) in &knn {
             if let Some(m) = by_vec_ref.get(vec_id) {
                 if let Some(filter) = &query.tier_filter {
@@ -1125,11 +1193,37 @@ impl fm_core::FusionMemoryEngine for MemoryEngine {
                         continue;
                     }
                 }
-                // 融合评分: cosine + W(t) + graph_affinity (L1: query_entity_ids 已抽)
-                // §1.5: score_candidate 取 &dyn GraphStore; Arc<Persist> deref → &Persist coerce。
-                let score = scoring::score_candidate(
+                seen.insert(m.id.clone());
+                let bm25 = bm25_norm.get(&m.id).copied().unwrap_or(0.0);
+                cands.push((m.clone(), *sim as f64, bm25));
+            }
+        }
+        // FTS-only 候选 (语义路必然漏的词法命中): cosine 记 0, 仍带 bm25/graph/freshness
+        for m in &fts_items {
+            if !seen.insert(m.id.clone()) {
+                continue;
+            }
+            if let Some(filter) = &query.tier_filter {
+                if !filter.contains(&m.tier) {
+                    continue;
+                }
+            }
+            if let Some(sess) = &query.session_id {
+                if &m.session_id != sess {
+                    continue;
+                }
+            }
+            let bm25 = bm25_norm.get(&m.id).copied().unwrap_or(0.0);
+            cands.push((m.clone(), 0.0, bm25));
+        }
+        for (m, cosine, bm25) in &cands {
+            {
+                // 四路融合评分: cosine + bm25 + graph_affinity + freshness
+                // §1.5: score_candidate4 取 &dyn GraphStore; Arc<Persist> deref → &Persist coerce。
+                let score = scoring::score_candidate4(
                     self.persist.as_ref(),
-                    *sim as f64,
+                    *cosine,
+                    *bm25,
                     m,
                     &query_entity_ids,
                     now,

@@ -18,7 +18,7 @@ source_of_truth:
 
 > **[English](README.md)** | 中文
 
-> **当前版本：v1.5.1** — docs 体系接入（fusion docs-system v1.1 契约）：`docs/` 页面集（product-page / get-started / architecture / api-reference / config-reference / troubleshooting）按 docs-system frontmatter 契约落地，`ci/validate_docs.py` 校验器 + `docs.yml` CI workflow（14 docs，0 errors）、`AGENTS.md`；纯文档补丁，零代码/API 变更。v1.5.0 web 界面（issue #33）：浏览/管理 REST API（`list`/`audit_log`/`merges`/`unmerge`/`reconcile`，冻结线契约上的加法 RPC 方法）+ `GET /app` 内嵌 web 控制台（React 18 + Tailwind，编译期 `include_dir` 内嵌 — 无运行时文件依赖）+ HTTP 导入路由（`POST /v1/memory/import`，`fm import` 的 HTTP 版，复用服务 engine 避 sled 锁）。v1.4.5 start.sh 注册自检（issue #31，配置治理 Phase 3.3）：`start.sh start` 启动前校验自身 `port-registry.yaml` 登记 — 端口未登记则拒绝启动（exit 1），把 CI check-ports 的失败前移到启动时。registry 文件缺失 = warn 放行（standalone 部署）；`FUSION_SKIP_REGISTRY_CHECK=1` 显式跳过。v1.4.4 env 契约文档（issue #29，配置治理 Phase 2.2）：本 README 汇总 `FUSION_MEMORY_*` 环境变量全表，另修 check-env 误报（合规名 `FUSION_MEMORY_MLX_API_KEY` 被子串匹配命中 legacy `MLX_API_KEY`；工作区 checker 改精确 token 匹配）。本仓零改名 — 验收 `python scripts/check-env.py`：0 findings。v1.4.3 CI 红修复（issue #27）：跨仓 path 依赖（`fg-redact` 依赖 fusion-guard、`fs-core` 依赖 fusion-store）破坏 CI 独立 checkout，全部换成 pin 的 git tag 依赖（与本地工作树零漂移），并以无兄弟目录的全新 lone clone 验证通过。v1.4.2 检索质量消融（issue #25）：全融合评分对纯 cosine **recall@5 +0.40**（0.8270 vs 0.4250，全量语料见 `docs/benchmarks/retrieval-quality-2026-10-25.md`）；benchmark 首测暴露融合衰减项缺陷并裁定 retune — 融合衰减项改用归一化新鲜度（实测原始 `W(t)` 融合反而*差于*纯 cosine）。CI 门禁：融合评分永不低于纯 cosine。v1.4.1 MLX embedding key TOML 镜像（issue #23）、v1.4.0 作用域命名空间（issue #21）、v1.3.0 fusion-identity 集成（issue #18）、v1.2.0 多租户隔离（issue #16）此前已落地。已知限制见 `CHANGELOG.md` "Known limitations"，非阻塞。
+> **当前版本：v1.6.0** — 检索与巩固（2026-11 演进计划第一阶段）：**四路融合检索**（M1）— FTS5 trigram 关键词索引（schema v5）与 cosine / 图亲和 / 新鲜度按 0.4/0.3/0.2/0.1 融合；全量消融 recall@5 cosine 0.2496 → 三路 0.5443 → **四路 0.6779**（`docs/benchmarks/retrieval-quality-m1-fourway-2026-11-12.md`），CI never-below 门禁；**dreaming 巩固调度**（M2）— 空闲触发的后台巩固（在飞门控 + pending 阈值，saga 内核零改动，边界事件进 audit_log），默认关，`FUSION_MEMORY_DREAM_INTERVAL_SECS`/`FUSION_MEMORY_DREAM_PENDING_THRESHOLD` 开启；**LongMemEval 子集 CI 门禁**（M4）— 双 embedder 模式（stub / 真 bge-m3），基线 JSON 入库，两种模式 recall@5 1.0 / MRR 1.0。此前：v1.5.1 docs 体系接入（fusion docs-system v1.1 契约）：`docs/` 页面集（product-page / get-started / architecture / api-reference / config-reference / troubleshooting）按 docs-system frontmatter 契约落地，`ci/validate_docs.py` 校验器 + `docs.yml` CI workflow（14 docs，0 errors）、`AGENTS.md`；纯文档补丁，零代码/API 变更。v1.5.0 web 界面（issue #33）：浏览/管理 REST API（`list`/`audit_log`/`merges`/`unmerge`/`reconcile`，冻结线契约上的加法 RPC 方法）+ `GET /app` 内嵌 web 控制台（React 18 + Tailwind，编译期 `include_dir` 内嵌 — 无运行时文件依赖）+ HTTP 导入路由（`POST /v1/memory/import`，`fm import` 的 HTTP 版，复用服务 engine 避 sled 锁）。v1.4.5 start.sh 注册自检（issue #31，配置治理 Phase 3.3）：`start.sh start` 启动前校验自身 `port-registry.yaml` 登记 — 端口未登记则拒绝启动（exit 1），把 CI check-ports 的失败前移到启动时。registry 文件缺失 = warn 放行（standalone 部署）；`FUSION_SKIP_REGISTRY_CHECK=1` 显式跳过。v1.4.4 env 契约文档（issue #29，配置治理 Phase 2.2）：本 README 汇总 `FUSION_MEMORY_*` 环境变量全表，另修 check-env 误报（合规名 `FUSION_MEMORY_MLX_API_KEY` 被子串匹配命中 legacy `MLX_API_KEY`；工作区 checker 改精确 token 匹配）。本仓零改名 — 验收 `python scripts/check-env.py`：0 findings。v1.4.3 CI 红修复（issue #27）：跨仓 path 依赖（`fg-redact` 依赖 fusion-guard、`fs-core` 依赖 fusion-store）破坏 CI 独立 checkout，全部换成 pin 的 git tag 依赖（与本地工作树零漂移），并以无兄弟目录的全新 lone clone 验证通过。v1.4.2 检索质量消融（issue #25）：全融合评分对纯 cosine **recall@5 +0.40**（0.8270 vs 0.4250，全量语料见 `docs/benchmarks/retrieval-quality-2026-10-25.md`）；benchmark 首测暴露融合衰减项缺陷并裁定 retune — 融合衰减项改用归一化新鲜度（实测原始 `W(t)` 融合反而*差于*纯 cosine）。CI 门禁：融合评分永不低于纯 cosine。v1.4.1 MLX embedding key TOML 镜像（issue #23）、v1.4.0 作用域命名空间（issue #21）、v1.3.0 fusion-identity 集成（issue #18）、v1.2.0 多租户隔离（issue #16）此前已落地。已知限制见 `CHANGELOG.md` "Known limitations"，非阻塞。
 
 Fusion 生态（"一核九端"）系统级长/短期记忆与认知图谱中枢。解决 Agent 跨 session 状态断层、重复提问、context window 爆炸，目标：越用越懂用户。
 
@@ -430,6 +430,13 @@ cargo llvm-cov --workspace \
 | `FUSION_MEMORY_CLUSTER_NODES` | 未设 | 选举成员表 `host:port,...`（未设 = 不选举） |
 | `FUSION_MEMORY_CLUSTER_NODE_ID` | 未设 | 在 `CLUSTER_NODES` 中自身下标（0 起） |
 | `FUSION_MEMORY_LEADER` | 未设 | follower 模式触发：同步源 leader 地址 |
+
+Dreaming 巩固调度（fm-server `dream.rs`，issue #40；默认关 — 开启即产品行为变更）：
+
+| 环境变量 | 默认 | 用途 |
+|-----|---------|---------|
+| `FUSION_MEMORY_DREAM_INTERVAL_SECS` | `0`（关） | 调度 tick 秒数；`0`/未设 = 完全禁用 dreaming 任务 |
+| `FUSION_MEMORY_DREAM_PENDING_THRESHOLD` | `1` | 触发巩固的最小 pending 实体数 |
 | `FUSION_MEMORY_HEARTBEAT_SECS` | `5` | follower ping 间隔 |
 | `FUSION_MEMORY_HEARTBEAT_FAILS` | `3` | 连续失败次数 = LeaderDown |
 | `FUSION_MEMORY_FETCH_LIMIT` | `256` | 单次同步拉取 wop 上限 |

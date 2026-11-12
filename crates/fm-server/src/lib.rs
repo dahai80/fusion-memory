@@ -6,6 +6,7 @@
 pub mod auth;
 pub mod cluster;
 pub mod config;
+pub mod dream;
 pub mod engine_builder;
 pub mod engine_handle;
 pub mod http;
@@ -48,6 +49,22 @@ pub async fn serve(cfg: ServerConfig, opts: ServeOpts) -> Result<(), String> {
     // role 解析: env 优先, 次读 data_dir/role 文件 (fm cluster promote 落地), 末 standalone。
     let role = fm_cluster::detect_role_with_home(Some(&cfg.data_dir));
     cluster::spawn_cluster(engine.clone(), role, &cfg.data_dir, &mut set);
+
+    // M2 #40: dreaming scheduler — default off (FUSION_MEMORY_DREAM_INTERVAL_SECS unset/0).
+    // Only adds a trigger; consolidation saga kernel untouched. In-flight gate shared
+    // with request paths via engine inflight counter; consolidate_lock serializes
+    // dream cycles with manual RPC consolidations.
+    let dream_cfg = dream::DreamConfig::from_env();
+    if dream_cfg.enabled() {
+        let dream_shutdown = shutdown_tx.subscribe();
+        let dream_engine = engine.clone();
+        set.spawn(async move {
+            dream::dream_loop(dream_engine, dream_cfg, dream_shutdown).await;
+            Ok(())
+        });
+    } else {
+        info!("dream scheduler disabled (FUSION_MEMORY_DREAM_INTERVAL_SECS unset/0)");
+    }
 
     if cfg.uds_enabled {
         let h = handle.clone();
