@@ -21,6 +21,15 @@ Internal path-dep private ecosystem (not on crates.io); versions tag + GitHub re
 
 ## [Unreleased]
 
+## [1.12.0] — 2026-11-14
+
+MINOR release — team namespace tier (issue #64). Additive only; no schema change. One new namespace tier + one new RPC (`list_namespaces`, UDS + HTTP).
+
+### Added
+- **`team` namespace tier (issue #64)**: team-scoped shared memory — `namespace="team"`, `namespace_key=<team-name>`; reads/writes visible only within the same key (no stacking onto user/project). Enforced across commit/retrieve/list/consolidate params, adopt_playbook `consumer_namespace`, and persist SQL predicates (fail-closed on unknown tiers); validation error messages updated to the full tier set.
+- **`list_namespaces` RPC (UDS + HTTP)**: `{"namespace": "<tier>"}` → distinct `namespace_key` values for one tier per tenant (keys only, never content); empty/unknown tier → invalid_params fail-closed.
+- **Tests**: team key isolation e2e via engine retrieve (fm-engine tests/team_namespace.rs), persist SQL isolation + list_namespace_keys (incl. tombstone exclusion + fail-closed tiers), namespace.rs visibility/validation, jsonrpc list_namespaces tier validation. 586 offline tests / 40 suites green.
+
 ## [1.11.0] — 2026-11-14
 
 MINOR release — sleep-time curation (issue #60). Additive only; no schema change. One new env (`FUSION_MEMORY_SLEEP_INTERVAL_SECS`, default off) + one new RPC (`sleep_run`, UDS + HTTP) + one new wop op (`sleep_replay`).

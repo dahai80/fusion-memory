@@ -17,6 +17,8 @@ pub const NS_LOCAL: &str = "local";
 // #58: per-agent 命名空间 (key = agent/worker id, 默认隔离) + 共享 playbook 仓库。
 pub const NS_AGENT: &str = "agent";
 pub const NS_PLAYBOOK: &str = "playbook";
+// #64 T2: 团队共享命名空间 (key = team name, key 间隔离)。
+pub const NS_TEAM: &str = "team";
 
 pub fn is_valid_namespace(ns: &str) -> bool {
     ns.is_empty()
@@ -25,6 +27,7 @@ pub fn is_valid_namespace(ns: &str) -> bool {
         || ns == NS_LOCAL
         || ns == NS_AGENT
         || ns == NS_PLAYBOOK
+        || ns == NS_TEAM
 }
 
 /// 检索/检索作用域过滤器。namespace="" = 不过滤 (全局, 旧行为)。
@@ -70,6 +73,8 @@ impl NamespaceFilter {
             NS_AGENT => ns == NS_AGENT && key_ok,
             // #58: playbook 仓库租户内全员可见 (key = 发布者署名)。
             NS_PLAYBOOK => ns == NS_PLAYBOOK,
+            // #64: team 命名空间按 key 隔离 — 同 team (key) 内共享, 跨 team 不可见。
+            NS_TEAM => ns == NS_TEAM && key_ok,
             _ => false,
         }
     }
@@ -125,6 +130,19 @@ mod tests {
         assert!(is_valid_namespace(NS_USER));
         assert!(is_valid_namespace(NS_PROJECT));
         assert!(is_valid_namespace(NS_LOCAL));
+        assert!(is_valid_namespace(NS_TEAM));
         assert!(!is_valid_namespace("global"));
+    }
+
+    // #64 T2: team 命名空间按 key 隔离 — 同 key 共享, 跨 key 不可见, 不叠 user。
+    #[test]
+    fn team_isolated_by_key() {
+        let f = NamespaceFilter::new(NS_TEAM, "t1");
+        assert!(f.visible(NS_TEAM, "t1"));
+        assert!(!f.visible(NS_TEAM, "t2"));
+        assert!(!f.visible(NS_USER, "t1"));
+        assert!(!f.visible(NS_PROJECT, "t1"));
+        // key 空 = tier 内全部 team 可见 (tier 枚举语义, 与 user 一致)。
+        assert!(NamespaceFilter::new(NS_TEAM, "").visible(NS_TEAM, "any"));
     }
 }

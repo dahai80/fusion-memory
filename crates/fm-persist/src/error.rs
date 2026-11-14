@@ -71,7 +71,7 @@ impl PersistError {
             // v1.0.0 B-1: 加密错误 → MemoryError::Encrypt (永久, 不可重试)。
             PersistError::Encrypt(s) => fm_core::MemoryError::Encrypt(s),
             PersistError::Namespace(s) => fm_core::MemoryError::Unsupported(format!(
-                "invalid namespace: {s} (expect user|project|local|empty)"
+                "invalid namespace: {s} (expect user|project|local|agent|playbook|team|empty)"
             )),
             PersistError::Revoke(s) => {
                 fm_core::MemoryError::Unsupported(format!("invalid revoke filter: {s}"))

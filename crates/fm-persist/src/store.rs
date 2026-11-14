@@ -437,6 +437,27 @@ impl Persist {
         Ok(out)
     }
 
+    /// #64 T2: distinct namespace_key 值 per tenant + tier (agent-studio T3 枚举 team 锚点用)。
+    /// 返回 key 列表, 不泄露内容。tier 必须非空且合法 (fail-closed)。tombstoned 排除。
+    pub fn list_namespace_keys(&self, tenant: &str, tier: &str) -> PersistResult<Vec<String>> {
+        use fm_core::namespace::is_valid_namespace;
+        if tier.is_empty() || !is_valid_namespace(tier) {
+            return Err(PersistError::Namespace(tier.to_string()));
+        }
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT namespace_key FROM memory_item \
+             WHERE tombstone=0 AND tenant=?1 AND namespace=?2 AND namespace_key != '' \
+             ORDER BY namespace_key ASC",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![tenant, tier], |r| r.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
     /// §1.3: 按 vector_ref 集合定向查 memory_item。替代 retrieve_context 旧版 list_all 全表扫 +
     /// HashMap (10k 记忆 ≈ 2MB clone/次, 仅为查 ~10 个 KNN 命中)。走 idx_memory_vector_ref 索引,
     /// vector_ref 作 TEXT 存 (u64 的字符串形), IN(...) 谓词对 TEXT 索引同样命中。空集返空。
@@ -1407,7 +1428,7 @@ const _: () = {
 /// 未知 namespace 值 fail-closed 报错, 不静默放行 (防越权读其他作用域)。
 fn ns_predicate(ns: &NamespaceFilter, base: usize) -> PersistResult<(String, Vec<String>)> {
     use fm_core::namespace::{
-        is_valid_namespace, NS_AGENT, NS_LOCAL, NS_PLAYBOOK, NS_PROJECT, NS_USER,
+        is_valid_namespace, NS_AGENT, NS_LOCAL, NS_PLAYBOOK, NS_PROJECT, NS_TEAM, NS_USER,
     };
     if !ns.is_active() {
         return Ok((String::new(), Vec::new()));
@@ -1468,6 +1489,15 @@ fn ns_predicate(ns: &NamespaceFilter, base: usize) -> PersistResult<(String, Vec
         }
         // #58: playbook 共享仓库租户内全员可见 (key = 发布者署名, 不过滤)。
         NS_PLAYBOOK => " AND namespace='playbook'".to_string(),
+        // #64: team 命名空间按 key 隔离 — 同 team (key) 共享, key 空 = tier 内全部。
+        NS_TEAM => {
+            if ns.key.is_empty() {
+                " AND namespace='team'".to_string()
+            } else {
+                key_params.push(ns.key.clone());
+                format!(" AND namespace='team' AND namespace_key={key_placeholder}")
+            }
+        }
         // is_valid_namespace 已挡, 此处不可达; 保守 fail-closed。
         _ => return Err(PersistError::Namespace(ns.namespace.clone())),
     };
@@ -2455,6 +2485,52 @@ mod tests {
             .list_all_by_tenant_scoped("", &NamespaceFilter::new("bogus", "k"))
             .unwrap_err();
         assert!(matches!(err, crate::error::PersistError::Namespace(_)));
+    }
+
+    // #64 T2: team 命名空间按 key 隔离 — key=A 写, key=B 读不到, key=A 读到; 不叠 user/project。
+    #[test]
+    fn team_scoped_isolation() {
+        let p = Persist::open_in_memory().unwrap();
+        p.put_memory(&ns_item("t-a", 1, "team", "alpha")).unwrap();
+        p.put_memory(&ns_item("t-b", 2, "team", "beta")).unwrap();
+        p.put_memory(&ns_item("u", 3, "user", "u1")).unwrap();
+        p.put_memory(&ns_item("prj", 4, "project", "p1")).unwrap();
+        let ids = |f: NamespaceFilter| -> Vec<String> {
+            let mut xs: Vec<String> = p
+                .list_all_by_tenant_scoped("", &f)
+                .unwrap()
+                .into_iter()
+                .map(|m| m.id)
+                .collect();
+            xs.sort();
+            xs
+        };
+        assert_eq!(ids(NamespaceFilter::new("team", "alpha")), vec!["t-a"]);
+        assert_eq!(ids(NamespaceFilter::new("team", "beta")), vec!["t-b"]);
+        // key 空 = tier 内全部 team 行, 不叠 user/project。
+        assert_eq!(ids(NamespaceFilter::new("team", "")), vec!["t-a", "t-b"]);
+    }
+
+    // #64 T2: list_namespace_keys — distinct keys per tenant+tier, 不泄内容, fail-closed。
+    #[test]
+    fn list_namespace_keys_per_tier() {
+        let p = Persist::open_in_memory().unwrap();
+        p.put_memory(&ns_item("t-a", 1, "team", "alpha")).unwrap();
+        p.put_memory(&ns_item("t-a2", 2, "team", "alpha")).unwrap();
+        p.put_memory(&ns_item("t-b", 3, "team", "beta")).unwrap();
+        p.put_memory(&ns_item("u", 4, "user", "u1")).unwrap();
+        p.tombstone_memory("t-b").unwrap();
+        assert_eq!(
+            p.list_namespace_keys("", "team").unwrap(),
+            vec!["alpha".to_string()]
+        );
+        assert_eq!(
+            p.list_namespace_keys("", "user").unwrap(),
+            vec!["u1".to_string()]
+        );
+        // 空 tier / 非法 tier fail-closed。
+        assert!(p.list_namespace_keys("", "").is_err());
+        assert!(p.list_namespace_keys("", "bogus").is_err());
     }
 
     // §1.10: idx_memory_entity_eid 索引存在 (audit_by_entities 反查依赖)。
