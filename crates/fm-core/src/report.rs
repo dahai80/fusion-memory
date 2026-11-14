@@ -31,6 +31,22 @@ pub struct ConsolidationReport {
     pub failures: Vec<ConsolidationFailure>,
 }
 
+/// P10 #60: sleep-time curation 报告 — 一次离线睡眠周期 = 巩固预计算 + 准入门重放。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SleepReport {
+    /// 巩固内核结果 (衰减回收/晋升/合并/摘要/补抽 — 测试时不再需要的预计算)。
+    #[serde(default)]
+    pub consolidated: ConsolidationReport,
+    /// 准入门重放检查的活跃记忆数。
+    pub replay_checked: u64,
+    /// 重放判定为近重复 (存在更新副本) 而降权的记忆数。
+    pub replay_downweighted: u64,
+    /// playbook 库内被更新副本取代而降级 (Pinned→Normal) 的条目数。
+    pub playbook_demoted: u64,
+    /// 整个睡眠周期耗时 (ms) — 离线成本记录。
+    pub duration_ms: u64,
+}
+
 /// 单次 consolidate 失败项。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConsolidationFailure {

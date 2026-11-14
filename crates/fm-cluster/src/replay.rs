@@ -175,6 +175,15 @@ pub async fn replay_one(sink: &dyn ReplaySink, entry: &WopEntry) -> ClusterResul
             sink.put_item(&item).await?;
             Ok(true)
         }
+        // P10 #60: sleep curation downweight — full item overwrite (weight/admission
+        // changed, vector unchanged). payload = MemoryItem JSON, follower put_item.
+        "sleep_replay" => {
+            let item: MemoryItem = serde_json::from_str(&entry.payload).map_err(|e| {
+                ClusterError::PermanentReplay(format!("sleep_replay payload decode: {e}"))
+            })?;
+            sink.put_item(&item).await?;
+            Ok(true)
+        }
         other => {
             // summarize/reextract/未知 op: 本地 consolidate 各节点独立, 跳过。
             // (summarize 产生新 Semantic 记忆, follower 经其 own consolidate 生成, 跳过避免双重摘要)

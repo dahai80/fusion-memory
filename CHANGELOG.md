@@ -21,6 +21,18 @@ Internal path-dep private ecosystem (not on crates.io); versions tag + GitHub re
 
 ## [Unreleased]
 
+## [1.11.0] — 2026-11-14
+
+MINOR release — sleep-time curation (issue #60). Additive only; no schema change. One new env (`FUSION_MEMORY_SLEEP_INTERVAL_SECS`, default off) + one new RPC (`sleep_run`, UDS + HTTP) + one new wop op (`sleep_replay`).
+
+### Added
+- **Sleep-time curation (issue #60)**: one scheduled offline pass = (1) recontextualization precompute — the consolidation kernel (decay/recycle/promote/merge/summarize/reextract) runs with no interactive request in flight, advancing the incremental watermark so test-time retrieval starts warm; (2) admission-gate replay — every active memory re-checked with the gate duplicate rule (KNN top-2 cosine ≥ 0.95); a copy superseded by a newer near-duplicate is downweighted ×0.5 and admission-marked (`replay-duplicate`, the marker doubles as the idempotency key; `system` authority never replayed). Playbook copies demote Pinned→Normal (`playbook-superseded`), newest copy stays pinned (batch ACE-style curation, #58 tie-in).
+- **Scheduling**: `FUSION_MEMORY_SLEEP_INTERVAL_SECS=N` (default 0/off) spawns an idle-gated scheduler (dream.rs precedent, in-flight gate shared with request paths, consolidate_lock serializes with manual consolidations); `sleep_run` RPC (UDS + HTTP, no params, idempotent) triggers one pass on demand.
+- **Replication + audit**: downweights are full-item wop overwrites (new `sleep_replay` op replayed as `put_item`); every demotion audited (`sleep/curation`); `SleepReport` carries replay_checked / replay_downweighted / playbook_demoted + duration_ms (the offline cost test-time requests no longer pay).
+
+### Tests
+- fm-server `sleep.rs`: offline pass updates assets idempotently (superseded copy downweighted + marked, canonical untouched, second pass no-op, warm-start watermark) + playbook demotion e2e (Pinned→Normal, reason marker, canonical kept pinned); workspace 581 tests green (39 suites).
+
 ## [1.10.0] — 2026-11-14
 
 MINOR release — experience admission gate + shared playbook repository (issues #57 #58). Additive only; schema v10 (4 guarded ALTERs + `share_grant` table, `CREATE IF NOT EXISTS` idempotent, no wire-contract change). One new env (`FUSION_MEMORY_ADMISSION_GATE`) + one new TOML key (`admission_gate`); six new RPCs (UDS + HTTP): `revoke`, `grant_access`, `revoke_access`, `list_grants`, `publish_playbook`, `adopt_playbook`.

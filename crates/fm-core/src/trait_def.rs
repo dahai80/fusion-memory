@@ -46,6 +46,15 @@ pub trait FusionMemoryEngine: Send + Sync {
     /// 触发后台遗忘与合并（nightly cron，增量 + saga，PRD §7.3）。
     async fn consolidate_memories(&self) -> MemoryResult<ConsolidationReport>;
 
+    /// P10 #60: sleep-time curation — 离线预计算巩固 (摘要/实体刷新/合并) + 准入门重放
+    /// (近重复降权 / playbook 降级), 结果落库供冷启动消费者直接命中。幂等: 重放已标记
+    /// 的记忆跳过。幂等 + 无交互请求在飞。默认 unsupported, 生产 MemoryEngine 覆写。
+    async fn sleep_curation(&self) -> MemoryResult<crate::report::SleepReport> {
+        Err(crate::error::MemoryError::Unsupported(
+            "sleep-time curation not implemented for this engine".into(),
+        ))
+    }
+
     /// issue #21: 按作用域命名空间调度 (仅该 namespace/key 可见域内的记忆参与回收/晋升/合并/摘要)。
     /// 不推进全局 consolidate 水位 (consolidation_log 不写) — 作用域运行是补跑, 不能吞掉
     /// 其他 namespace 的待处理变更。默认实现 unsupported, 生产 MemoryEngine 覆写。

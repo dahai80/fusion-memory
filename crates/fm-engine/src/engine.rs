@@ -9,8 +9,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use fm_core::{
-    ConsolidationFailure, ConsolidationReport, ContextBlock, FormattedContext, Interaction,
-    MemoryId, MemoryItem, MemoryTier, MemoryType, NamespaceFilter, RetrieveQuery, Turn,
+    AdmissionRecord, ConsolidationFailure, ConsolidationReport, ContextBlock, FormattedContext,
+    Interaction, MemoryId, MemoryItem, MemoryTier, MemoryType, NamespaceFilter, RetrieveQuery,
+    SafetyAuthority, SafetyPersistence, SleepReport, Turn,
 };
 use fm_embed::{vector_id_from_ulid, Embedder};
 use fm_persist::{MergeLogEntry, Persist};
@@ -1554,6 +1555,136 @@ impl fm_core::FusionMemoryEngine for MemoryEngine {
     ) -> fm_core::MemoryResult<ConsolidationReport> {
         self.consolidate_impl(&NamespaceFilter::new(namespace, namespace_key))
             .await
+    }
+
+    // P10 #60: sleep-time curation — offline precompute + admission-gate replay.
+    // Phase 1: consolidate kernel (decay/recycle/promote/merge/summarize/reextract) =
+    // the recontextualization precompute (summarization + entity refresh); it takes
+    // consolidate_lock internally. Phase 2: replay the admission gate duplicate rule
+    // over all active memories — a copy superseded by a newer near-duplicate is
+    // downweighted (weight x0.5) and admission-marked (the marker doubles as the
+    // idempotency key, so a second pass is a no-op); playbook copies additionally
+    // demote Pinned to Normal. Runs with no interactive request in flight.
+    async fn sleep_curation(&self) -> fm_core::MemoryResult<SleepReport> {
+        let start = Self::now_ms();
+        let consolidated = self.consolidate_impl(&NamespaceFilter::default()).await?;
+        // Phase 2 under consolidate_lock: same read-snapshot-decide-write atomicity
+        // as consolidate phase-1 (protects against concurrent touch lost updates).
+        let _guard = self.consolidate_lock.lock().await;
+        let now = Self::now_ms();
+        let dup_sim = self
+            .admission
+            .as_ref()
+            .map(|c| c.dup_sim)
+            .unwrap_or(crate::admission::DEFAULT_DUP_SIM);
+        let items = self
+            .persist
+            .list_changed_since_scoped(0, &NamespaceFilter::default())
+            .map_err(|e| e.to_memory())?;
+        let mut checked = 0u64;
+        let mut downweighted = 0u64;
+        let mut demoted = 0u64;
+        for item in &items {
+            // System authority: system-written rows are never replay-downweighted.
+            if item.authority == SafetyAuthority::System {
+                continue;
+            }
+            // Idempotency: already replay-marked rows skip (no double downweight).
+            if let Some(rec) = &item.admission {
+                if rec.reason.starts_with("replay-") || rec.reason == "playbook-superseded" {
+                    continue;
+                }
+            }
+            let Ok(vr) = item.vector_ref.parse::<u64>() else {
+                continue;
+            };
+            let Ok(Some(vec)) = self.store.get_vector(vr) else {
+                continue;
+            };
+            checked += 1;
+            // top-2 KNN: top-1 = self (sim 1.0); top-2 = nearest other row.
+            let knn = match self.store.search_knn(&vec, 2) {
+                Ok(k) => k,
+                Err(e) => {
+                    warn!(id = %item.id, error = %e, "sleep: knn failed, item skipped");
+                    continue;
+                }
+            };
+            let Some((other_vid, sim)) = knn.iter().find(|(vid, _)| *vid != vr) else {
+                continue;
+            };
+            if *sim < dup_sim {
+                continue;
+            }
+            // Canonical = newest; only the superseded (older) copy is downweighted.
+            let other_newer = self
+                .persist
+                .get_by_vector_refs(&[*other_vid])
+                .ok()
+                .and_then(|v| v.first().cloned())
+                .map(|o| o.created_timestamp > item.created_timestamp)
+                .unwrap_or(false);
+            if !other_newer {
+                continue;
+            }
+            let is_playbook = item.namespace == fm_core::namespace::NS_PLAYBOOK;
+            let mut up = item.clone();
+            up.weight *= 0.5;
+            up.admission = Some(AdmissionRecord {
+                accepted: false,
+                score: *sim,
+                reason: if is_playbook {
+                    demoted += 1;
+                    up.persistence = SafetyPersistence::Normal;
+                    "playbook-superseded".to_string()
+                } else {
+                    downweighted += 1;
+                    "replay-duplicate".to_string()
+                },
+                gate_version: crate::admission::GATE_VERSION,
+            });
+            // §1.9 precedent: full-item overwrite wop so followers sync weight/admission.
+            let payload = serde_json::to_string(&up).unwrap_or_default();
+            if let Err(e) = self
+                .persist
+                .put_memory_with_wop(&up, "sleep_replay", &payload, now)
+            {
+                warn!(id = %item.id, error = %e, "sleep: downweight write failed, skip");
+                continue;
+            }
+            if let Err(e) = self.persist.append_audit(
+                now,
+                "sleep",
+                "curation",
+                &item.id,
+                up.admission
+                    .as_ref()
+                    .map(|r| r.reason.as_str())
+                    .unwrap_or(""),
+            ) {
+                warn!(error = %e, "sleep: audit append failed, non-fatal");
+            }
+            info!(id = %item.id, sim = *sim, playbook = is_playbook, "sleep: superseded copy downweighted");
+        }
+        let duration_ms = Self::now_ms().saturating_sub(start);
+        self.dream_audit(
+            "sleep-complete",
+            &format!("checked={checked} downweighted={downweighted} demoted={demoted}"),
+        );
+        info!(
+            replay_checked = checked,
+            replay_downweighted = downweighted,
+            playbook_demoted = demoted,
+            duration_ms,
+            "sleep curation pass complete"
+        );
+        Ok(SleepReport {
+            consolidated,
+            replay_checked: checked,
+            replay_downweighted: downweighted,
+            playbook_demoted: demoted,
+            duration_ms,
+        })
     }
 
     async fn get_memory(&self, id: &str) -> fm_core::MemoryResult<Option<MemoryItem>> {

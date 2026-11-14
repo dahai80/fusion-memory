@@ -13,6 +13,7 @@ pub mod http;
 pub mod identity;
 pub mod jsonrpc;
 pub mod metrics;
+pub mod sleep;
 pub mod tenant;
 pub mod uds;
 
@@ -64,6 +65,21 @@ pub async fn serve(cfg: ServerConfig, opts: ServeOpts) -> Result<(), String> {
         });
     } else {
         info!("dream scheduler disabled (FUSION_MEMORY_DREAM_INTERVAL_SECS unset/0)");
+    }
+
+    // P10 #60: sleep-time curation scheduler — default off (FUSION_SLEEP_INTERVAL_SECS
+    // unset/0). Idle-gated (in-flight == 0); same entry as the manual sleep_run RPC;
+    // consolidate_lock serializes with manual consolidations.
+    let sleep_cfg = sleep::SleepConfig::from_env();
+    if sleep_cfg.enabled() {
+        let sleep_shutdown = shutdown_tx.subscribe();
+        let sleep_engine = engine.clone();
+        set.spawn(async move {
+            sleep::sleep_loop(sleep_engine, sleep_cfg, sleep_shutdown).await;
+            Ok(())
+        });
+    } else {
+        info!("sleep curation scheduler disabled (FUSION_MEMORY_SLEEP_INTERVAL_SECS unset/0)");
     }
 
     if cfg.uds_enabled {
