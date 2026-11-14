@@ -90,6 +90,7 @@ pub fn app(state: HttpState) -> axum::Router {
         .route("/v1/memory/publish_playbook", post(publish_playbook_route))
         .route("/v1/memory/adopt_playbook", post(adopt_playbook_route))
         .route("/v1/memory/sleep_run", post(sleep_run_route))
+        .route("/v1/memory/list_namespaces", post(list_namespaces_route))
         // #33: web UI static assets (web/dist embedded at compile time, no runtime file dependency). Public shell; data goes through Bearer.
         .route("/app", get(web_index))
         .route("/app/*path", get(web_asset))
@@ -282,6 +283,9 @@ async fn adopt_playbook_route(st: State<HttpState>, h: HeaderMap, j: Json<Value>
     handle_rpc(st, h, j).await
 }
 async fn sleep_run_route(st: State<HttpState>, h: HeaderMap, j: Json<Value>) -> Response {
+    handle_rpc(st, h, j).await
+}
+async fn list_namespaces_route(st: State<HttpState>, h: HeaderMap, j: Json<Value>) -> Response {
     handle_rpc(st, h, j).await
 }
 async fn audit_log_route(st: State<HttpState>, h: HeaderMap, j: Json<Value>) -> Response {

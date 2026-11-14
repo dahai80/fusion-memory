@@ -135,6 +135,15 @@ pub trait FusionMemoryEngine: Send + Sync {
         ))
     }
 
+    /// #64 T2: distinct namespace_key values per tenant + tier (team anchors
+    /// enumeration for agent-studio). Returns keys only, never content.
+    /// Empty/unknown tier → Unsupported-style error (fail-closed).
+    async fn list_namespaces(&self, _tier: &str, _tenant: &str) -> MemoryResult<Vec<String>> {
+        Err(crate::error::MemoryError::Unsupported(
+            "list_namespaces not implemented for this engine".into(),
+        ))
+    }
+
     /// #33: latest audit_log entries (id DESC), capped by `limit`.
     async fn list_audit_log(&self, _limit: usize) -> MemoryResult<Vec<crate::browse::AuditEntry>> {
         Err(crate::error::MemoryError::Unsupported(

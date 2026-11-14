@@ -1851,6 +1851,21 @@ impl fm_core::FusionMemoryEngine for MemoryEngine {
         Ok(items.into_iter().skip(q.offset).take(q.limit).collect())
     }
 
+    async fn list_namespaces(
+        &self,
+        tier: &str,
+        tenant: &str,
+    ) -> fm_core::MemoryResult<Vec<String>> {
+        if tier.is_empty() || !fm_core::namespace::is_valid_namespace(tier) {
+            return Err(fm_core::MemoryError::Unsupported(format!(
+                "list_namespaces: invalid tier {tier:?} (expect user|project|local|agent|playbook|team)"
+            )));
+        }
+        self.persist
+            .list_namespace_keys(tenant, tier)
+            .map_err(|e| e.to_memory())
+    }
+
     async fn list_audit_log(
         &self,
         limit: usize,

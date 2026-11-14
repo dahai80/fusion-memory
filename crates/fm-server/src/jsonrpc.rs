@@ -212,6 +212,8 @@ pub async fn dispatch(
         "adopt_playbook" => adopt_playbook(params, engine, tenant).await,
         // P10 #60: sleep-time curation — manual trigger of one offline pass (idempotent).
         "sleep_run" => sleep_run(engine).await,
+        // #64 T2: distinct namespace_key per tier (team anchors enumeration, keys only).
+        "list_namespaces" => list_namespaces(params, engine, tenant).await,
         // v1.9.0 #53: governance panel — read-only scoring/forgetting parameter snapshot.
         "config" => Ok(fm_engine::scoring::governance_snapshot()),
         "health" => Ok(Value::String("ok".into())),
@@ -270,13 +272,14 @@ pub fn http_status_for_error(code: i64) -> StatusCode {
     }
 }
 
-/// issue #21: namespace 参数校验 (user/project/local/空)。非法值 invalid_params, 不静默降级。
+/// issue #21: namespace 参数校验 (user/project/local/agent/playbook/team/空)。
+/// 非法值 invalid_params, 不静默降级。
 fn validate_namespace(ns: &str) -> Result<(), RpcError> {
     if fm_core::namespace::is_valid_namespace(ns) {
         Ok(())
     } else {
         Err(RpcError::invalid_params(format!(
-            "namespace must be one of user|project|local|\"\", got {ns:?}"
+            "namespace must be one of user|project|local|agent|playbook|team|\"\", got {ns:?}"
         )))
     }
 }
@@ -405,6 +408,32 @@ async fn sleep_run(engine: &EngineHandle) -> Result<Value, RpcError> {
         .await
         .map_err(|e| RpcError::from_engine(&e))?;
     serde_json::to_value(report).map_err(|e| RpcError::internal(e.to_string()))
+}
+
+/// #64 T2: distinct namespace_key values for one tier (team anchors enumeration).
+/// Keys only, never content. Empty/unknown tier → invalid_params (fail-closed).
+async fn list_namespaces(
+    params: Value,
+    engine: &EngineHandle,
+    tenant: &str,
+) -> Result<Value, RpcError> {
+    #[derive(Debug, Deserialize)]
+    struct ListNamespacesParams {
+        namespace: String,
+    }
+    let p: ListNamespacesParams =
+        serde_json::from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+    if p.namespace.is_empty() || !fm_core::namespace::is_valid_namespace(&p.namespace) {
+        return Err(RpcError::invalid_params(format!(
+            "namespace must be a non-empty tier: user|project|local|agent|playbook|team, got {:?}",
+            p.namespace
+        )));
+    }
+    let keys = engine
+        .list_namespaces(&p.namespace, tenant)
+        .await
+        .map_err(|e| RpcError::from_engine(&e))?;
+    serde_json::to_value(keys).map_err(|e| RpcError::internal(e.to_string()))
 }
 
 async fn consolidate(params: Value, engine: &EngineHandle) -> Result<Value, RpcError> {
@@ -724,7 +753,7 @@ async fn adopt_playbook(
     }
     if !fm_core::namespace::is_valid_namespace(&p.consumer_namespace) {
         return Err(RpcError::invalid_params(format!(
-            "consumer_namespace must be one of user|project|local|agent|playbook|empty, got {0:?}",
+            "consumer_namespace must be one of user|project|local|agent|playbook|team|empty, got {0:?}",
             p.consumer_namespace
         )));
     }
@@ -1991,6 +2020,41 @@ mod tests {
         let (eng, _) = stub_handle();
         let res = dispatch_err(&rpc("sleep_run", serde_json::json!({}), 1), &eng).await;
         assert_ne!(res.code, -32602, "no params validation expected");
+    }
+
+    // #64 T2: list_namespaces — tier required (fail-closed); valid tier reaches the
+    // engine (stub surfaces Unsupported, not a params error).
+    #[tokio::test]
+    async fn list_namespaces_validates_tier() {
+        let (eng, _) = stub_handle();
+        let err = dispatch_err(&rpc("list_namespaces", serde_json::json!({}), 36), &eng).await;
+        assert_eq!(err.code, -32602, "missing tier");
+        let err = dispatch_err(
+            &rpc("list_namespaces", serde_json::json!({"namespace": ""}), 37),
+            &eng,
+        )
+        .await;
+        assert_eq!(err.code, -32602, "empty tier rejected");
+        let err = dispatch_err(
+            &rpc(
+                "list_namespaces",
+                serde_json::json!({"namespace": "bogus"}),
+                38,
+            ),
+            &eng,
+        )
+        .await;
+        assert_eq!(err.code, -32602, "unknown tier rejected");
+        let err = dispatch_err(
+            &rpc(
+                "list_namespaces",
+                serde_json::json!({"namespace": "team"}),
+                39,
+            ),
+            &eng,
+        )
+        .await;
+        assert_ne!(err.code, -32602, "valid tier passes params validation");
     }
 
     #[tokio::test]
