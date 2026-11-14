@@ -217,6 +217,32 @@ cmd_doctor() {
     else
         echo "  data dir: ${C_YELLOW}absent${C_RESET} (start 时创建)"
     fi
+    # 6. #59 embed key 漂移: $FM_HOME/mlx_api_key vs fusion-mlx settings.json auth.api_key
+    local settings_json="${FUSION_MEMORY_MLX_SETTINGS_JSON:-$HOME/.fusion-mlx/settings.json}"
+    local mlx_key=""
+    mlx_key="$(python3 -c "import json,sys
+try:
+    d = json.load(open(sys.argv[1]))
+    print((d.get('auth') or {}).get('api_key') or '')
+except Exception:
+    print('')" "$settings_json" 2>/dev/null)"
+    if [[ -z "$mlx_key" ]]; then
+        echo "  embed key (settings.json): ${C_YELLOW}not found${C_RESET} ($settings_json 无 auth.api_key)"
+    else
+        local key_file="$FM_HOME/mlx_api_key"
+        if [[ -f "$key_file" ]]; then
+            local file_key
+            file_key="$(tr -d '[:space:]' < "$key_file")"
+            if [[ "$file_key" == "$mlx_key" ]]; then
+                echo "  embed key: ${C_GREEN}file matches settings.json${C_RESET}"
+            else
+                echo "  embed key: ${C_RED}DRIFT${C_RESET} — $key_file ≠ settings.json auth.api_key → 401 risk; update the file or delete it and unset [embed].mlx_api_key_file to use the settings.json fallback"
+                ok=0
+            fi
+        else
+            echo "  embed key: ${C_GREEN}no key file — server falls back to settings.json (#59)${C_RESET}"
+        fi
+    fi
     if [[ $ok -eq 1 ]]; then
         echo "${C_GREEN}● healthy${C_RESET}"
     else

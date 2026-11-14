@@ -21,6 +21,19 @@ Internal path-dep private ecosystem (not on crates.io); versions tag + GitHub re
 
 ## [Unreleased]
 
+## [1.9.2] — 2026-11-14
+
+PATCH release — embedding API key drift fix (issue #59). No wire-contract change; one new env (`FUSION_MEMORY_MLX_SETTINGS_JSON`).
+
+### Fixed
+- **Embedding API key drift (issue #59)**: the manually managed `[embed] mlx_api_key_file` silently goes stale when fusion-mlx rotates its key (authoritative source: `~/.fusion-mlx/settings.json` `auth.api_key`), surfacing only as a vague `vector store error: mlx api error: status 401` on retrieve. Three-part fix:
+  - **Direct source**: when every explicit key source is unset (env `FUSION_MEMORY_MLX_API_KEY` / `FUSION_MEMORY_MLX_API_KEY_FILE`, TOML `[embed] mlx_api_key`/`mlx_api_key_file`), the server falls back to reading `auth.api_key` from the fusion-mlx settings dir — one source of truth, zero drift. Path overridable via `FUSION_MEMORY_MLX_SETTINGS_JSON` (default `$HOME/.fusion-mlx/settings.json`); read failure skips the fallback silently (startup never blocked; explicit config always wins).
+  - **Fail visible**: an embedding 401 now returns an actionable error — "embedding key rejected by fusion-mlx — check [embed] mlx_api_key/mlx_api_key_file vs fusion-mlx settings.json auth.api_key (or unset them to use the settings.json fallback)" — instead of a bare store-layer error.
+  - **Sync helper**: `fm doctor` and `./start.sh doctor` cross-check the key file (`$FM_HOME/mlx_api_key`) against fusion-mlx's `auth.api_key` and warn (start.sh: fail; fm-cli: DRIFT line) on mismatch, covering match / drift / absent / no-settings states.
+
+### Verified (live)
+- Server started with no `[embed]` key configured: commit + retrieve succeed against real fusion-mlx bge-m3 via the settings.json fallback; wrong explicit key produces the new 401 hint verbatim; `fm doctor` DRIFT/absent states and `./start.sh doctor` drift/healthy states exercised. 555 offline tests green (+3 fallback unit tests), clippy/fmt/live-compile/docs-validate clean.
+
 ## [1.9.1] — 2026-11-13
 
 PATCH release — new client adapter (no Rust code/API change, no schema change), plus a docs-only subset-qualifier fix (#55).

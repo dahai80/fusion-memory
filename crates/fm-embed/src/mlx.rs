@@ -89,6 +89,15 @@ impl MlxEmbedder {
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
             warn!(status = %status, body = %body.chars().take(200).collect::<String>(), "mlx embeddings non-2xx");
+            if status == reqwest::StatusCode::UNAUTHORIZED {
+                // #59: fail-visible — 401 几乎总是 key 漂移 (手管 key 文件 vs fusion-mlx
+                // settings.json), 附排查提示免 store 层 goose chase。
+                return Err(EmbedError::Api(format!(
+                    "status {status}: {} — {}",
+                    body.chars().take(200).collect::<String>(),
+                    crate::config::auth_rejected_hint()
+                )));
+            }
             return Err(EmbedError::Api(format!("status {status}: {body}")));
         }
         let parsed: EmbedResponse = resp

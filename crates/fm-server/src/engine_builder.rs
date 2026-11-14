@@ -39,12 +39,13 @@ pub fn build_server_engine(cfg: &ServerConfig, stub: bool) -> Result<ServerEngin
             api_key: cfg.mlx_api_key.clone(),
             ..EmbedConfig::default()
         };
-        let merged = base.overlay_env();
+        // #59: 全链为空时回落 fusion-mlx settings.json auth.api_key (单一事实来源)。
+        let merged = base.overlay_env().with_settings_fallback();
         info!(
             mlx_url = %merged.mlx_url,
             embed_model = %merged.embed_model,
             has_key = !merged.api_key.is_empty(),
-            "embedding config resolved (#23)"
+            "embedding config resolved (#23, #59 settings fallback)"
         );
         Some(merged)
     };
