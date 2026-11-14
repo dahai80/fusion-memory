@@ -6,6 +6,7 @@
 //! - consolidate(W(t) 回收 + Short→Long 晋升 + entities_pending 重抽)
 //! - get/delete/audit
 
+pub mod admission;
 pub mod entity_extract;
 pub mod export;
 pub mod import_studio;

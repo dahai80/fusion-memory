@@ -70,6 +70,7 @@ source_of_truth:
 
 | 环境变量 | 默认 | 用途 |
 |-----|---------|---------|
+| `FUSION_MEMORY_ADMISSION_GATE` | `0`（关） | v1.10.0 #57 经验准入门；`1` = 持久化前拒绝 no-op 候选（近重复/会话冗余/低新颖性），裁决随记忆落库 |
 | `FUSION_MEMORY_DREAM_INTERVAL_SECS` | `0`（关） | 调度 tick 秒数；`0`/未设 = 完全禁用 dreaming 任务 |
 | `FUSION_MEMORY_DREAM_PENDING_THRESHOLD` | `1` | 触发巩固的最小 pending 实体数 |
 

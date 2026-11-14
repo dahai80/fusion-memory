@@ -203,6 +203,13 @@ pub async fn dispatch(
         "export" => export(params, engine, tenant, acl).await,
         // M7 #48: procedural memory -> SKILL.md export (agent-studio / fusion-harness).
         "export_skills" => export_skills(params, engine, tenant, acl).await,
+        // v1.10.0 #57/#58: revoke-by-meta + share grants + playbook publish/adopt.
+        "revoke" => revoke(params, engine, tenant).await,
+        "grant_access" => grant_access(params, engine).await,
+        "revoke_access" => revoke_access(params, engine).await,
+        "list_grants" => list_grants(params, engine).await,
+        "publish_playbook" => publish_playbook(params, engine, tenant).await,
+        "adopt_playbook" => adopt_playbook(params, engine, tenant).await,
         // v1.9.0 #53: governance panel — read-only scoring/forgetting parameter snapshot.
         "config" => Ok(fm_engine::scoring::governance_snapshot()),
         "health" => Ok(Value::String("ok".into())),
@@ -541,6 +548,191 @@ async fn count(params: Value, engine: &EngineHandle, tenant: &str) -> Result<Val
         .map_err(|e| RpcError::from_engine(&e))?;
     serde_json::to_value(serde_json::json!({"count": n}))
         .map_err(|e| RpcError::internal(e.to_string()))
+}
+
+// ── v1.10.0 #57/#58: revoke-by-meta + share grants + playbook publish/adopt. ──
+
+/// revoke params (#57)。filter 至少一字段 (persist 层 fail-closed), confirm 必填 (B5)。
+#[derive(Debug, Deserialize)]
+struct RevokeParams {
+    filter: fm_core::RevokeFilter,
+    #[serde(default)]
+    confirm: bool,
+}
+
+async fn revoke(params: Value, engine: &EngineHandle, tenant: &str) -> Result<Value, RpcError> {
+    let p: RevokeParams =
+        serde_json::from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+    if !p.confirm {
+        return Err(RpcError::invalid_params(
+            "revoke requires confirm=true (B5 double-confirmation)",
+        ));
+    }
+    let n = engine
+        .revoke_by_meta(&p.filter, tenant)
+        .await
+        .map_err(|e| RpcError::from_engine(&e))?;
+    Ok(serde_json::json!({"revoked_count": n}))
+}
+
+/// grant_access params (#58)。namespace 现仅 agent (fail-closed)。
+#[derive(Debug, Deserialize)]
+struct GrantAccessParams {
+    grantor_key: String,
+    grantee_key: String,
+    #[serde(default = "default_agent_ns")]
+    namespace: String,
+}
+
+fn default_agent_ns() -> String {
+    fm_core::namespace::NS_AGENT.into()
+}
+
+fn validate_grant_keys(p: &GrantAccessParams) -> Result<(), RpcError> {
+    if p.grantor_key.trim().is_empty() || p.grantee_key.trim().is_empty() {
+        return Err(RpcError::invalid_params(
+            "grantor_key/grantee_key must be non-empty",
+        ));
+    }
+    if p.grantor_key.len() > 256 || p.grantee_key.len() > 256 {
+        return Err(RpcError::invalid_params("grant keys must be <= 256 chars"));
+    }
+    if p.namespace != fm_core::namespace::NS_AGENT {
+        return Err(RpcError::invalid_params(
+            r#"namespace must be "agent" (only supported grant tier)"#,
+        ));
+    }
+    Ok(())
+}
+
+async fn grant_access(params: Value, engine: &EngineHandle) -> Result<Value, RpcError> {
+    let p: GrantAccessParams =
+        serde_json::from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+    validate_grant_keys(&p)?;
+    let grant = fm_core::ShareGrant {
+        grantor_key: p.grantor_key.trim().to_string(),
+        grantee_key: p.grantee_key.trim().to_string(),
+        namespace: p.namespace,
+        created_at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0),
+    };
+    engine
+        .grant_access(&grant)
+        .await
+        .map_err(|e| RpcError::from_engine(&e))?;
+    Ok(Value::String("granted".into()))
+}
+
+/// revoke_access params (#58)。confirm 必填 (B5)。
+#[derive(Debug, Deserialize)]
+struct RevokeAccessParams {
+    grantor_key: String,
+    grantee_key: String,
+    #[serde(default = "default_agent_ns")]
+    namespace: String,
+    #[serde(default)]
+    confirm: bool,
+}
+
+async fn revoke_access(params: Value, engine: &EngineHandle) -> Result<Value, RpcError> {
+    let p: RevokeAccessParams =
+        serde_json::from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+    if !p.confirm {
+        return Err(RpcError::invalid_params(
+            "revoke_access requires confirm=true (B5 double-confirmation)",
+        ));
+    }
+    let n = engine
+        .revoke_access(&p.grantor_key, &p.grantee_key, &p.namespace)
+        .await
+        .map_err(|e| RpcError::from_engine(&e))?;
+    Ok(serde_json::json!({"removed": n}))
+}
+
+/// list_grants params (#58)。
+#[derive(Debug, Deserialize)]
+struct ListGrantsParams {
+    grantee_key: String,
+    #[serde(default = "default_agent_ns")]
+    namespace: String,
+}
+
+async fn list_grants(params: Value, engine: &EngineHandle) -> Result<Value, RpcError> {
+    let p: ListGrantsParams =
+        serde_json::from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+    let grants = engine
+        .list_grants(&p.grantee_key, &p.namespace)
+        .await
+        .map_err(|e| RpcError::from_engine(&e))?;
+    serde_json::to_value(grants).map_err(|e| RpcError::internal(e.to_string()))
+}
+
+/// publish_playbook params (#58)。
+#[derive(Debug, Deserialize)]
+struct PublishPlaybookParams {
+    memory_id: String,
+    publisher_key: String,
+}
+
+async fn publish_playbook(
+    params: Value,
+    engine: &EngineHandle,
+    tenant: &str,
+) -> Result<Value, RpcError> {
+    let p: PublishPlaybookParams =
+        serde_json::from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+    if p.publisher_key.trim().is_empty() {
+        return Err(RpcError::invalid_params("publisher_key must be non-empty"));
+    }
+    let id = engine
+        .publish_playbook(&p.memory_id, p.publisher_key.trim(), tenant)
+        .await
+        .map_err(|e| RpcError::from_engine(&e))?;
+    Ok(serde_json::json!({"playbook_id": id}))
+}
+
+/// adopt_playbook params (#58)。采纳必过 #57 准入门 (近重复拒绝)。
+#[derive(Debug, Deserialize)]
+struct AdoptPlaybookParams {
+    playbook_id: String,
+    consumer_namespace: String,
+    consumer_key: String,
+}
+
+async fn adopt_playbook(
+    params: Value,
+    engine: &EngineHandle,
+    tenant: &str,
+) -> Result<Value, RpcError> {
+    let p: AdoptPlaybookParams =
+        serde_json::from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+    if p.consumer_key.trim().is_empty() {
+        return Err(RpcError::invalid_params("consumer_key must be non-empty"));
+    }
+    if !fm_core::namespace::is_valid_namespace(&p.consumer_namespace) {
+        return Err(RpcError::invalid_params(format!(
+            "consumer_namespace must be one of user|project|local|agent|playbook|empty, got {0:?}",
+            p.consumer_namespace
+        )));
+    }
+    let adopted = engine
+        .adopt_playbook(
+            &p.playbook_id,
+            &p.consumer_namespace,
+            p.consumer_key.trim(),
+            tenant,
+        )
+        .await
+        .map_err(|e| RpcError::from_engine(&e))?;
+    match adopted {
+        Some(id) => Ok(serde_json::json!({"adopted": true, "memory_id": id})),
+        None => Ok(
+            serde_json::json!({"adopted": false, "memory_id": Value::Null,
+            "reason": "admission gate rejected (near-duplicate)"}),
+        ),
+    }
 }
 
 // ── #33 web surface (v1.5.0): browse/manage methods (list/audit_log/merges/unmerge/reconcile). ──
@@ -1707,5 +1899,93 @@ mod tests {
         .await;
         let ids: Vec<String> = serde_json::from_value(v["memory_ids"].clone()).unwrap();
         assert_eq!(ids, vec!["ixA".to_string(), "ixB".to_string()]);
+    }
+
+    // ── v1.10.0 #57/#58: revoke / grants / playbook param validation (stub engine). ──
+
+    #[tokio::test]
+    async fn revoke_requires_confirm() {
+        let (eng, _) = stub_handle();
+        let err = dispatch_err(
+            &rpc(
+                "revoke",
+                serde_json::json!({"filter": {"authority": "observed"}}),
+                30,
+            ),
+            &eng,
+        )
+        .await;
+        assert_eq!(err.code, -32602, "B5 confirm required");
+    }
+
+    #[tokio::test]
+    async fn revoke_rejects_empty_filter() {
+        let (eng, _) = stub_handle();
+        let err = dispatch_err(
+            &rpc(
+                "revoke",
+                serde_json::json!({"filter": {}, "confirm": true}),
+                31,
+            ),
+            &eng,
+        )
+        .await;
+        // 空过滤 persist 层 fail-closed (Revoke) → Unsupported。
+        assert_ne!(err.code, 0, "empty filter must fail closed, got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn grant_access_validates_keys_and_namespace() {
+        let (eng, _) = stub_handle();
+        let err = dispatch_err(
+            &rpc(
+                "grant_access",
+                serde_json::json!({"grantor_key": "  ", "grantee_key": "b"}),
+                32,
+            ),
+            &eng,
+        )
+        .await;
+        assert_eq!(err.code, -32602);
+        let err = dispatch_err(
+            &rpc(
+                "grant_access",
+                serde_json::json!({"grantor_key": "a", "grantee_key": "b", "namespace": "user"}),
+                33,
+            ),
+            &eng,
+        )
+        .await;
+        assert_eq!(err.code, -32602, "only agent tier grantable");
+    }
+
+    #[tokio::test]
+    async fn adopt_playbook_validates_namespace() {
+        let (eng, _) = stub_handle();
+        let err = dispatch_err(
+            &rpc(
+                "adopt_playbook",
+                serde_json::json!({"playbook_id": "p1", "consumer_namespace": "bogus", "consumer_key": "k"}),
+                34,
+            ),
+            &eng,
+        )
+        .await;
+        assert_eq!(err.code, -32602);
+    }
+
+    #[tokio::test]
+    async fn publish_playbook_rejects_blank_publisher() {
+        let (eng, _) = stub_handle();
+        let err = dispatch_err(
+            &rpc(
+                "publish_playbook",
+                serde_json::json!({"memory_id": "m1", "publisher_key": " "}),
+                35,
+            ),
+            &eng,
+        )
+        .await;
+        assert_eq!(err.code, -32602);
     }
 }

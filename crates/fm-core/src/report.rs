@@ -47,6 +47,9 @@ pub struct CommitOutcome {
     pub memory_ids: Vec<MemoryId>,
     /// 失败 turn 明细 (embed/insert_vector/persist 失败均记此)。
     pub failed_turns: Vec<TurnFailure>,
+    /// #57: 准入门拒绝的 turn 明细 (stage="admission", error=拒绝原因)。未持久化、无向量。
+    #[serde(default)]
+    pub rejected_turns: Vec<TurnFailure>,
 }
 
 /// 单 turn commit 失败明细 (P1-1)。

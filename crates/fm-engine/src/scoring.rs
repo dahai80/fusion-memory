@@ -3,7 +3,7 @@
 //! score = α*cosine + β*W(t) + γ*graph_affinity
 //! α=0.5, β=0.3, γ=0.2。W(t) 由 fm_similarity::weight_at 算。
 
-use fm_core::{EntityNode, MemoryItem, MemoryType};
+use fm_core::{EntityNode, MemoryItem, MemoryType, SafetyAuthority, SafetyPersistence};
 use fm_graph::{GraphResult, GraphStore};
 use fm_similarity::weight_at;
 use tracing::debug;
@@ -120,14 +120,36 @@ pub fn normalize_bm25(ranks: &[(String, f64)]) -> std::collections::HashMap<Stri
 }
 
 /// 算某 MemoryItem 当前 W(t)。t = now - created_timestamp。
+/// #57: 低权威加速衰减 — 有效年龄 × authority_age_factor (self=1.0 基准, 位不变形)。
 pub fn weight_of(item: &MemoryItem, now: u64) -> f64 {
     weight_at(
         item.weight,
         item.created_timestamp,
-        now,
+        effective_now(item, now),
         item.memory_type,
         item.access_count,
     )
+}
+
+/// #57: 权威层级 → 有效年龄倍率。低权威更快遗忘 (遗忘曲线是门的一部分);
+/// observed=2x / team=0.75x / system=0.5x; self=1.0 (默认, 旧行为位不变)。
+pub fn authority_age_factor(authority: SafetyAuthority) -> f64 {
+    match authority {
+        SafetyAuthority::SelfAuth => 1.0,
+        SafetyAuthority::Observed => 2.0,
+        SafetyAuthority::Team => 0.75,
+        SafetyAuthority::System => 0.5,
+    }
+}
+
+/// #57: 有效 now — created + (now-created)×age_factor。pinned 恒返 created (零衰减)。
+fn effective_now(item: &MemoryItem, now: u64) -> u64 {
+    if item.persistence == SafetyPersistence::Pinned {
+        return item.created_timestamp;
+    }
+    let factor = authority_age_factor(item.authority);
+    let age = now.saturating_sub(item.created_timestamp);
+    item.created_timestamp + (age as f64 * factor) as u64
 }
 
 /// #25: 归一化新鲜度 — 融合评分专用 (retrieval quality ablation 裁定)。
@@ -137,10 +159,14 @@ pub fn weight_of(item: &MemoryItem, now: u64) -> f64 {
 /// recall@5 0.48 → 0.17 (见 docs/benchmarks/retrieval-quality-2026-10-25.md)。
 /// W(t) 原值仍用于 θ_drop/θ_promote 调度阈值 (PRD §7.3), 仅检索排序改用归一化值。
 pub fn freshness_of(item: &MemoryItem, now: u64) -> f64 {
+    // #57: pinned 恒 1.0 (钉住不衰减); 其余走 authority 年龄拉伸。
+    if item.persistence == SafetyPersistence::Pinned {
+        return 1.0;
+    }
     let f = weight_at(
         1.0,
         item.created_timestamp,
-        now,
+        effective_now(item, now),
         item.memory_type,
         item.access_count,
     );
@@ -201,8 +227,11 @@ pub fn score_candidate4(
     Ok(score)
 }
 
-/// 是否该回收 (遗忘)。W(t) < θ_drop。
+/// 是否该回收 (遗忘)。W(t) < θ_drop。#57: pinned 永不回收。
 pub fn should_recycle(item: &MemoryItem, now: u64) -> bool {
+    if item.persistence == SafetyPersistence::Pinned {
+        return false;
+    }
     weight_of(item, now) < THETA_DROP
 }
 

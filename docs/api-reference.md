@@ -46,6 +46,12 @@ source_of_truth:
 | `POST /v1/memory/export` | — | M8 #49 标准导出：`{format: "jsonl"\|"markdown", limit 1..=1000, namespace?, memory_type?}` → `{format, count, body}`；渲染器内无条件 redact（防线 2）；排除 tombstone；ACL owner 过滤 |
 | `POST /v1/memory/export_skills` | — | M7 #48 SKILL.md 导出：Procedural 记忆 → `[{id, name, confidence?, markdown}]`（YAML frontmatter 契约 + Provenance 尾注）；limit 1..=50；ACL owner 过滤 |
 | `POST /v1/memory/config` | — | v1.9.0 #53 治理面板：只读返回评分/遗忘调优常量快照（融合权重/有效期因子/θ 阈值/图跳数） |
+| `POST /v1/memory/revoke` | ✔ | v1.10.0 #57 按元数据撤销：`{filter: {scope?, authority?, persistence?, session_id?, namespace?}, confirm=true}` → `{revoked}`；空过滤 → 错误（fail-closed） |
+| `POST /v1/memory/grant_access` | — | v1.10.0 #58 跨 agent 授权：`{grantor_key, grantee_key, namespace="agent"}`；仅 agent 命名空间，key 非空 ≤256 字符 |
+| `POST /v1/memory/revoke_access` | ✔ | v1.10.0 #58 撤销授权：`{grantor_key, grantee_key, namespace?, confirm=true}` → `{revoked}` |
+| `POST /v1/memory/list_grants` | — | v1.10.0 #58 授权查询：`{grantee_key, namespace?}` → `[{grantor_key, grantee_key, namespace, created_at}]` |
+| `POST /v1/memory/publish_playbook` | — | v1.10.0 #58 发布到共享库：`{memory_id, publisher_key}` → `{playbook_id}`（playbook 命名空间 / team 权威 / pinned / 署名） |
+| `POST /v1/memory/adopt_playbook` | — | v1.10.0 #58 采纳 playbook：`{playbook_id, consumer_namespace, consumer_key}` → `{memory_id}` 或 `{memory_id: null}`（准入门拒绝） |
 | `GET /app` + `/app/*path` | 壳公开 | 内嵌 Web 控制台（数据全部走 Bearer /v1/*；v1.9.0 增 Governance 页 + Audit 页 trust 事件过滤） |
 
 ## JSON-RPC 方法（UDS）

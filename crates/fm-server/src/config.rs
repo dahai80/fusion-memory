@@ -55,6 +55,8 @@ pub struct ServerConfig {
     pub embed_model: String,
     /// #23: fusion-mlx API key (TOML [embed].mlx_api_key / mlx_api_key_file, env FUSION_MEMORY_MLX_API_KEY 优先)。
     pub mlx_api_key: String,
+    /// #57: 经验准入门开关 (env FUSION_MEMORY_ADMISSION_GATE, 默认 false = 旧行为全量入库)。
+    pub admission_gate: bool,
 }
 
 /// P1-8: TOML 配置文件镜像。全字段可选 — 仅出现的字段覆盖默认。
@@ -89,6 +91,8 @@ pub struct ConfigFile {
     pub acl: Option<bool>,
     /// #23: MLX embedding 配置段。
     pub embed: Option<EmbedFileConfig>,
+    /// #57: 准入门开关 (TOML 镜像, env 优先)。
+    pub admission_gate: Option<bool>,
 }
 
 /// #23: `[embed]` 段。fusion-mlx embedding 连接配置的 TOML 镜像。
@@ -154,6 +158,7 @@ impl Default for ServerConfig {
             embed_mlx_url: EmbedConfig::default().mlx_url,
             embed_model: EmbedConfig::default().embed_model,
             mlx_api_key: String::new(),
+            admission_gate: false,
         }
     }
 }
@@ -288,6 +293,9 @@ impl ServerConfig {
             }
         }
         // #23: [embed] 段 (fusion-mlx embedding 连接)。secret_file 同模式: 字段空才读文件。
+        if let Some(b) = f.admission_gate {
+            self.admission_gate = b;
+        }
         if let Some(e) = &f.embed {
             if let Some(u) = &e.mlx_url {
                 self.embed_mlx_url = u.clone();
@@ -349,6 +357,16 @@ impl ServerConfig {
         }
         if let Ok(v) = std::env::var("FUSION_MEMORY_DEFAULT_TENANT") {
             self.default_tenant = v;
+        }
+        if let Ok(v) = std::env::var("FUSION_MEMORY_ADMISSION_GATE") {
+            match v.parse::<bool>() {
+                Ok(b) => self.admission_gate = b,
+                Err(e) => warn!(
+                    raw = %v,
+                    error = %e,
+                    "FUSION_MEMORY_ADMISSION_GATE bad value (expect true/false), fallback default"
+                ),
+            }
         }
         if let Ok(v) = std::env::var("FUSION_MEMORY_MULTI_TENANT") {
             match v.parse::<bool>() {

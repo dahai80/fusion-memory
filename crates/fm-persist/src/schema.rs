@@ -37,8 +37,9 @@ pub const MEMORY_ITEM_DDL_INSERT: &str = "\
 INSERT OR REPLACE INTO memory_item(\
   id,interaction_id,turn_idx,session_id,tenant,memory_type,tier,content,vector_ref,weight,\
   access_count,last_accessed_timestamp,created_timestamp,provenance,tombstone,entities_pending,entities_json,\
-  namespace,namespace_key,valid_from,valid_until,confidence,sources_json,owner\
-) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24)";
+  namespace,namespace_key,valid_from,valid_until,confidence,sources_json,owner,\
+  scope,authority,persistence,admission_json\
+) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28)";
 
 pub const MEMORY_ITEM_DDL_SELECT_BY_ID: &str = "SELECT * FROM memory_item WHERE id=?1";
 
@@ -171,6 +172,19 @@ CREATE TABLE IF NOT EXISTS memory_revision (\
 pub const INDEX_MEMORY_REVISION_MID: &str = "\
 CREATE INDEX IF NOT EXISTS idx_memory_revision_mid ON memory_revision(memory_id, rev)";
 
+// #58: agent 间显式读授权 (grantor_key 授权 grantee_key 读 agent 命名空间)。
+pub const SHARE_GRANT_DDL: &str = "\
+CREATE TABLE IF NOT EXISTS share_grant (\
+  id INTEGER PRIMARY KEY AUTOINCREMENT,\
+  grantor_key TEXT NOT NULL,\
+  grantee_key TEXT NOT NULL,\
+  namespace TEXT NOT NULL DEFAULT 'agent',\
+  created_at INTEGER NOT NULL,\
+  UNIQUE(grantor_key, grantee_key, namespace)\
+)";
+pub const INDEX_SHARE_GRANT_GRANTEE: &str = "\
+CREATE INDEX IF NOT EXISTS idx_share_grant_grantee ON share_grant(grantee_key, namespace)";
+
 pub const MEMORY_FTS_DDL: &str = "\
 CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(\
 content, mem_id UNINDEXED, tokenize='trigram'\
@@ -197,6 +211,8 @@ pub const ALL_DDL: &[&str] = &[
     MEMORY_FTS_DDL,
     MEMORY_REVISION_DDL,
     INDEX_MEMORY_REVISION_MID,
+    SHARE_GRANT_DDL,
+    INDEX_SHARE_GRANT_GRANTEE,
 ];
 
 pub const ALL_PRAGMAS: &[&str] = &[PRAGMA_BUSY, PRAGMA_SYNC, PRAGMA_FK];
@@ -210,7 +226,8 @@ pub const ALL_PRAGMAS: &[&str] = &[PRAGMA_BUSY, PRAGMA_SYNC, PRAGMA_FK];
 //     旧库 ALTER TABLE 补列 DEFAULT '' + 补索引。
 // v5: #39 加 memory_fts FTS5 虚表 (trigram 关键词路); 旧库迁移时回填全部明文行
 //     (enc:v1: 密文行不索引 — 加密部署不走 FTS, 无明文 token 落盘)。
-pub const SCHEMA_VERSION: u32 = 9;
+// v10: #57/#58 加 scope/authority/persistence/admission_json 列 + share_grant 表。
+pub const SCHEMA_VERSION: u32 = 10;
 
 /// §1.10: 读旧库 user_version。新库/空 PRAGMA 返 0。
 pub fn user_version(conn: &rusqlite::Connection) -> rusqlite::Result<u32> {
@@ -344,6 +361,40 @@ pub fn migrate(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
     // v8 → v9: #49 修订历史表 — ALL_DDL 内 CREATE TABLE IF NOT EXISTS 幂等建表, 无 ALTER。
     if from < 9 {
         tracing::info!("migrate: ensured memory_revision table (v9)");
+    }
+    // v9 → v10: #57/#58 — safety/admission 四列 + share_grant 表 (ALL_DDL 幂等)。
+    if from < 10 {
+        for (col, ddl) in [
+            (
+                "scope",
+                "ALTER TABLE memory_item ADD COLUMN scope TEXT NOT NULL DEFAULT 'session'",
+            ),
+            (
+                "authority",
+                "ALTER TABLE memory_item ADD COLUMN authority TEXT NOT NULL DEFAULT 'self'",
+            ),
+            (
+                "persistence",
+                "ALTER TABLE memory_item ADD COLUMN persistence TEXT NOT NULL DEFAULT 'normal'",
+            ),
+            (
+                "admission_json",
+                "ALTER TABLE memory_item ADD COLUMN admission_json TEXT NOT NULL DEFAULT ''",
+            ),
+        ] {
+            let has: i64 = conn.query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM pragma_table_info('memory_item') WHERE name='{col}'"
+                ),
+                [],
+                |r| r.get(0),
+            )?;
+            if has == 0 {
+                conn.execute_batch(ddl)?;
+                tracing::info!(col, "migrate: added safety column to memory_item (v10)");
+            }
+        }
+        tracing::info!("migrate: ensured share_grant table (v10)");
     }
     // v7 → v8: #46 per-memory ACL — owner user id 列 (可空, 旧行 NULL = 共享/旧数据)。
     if from < 8 {

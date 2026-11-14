@@ -82,6 +82,13 @@ pub fn app(state: HttpState) -> axum::Router {
         .route("/v1/memory/export_skills", post(export_skills_route))
         .route("/v1/memory/config", post(config_route))
         .route("/v1/memory/import", post(import_route))
+        // #57/#58: admission gate + shared playbook routes (dispatch semantics identical to UDS).
+        .route("/v1/memory/revoke", post(revoke_route))
+        .route("/v1/memory/grant_access", post(grant_access_route))
+        .route("/v1/memory/revoke_access", post(revoke_access_route))
+        .route("/v1/memory/list_grants", post(list_grants_route))
+        .route("/v1/memory/publish_playbook", post(publish_playbook_route))
+        .route("/v1/memory/adopt_playbook", post(adopt_playbook_route))
         // #33: web UI static assets (web/dist embedded at compile time, no runtime file dependency). Public shell; data goes through Bearer.
         .route("/app", get(web_index))
         .route("/app/*path", get(web_asset))
@@ -253,6 +260,24 @@ async fn count(st: State<HttpState>, h: HeaderMap, j: Json<Value>) -> Response {
 
 // #33 web surface: browse/manage thin routes (dispatch semantics identical to UDS; all go through handle_rpc).
 async fn list_route(st: State<HttpState>, h: HeaderMap, j: Json<Value>) -> Response {
+    handle_rpc(st, h, j).await
+}
+async fn revoke_route(st: State<HttpState>, h: HeaderMap, j: Json<Value>) -> Response {
+    handle_rpc(st, h, j).await
+}
+async fn grant_access_route(st: State<HttpState>, h: HeaderMap, j: Json<Value>) -> Response {
+    handle_rpc(st, h, j).await
+}
+async fn revoke_access_route(st: State<HttpState>, h: HeaderMap, j: Json<Value>) -> Response {
+    handle_rpc(st, h, j).await
+}
+async fn list_grants_route(st: State<HttpState>, h: HeaderMap, j: Json<Value>) -> Response {
+    handle_rpc(st, h, j).await
+}
+async fn publish_playbook_route(st: State<HttpState>, h: HeaderMap, j: Json<Value>) -> Response {
+    handle_rpc(st, h, j).await
+}
+async fn adopt_playbook_route(st: State<HttpState>, h: HeaderMap, j: Json<Value>) -> Response {
     handle_rpc(st, h, j).await
 }
 async fn audit_log_route(st: State<HttpState>, h: HeaderMap, j: Json<Value>) -> Response {

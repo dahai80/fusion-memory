@@ -30,6 +30,10 @@ pub enum PersistError {
     // v1.4.0 #21: 未知 namespace 值 (仅 user/project/local/空 合法), fail-closed 不静默降级。
     #[error("invalid namespace: {0}")]
     Namespace(String),
+
+    // v1.10.0 #57: revoke-by-meta 过滤器非法 (空过滤 / 未知枚举值), fail-closed。
+    #[error("invalid revoke filter: {0}")]
+    Revoke(String),
 }
 
 // §1.1: r2d2::Error → PersistError::Pool (供 Pool::builder().build()? 的 ? 转换)。
@@ -69,6 +73,9 @@ impl PersistError {
             PersistError::Namespace(s) => fm_core::MemoryError::Unsupported(format!(
                 "invalid namespace: {s} (expect user|project|local|empty)"
             )),
+            PersistError::Revoke(s) => {
+                fm_core::MemoryError::Unsupported(format!("invalid revoke filter: {s}"))
+            }
         }
     }
 }
