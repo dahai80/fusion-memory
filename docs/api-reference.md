@@ -51,6 +51,7 @@ source_of_truth:
 | `POST /v1/memory/revoke_access` | ✔ | v1.10.0 #58 撤销授权：`{grantor_key, grantee_key, namespace?, confirm=true}` → `{revoked}` |
 | `POST /v1/memory/list_grants` | — | v1.10.0 #58 授权查询：`{grantee_key, namespace?}` → `[{grantor_key, grantee_key, namespace, created_at}]` |
 | `POST /v1/memory/publish_playbook` | — | v1.10.0 #58 发布到共享库：`{memory_id, publisher_key}` → `{playbook_id}`（playbook 命名空间 / team 权威 / pinned / 署名） |
+| `POST /v1/memory/sleep_run` | — | v1.11.0 #60 睡眠治理：无参数，幂等触发一趟离线预计算 + 准入门重放 → `SleepReport`（consolidated/replay_checked/replay_downweighted/playbook_demoted/duration_ms） |
 | `POST /v1/memory/adopt_playbook` | — | v1.10.0 #58 采纳 playbook：`{playbook_id, consumer_namespace, consumer_key}` → `{memory_id}` 或 `{memory_id: null}`（准入门拒绝） |
 | `GET /app` + `/app/*path` | 壳公开 | 内嵌 Web 控制台（数据全部走 Bearer /v1/*；v1.9.0 增 Governance 页 + Audit 页 trust 事件过滤） |
 

@@ -24,6 +24,8 @@ pub use memory::{
     SafetyScope,
 };
 pub use namespace::NamespaceFilter;
-pub use report::{CommitOutcome, ConsolidationFailure, ConsolidationReport, MemoryId, TurnFailure};
+pub use report::{
+    CommitOutcome, ConsolidationFailure, ConsolidationReport, MemoryId, SleepReport, TurnFailure,
+};
 pub use share::{RevokeFilter, ShareGrant};
 pub use trait_def::FusionMemoryEngine;

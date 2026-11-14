@@ -210,6 +210,8 @@ pub async fn dispatch(
         "list_grants" => list_grants(params, engine).await,
         "publish_playbook" => publish_playbook(params, engine, tenant).await,
         "adopt_playbook" => adopt_playbook(params, engine, tenant).await,
+        // P10 #60: sleep-time curation — manual trigger of one offline pass (idempotent).
+        "sleep_run" => sleep_run(engine).await,
         // v1.9.0 #53: governance panel — read-only scoring/forgetting parameter snapshot.
         "config" => Ok(fm_engine::scoring::governance_snapshot()),
         "health" => Ok(Value::String("ok".into())),
@@ -394,6 +396,15 @@ struct ConsolidateParams {
     namespace: Option<String>,
     #[serde(default)]
     namespace_key: Option<String>,
+}
+
+// P10 #60: sleep-time curation trigger — no params, idempotent, safe to call from ops.
+async fn sleep_run(engine: &EngineHandle) -> Result<Value, RpcError> {
+    let report = engine
+        .sleep_curation()
+        .await
+        .map_err(|e| RpcError::from_engine(&e))?;
+    serde_json::to_value(report).map_err(|e| RpcError::internal(e.to_string()))
 }
 
 async fn consolidate(params: Value, engine: &EngineHandle) -> Result<Value, RpcError> {
@@ -1972,6 +1983,14 @@ mod tests {
         )
         .await;
         assert_eq!(err.code, -32602);
+    }
+
+    // P10 #60: sleep_run dispatches; stub engine (Unsupported default) → engine error.
+    #[tokio::test]
+    async fn sleep_run_dispatches_and_surfaces_unsupported() {
+        let (eng, _) = stub_handle();
+        let res = dispatch_err(&rpc("sleep_run", serde_json::json!({}), 1), &eng).await;
+        assert_ne!(res.code, -32602, "no params validation expected");
     }
 
     #[tokio::test]
