@@ -78,6 +78,112 @@ impl MemoryTier {
     }
 }
 
+/// #57 safety metadata: 可见范围。写入即可撤销/可围栏 (arXiv 2610.00093)。
+/// session=仅本会话 / agent=仅本 agent 命名空间 / team=团队共享 / global=全局。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum SafetyScope {
+    #[default]
+    Session,
+    Agent,
+    Team,
+    Global,
+}
+
+impl SafetyScope {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SafetyScope::Session => "session",
+            SafetyScope::Agent => "agent",
+            SafetyScope::Team => "team",
+            SafetyScope::Global => "global",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "session" => Some(Self::Session),
+            "agent" => Some(Self::Agent),
+            "team" => Some(Self::Team),
+            "global" => Some(Self::Global),
+            _ => None,
+        }
+    }
+}
+
+/// #57 safety metadata: 权威层级 — 驱动衰减速度 (低权威更快遗忘) 与准入阈值。
+/// self=本 agent 自身经验 / observed=观察到的他方行为 / team=团队沉淀 / system=系统写入 (恒准入)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+pub enum SafetyAuthority {
+    #[default]
+    #[serde(rename = "self")]
+    SelfAuth,
+    Observed,
+    Team,
+    System,
+}
+
+impl SafetyAuthority {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SafetyAuthority::SelfAuth => "self",
+            SafetyAuthority::Observed => "observed",
+            SafetyAuthority::Team => "team",
+            SafetyAuthority::System => "system",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "self" => Some(Self::SelfAuth),
+            "observed" => Some(Self::Observed),
+            "team" => Some(Self::Team),
+            "system" => Some(Self::System),
+            _ => None,
+        }
+    }
+}
+
+/// #57 safety metadata: 保留类别。
+/// ephemeral=短住 (快速衰减) / normal=常规遗忘曲线 / pinned=钉住 (不参与回收)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum SafetyPersistence {
+    Ephemeral,
+    #[default]
+    Normal,
+    Pinned,
+}
+
+impl SafetyPersistence {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SafetyPersistence::Ephemeral => "ephemeral",
+            SafetyPersistence::Normal => "normal",
+            SafetyPersistence::Pinned => "pinned",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "ephemeral" => Some(Self::Ephemeral),
+            "normal" => Some(Self::Normal),
+            "pinned" => Some(Self::Pinned),
+            _ => None,
+        }
+    }
+}
+
+/// #57 准入门裁决记录 — 与记忆同行落库供审计 (accepted/rejected + score + reason)。
+/// 确定性门 (Rule 5): 无模型调用, 判定可离线重放。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AdmissionRecord {
+    pub accepted: bool,
+    pub score: f32,
+    pub reason: String,
+    pub gate_version: u32,
+}
+
 /// 记忆条目（turn 级最小存储单元）。PRD §5.2 刷新版。
 ///
 /// 关键字段（相对原始 PRD 变更见 PRD §5.2 注释）：
@@ -133,6 +239,18 @@ pub struct MemoryItem {
     /// None = 共享/旧数据 (所有租户内调用方可见)。仅 multi_tenant+ACL 模式下由服务端权威写入。
     #[serde(default)]
     pub owner: Option<String>,
+    /// #57 safety metadata: 可见范围 (旧数据 = Session 默认)。
+    #[serde(default)]
+    pub scope: SafetyScope,
+    /// #57 safety metadata: 权威层级 (低权威衰减更快, 遗忘曲线 × authority 因子)。
+    #[serde(default)]
+    pub authority: SafetyAuthority,
+    /// #57 safety metadata: 保留类别 (pinned 不参与回收)。
+    #[serde(default)]
+    pub persistence: SafetyPersistence,
+    /// #57 准入门裁决 (None = 门未启用 / 门前数据)。
+    #[serde(default)]
+    pub admission: Option<AdmissionRecord>,
 }
 
 impl MemoryItem {
@@ -174,7 +292,30 @@ impl MemoryItem {
             confidence: None,
             sources: Vec::new(),
             owner: None,
+            scope: SafetyScope::Session,
+            authority: SafetyAuthority::SelfAuth,
+            persistence: SafetyPersistence::Normal,
+            admission: None,
         }
+    }
+
+    /// #57: 挂 safety metadata (scope/authority/persistence)。
+    pub fn with_safety(
+        mut self,
+        scope: SafetyScope,
+        authority: SafetyAuthority,
+        persistence: SafetyPersistence,
+    ) -> Self {
+        self.scope = scope;
+        self.authority = authority;
+        self.persistence = persistence;
+        self
+    }
+
+    /// #57: 挂准入门裁决记录。
+    pub fn with_admission(mut self, record: AdmissionRecord) -> Self {
+        self.admission = Some(record);
+        self
     }
 
     /// issue #21: 挂作用域命名空间 (空 namespace = 全局, 不改旧调用点签名)。

@@ -65,6 +65,15 @@ pub fn build_server_engine(cfg: &ServerConfig, stub: bool) -> Result<ServerEngin
         info!("PII redaction enabled (R8)");
     }
 
+    // #57: 经验准入门 — FUSION_MEMORY_ADMISSION_GATE=1 开启 (默认关, 向后兼容)。
+    if cfg.admission_gate {
+        engine = engine.with_admission(fm_engine::admission::AdmissionConfig {
+            enabled: true,
+            ..Default::default()
+        });
+        info!("admission gate enabled (#57)");
+    }
+
     // M6 #45: 注入检测 — 本地规则层恒开 (离线 fail-safe); FUSION_MEMORY_INJECTION_URL
     // 配置时叠加 fusion-security 委托 (仅 loopback, 防线 1)。未配置 = 零外联。
     if let Ok(url) = std::env::var("FUSION_MEMORY_INJECTION_URL") {

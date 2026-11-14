@@ -304,6 +304,11 @@ pub async fn run_import(engine: &MemoryEngine, source_db: &str) -> Result<Import
             sources: Vec::new(),
             // M5 #46: imported rows are shared (no ACL owner) — legacy data has no user identity.
             owner: None,
+            // #57: legacy rows are pre-gate data — default safety metadata, no admission record.
+            scope: fm_core::SafetyScope::default(),
+            authority: fm_core::SafetyAuthority::default(),
+            persistence: fm_core::SafetyPersistence::default(),
+            admission: None,
         };
         if let Err(e) = engine.persist().put_memory(&item) {
             warn!(id = %row.id, error = %e, "persist failed");

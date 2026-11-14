@@ -36,6 +36,7 @@ pub trait FusionMemoryEngine: Send + Sync {
         Ok(CommitOutcome {
             memory_ids: ids,
             failed_turns: Vec::new(),
+            rejected_turns: Vec::new(),
         })
     }
 
@@ -178,6 +179,78 @@ pub trait FusionMemoryEngine: Send + Sync {
     ) -> MemoryResult<Vec<crate::browse::MemoryRevision>> {
         Err(crate::error::MemoryError::Unsupported(
             "list_revisions not implemented for this engine".into(),
+        ))
+    }
+
+    // v1.10.0 #57/#58: 准入门撤销 + agent 共享授权 + playbook 发布/采纳。
+    // 全部默认 Unsupported (v1.2.0 tenant 模式), 生产 MemoryEngine 覆写。
+
+    /// #57: revoke-by-metadata — 按 scope/authority/persistence/session/namespace 组合
+    /// tombstone 匹配记忆 (AND 语义), 返回撤销条数。空过滤器 fail-closed 拒绝。
+    async fn revoke_by_meta(
+        &self,
+        _filter: &crate::share::RevokeFilter,
+        _tenant: &str,
+    ) -> MemoryResult<u64> {
+        Err(crate::error::MemoryError::Unsupported(
+            "revoke_by_meta not implemented for this engine".into(),
+        ))
+    }
+
+    /// #58: 授予 grantee 读 grantor agent 命名空间的授权 (幂等)。
+    async fn grant_access(&self, _grant: &crate::share::ShareGrant) -> MemoryResult<()> {
+        Err(crate::error::MemoryError::Unsupported(
+            "grant_access not implemented for this engine".into(),
+        ))
+    }
+
+    /// #58: 撤销读授权, 返回删除行数。
+    async fn revoke_access(
+        &self,
+        _grantor_key: &str,
+        _grantee_key: &str,
+        _namespace: &str,
+    ) -> MemoryResult<u64> {
+        Err(crate::error::MemoryError::Unsupported(
+            "revoke_access not implemented for this engine".into(),
+        ))
+    }
+
+    /// #58: 列 grantee 收到的授权。
+    async fn list_grants(
+        &self,
+        _grantee_key: &str,
+        _namespace: &str,
+    ) -> MemoryResult<Vec<crate::share::ShareGrant>> {
+        Err(crate::error::MemoryError::Unsupported(
+            "list_grants not implemented for this engine".into(),
+        ))
+    }
+
+    /// #58: 发布 namespace-local 洞见进共享 playbook 仓库 (authority=team, pinned)。
+    /// 返回 playbook 条目 id。
+    async fn publish_playbook(
+        &self,
+        _memory_id: &str,
+        _publisher_key: &str,
+        _tenant: &str,
+    ) -> MemoryResult<String> {
+        Err(crate::error::MemoryError::Unsupported(
+            "publish_playbook not implemented for this engine".into(),
+        ))
+    }
+
+    /// #58: 采纳 playbook 条目进消费方命名空间 — 过 #57 准入门 (近重复拒绝,
+    /// 无盲传播)。Ok(Some(id)) = 已入库; Ok(None) = 门拒绝 (裁决走 audit)。
+    async fn adopt_playbook(
+        &self,
+        _playbook_id: &str,
+        _consumer_namespace: &str,
+        _consumer_key: &str,
+        _tenant: &str,
+    ) -> MemoryResult<Option<String>> {
+        Err(crate::error::MemoryError::Unsupported(
+            "adopt_playbook not implemented for this engine".into(),
         ))
     }
 }

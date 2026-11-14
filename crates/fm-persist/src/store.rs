@@ -197,6 +197,13 @@ impl Persist {
                 item.confidence.map(|c| c as f64),
                 serde_json::to_string(&item.sources).expect("sources_json serialize"),
                 item.owner,
+                item.scope.as_str(),
+                item.authority.as_str(),
+                item.persistence.as_str(),
+                item.admission
+                    .as_ref()
+                    .map(|a| serde_json::to_string(a).expect("admission_json serialize"))
+                    .unwrap_or_default(),
             ],
         )?;
         for e in &item.entities {
@@ -281,6 +288,13 @@ impl Persist {
                 item.confidence.map(|c| c as f64),
                 serde_json::to_string(&item.sources).expect("sources_json serialize"),
                 item.owner,
+                item.scope.as_str(),
+                item.authority.as_str(),
+                item.persistence.as_str(),
+                item.admission
+                    .as_ref()
+                    .map(|a| serde_json::to_string(a).expect("admission_json serialize"))
+                    .unwrap_or_default(),
             ],
         )?;
         for e in &item.entities {
@@ -1207,6 +1221,110 @@ ORDER BY first_hop ASC LIMIT ?3";
     }
 
     /// P1-3: 追加审计日志 (核心路径 who/when/what)。失败仅 warn 不阻断核心路径。
+    /// #57: revoke-by-metadata — 按元数据组合 tombstone 匹配行 (AND 语义), 返回撤销条数。
+    /// 不清向量 (tombstone 后 consolidate reconcile 物理删, 与显式 delete 同语义)。
+    pub fn revoke_by_meta(&self, f: &fm_core::RevokeFilter, tenant: &str) -> PersistResult<u64> {
+        f.validate().map_err(PersistError::Revoke)?;
+        let mut sql =
+            String::from("UPDATE memory_item SET tombstone=1 WHERE tombstone=0 AND tenant=?1");
+        let mut params_vec: Vec<String> = vec![tenant.to_string()];
+        let mut idx = 2usize;
+        for (col, val) in [
+            ("scope", &f.scope),
+            ("authority", &f.authority),
+            ("persistence", &f.persistence),
+        ] {
+            if let Some(v) = val {
+                sql.push_str(&format!(" AND {col}=?{idx}"));
+                params_vec.push(v.clone());
+                idx += 1;
+            }
+        }
+        if let Some(s) = &f.session_id {
+            sql.push_str(&format!(" AND session_id=?{idx}"));
+            params_vec.push(s.clone());
+            idx += 1;
+        }
+        if let Some(n) = &f.namespace {
+            sql.push_str(&format!(" AND namespace=?{idx}"));
+            params_vec.push(n.clone());
+        }
+        let conn = self.conn_mut()?;
+        let n = conn.execute(&sql, rusqlite::params_from_iter(params_vec.iter()))? as u64;
+        tracing::info!(revoked = n, "revoke_by_meta");
+        Ok(n)
+    }
+
+    /// #58: 新增读授权 (幂等, OR IGNORE)。
+    pub fn add_share_grant(&self, g: &fm_core::ShareGrant) -> PersistResult<()> {
+        let conn = self.conn_mut()?;
+        conn.execute(
+            "INSERT OR IGNORE INTO share_grant(grantor_key,grantee_key,namespace,created_at) VALUES(?1,?2,?3,?4)",
+            rusqlite::params![g.grantor_key, g.grantee_key, g.namespace, g.created_at as i64],
+        )?;
+        Ok(())
+    }
+
+    /// #58: 撤销读授权, 返回删除行数。
+    pub fn remove_share_grant(
+        &self,
+        grantor_key: &str,
+        grantee_key: &str,
+        namespace: &str,
+    ) -> PersistResult<u64> {
+        let conn = self.conn_mut()?;
+        let n = conn.execute(
+            "DELETE FROM share_grant WHERE grantor_key=?1 AND grantee_key=?2 AND namespace=?3",
+            rusqlite::params![grantor_key, grantee_key, namespace],
+        )?;
+        Ok(n as u64)
+    }
+
+    /// #58: 列 grantee 在某 namespace 的全部授权 (agent 检索时展开 extra_keys)。
+    pub fn list_share_grants(
+        &self,
+        grantee_key: &str,
+        namespace: &str,
+    ) -> PersistResult<Vec<fm_core::ShareGrant>> {
+        let conn = self.conn_mut()?;
+        let mut stmt = conn.prepare(
+            "SELECT grantor_key,grantee_key,namespace,created_at FROM share_grant \
+             WHERE grantee_key=?1 AND namespace=?2 ORDER BY id",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![grantee_key, namespace], |r| {
+            Ok(fm_core::ShareGrant {
+                grantor_key: r.get(0)?,
+                grantee_key: r.get(1)?,
+                namespace: r.get(2)?,
+                created_at: r.get::<_, i64>(3)?.max(0) as u64,
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// #57: 准入门会话冗余检查用 — 列同 session 活跃记忆内容, 上限 limit。
+    pub fn list_active_by_session(
+        &self,
+        session_id: &str,
+        limit: usize,
+    ) -> PersistResult<Vec<String>> {
+        let conn = self.conn_mut()?;
+        let mut stmt = conn.prepare(
+            "SELECT content FROM memory_item WHERE session_id=?1 AND tombstone=0 \
+             ORDER BY created_timestamp DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![session_id, limit as i64], |r| r.get(0))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
     pub fn append_audit(
         &self,
         at: u64,
@@ -1288,7 +1406,9 @@ const _: () = {
 /// 返回 (追加到 WHERE 后的谓词, 需绑定在其前参数之后的键值)。空 namespace = 无谓词 (旧行为)。
 /// 未知 namespace 值 fail-closed 报错, 不静默放行 (防越权读其他作用域)。
 fn ns_predicate(ns: &NamespaceFilter, base: usize) -> PersistResult<(String, Vec<String>)> {
-    use fm_core::namespace::{is_valid_namespace, NS_LOCAL, NS_PROJECT, NS_USER};
+    use fm_core::namespace::{
+        is_valid_namespace, NS_AGENT, NS_LOCAL, NS_PLAYBOOK, NS_PROJECT, NS_USER,
+    };
     if !ns.is_active() {
         return Ok((String::new(), Vec::new()));
     }
@@ -1324,6 +1444,30 @@ fn ns_predicate(ns: &NamespaceFilter, base: usize) -> PersistResult<(String, Vec
                 format!(" AND namespace='local' AND namespace_key={key_placeholder}")
             }
         }
+        // #58: agent 命名空间默认隔离 — 只见自己 key (+ 显式授权 extra_keys)。
+        NS_AGENT => {
+            let mut keys = Vec::new();
+            if !ns.key.is_empty() {
+                keys.push(ns.key.clone());
+            }
+            keys.extend(ns.extra_keys.iter().cloned());
+            if keys.is_empty() {
+                " AND namespace='agent'".to_string()
+            } else {
+                let placeholders: Vec<String> = keys
+                    .iter()
+                    .enumerate()
+                    .map(|(i, _)| format!("?{}", base + i))
+                    .collect();
+                key_params.extend(keys);
+                format!(
+                    " AND namespace='agent' AND namespace_key IN ({})",
+                    placeholders.join(",")
+                )
+            }
+        }
+        // #58: playbook 共享仓库租户内全员可见 (key = 发布者署名, 不过滤)。
+        NS_PLAYBOOK => " AND namespace='playbook'".to_string(),
         // is_valid_namespace 已挡, 此处不可达; 保守 fail-closed。
         _ => return Err(PersistError::Namespace(ns.namespace.clone())),
     };
@@ -1433,6 +1577,36 @@ fn row_to_memory(
         sources: serde_json::from_str(&row.get::<_, String>("sources_json")?).unwrap_or_default(),
         // M5 #46: per-memory ACL owner (旧行 NULL = None)。
         owner: row.get::<_, Option<String>>("owner")?,
+        // #57: safety metadata (旧行 DEFAULT 值 = session/self/normal) + 准入裁决。
+        scope: row
+            .get::<_, String>("scope")
+            .ok()
+            .and_then(|s| fm_core::SafetyScope::parse(&s))
+            .unwrap_or_default(),
+        authority: row
+            .get::<_, String>("authority")
+            .ok()
+            .and_then(|s| fm_core::SafetyAuthority::parse(&s))
+            .unwrap_or_default(),
+        persistence: row
+            .get::<_, String>("persistence")
+            .ok()
+            .and_then(|s| fm_core::SafetyPersistence::parse(&s))
+            .unwrap_or_default(),
+        admission: {
+            let raw: String = row.get::<_, String>("admission_json").unwrap_or_default();
+            if raw.is_empty() {
+                None
+            } else {
+                match serde_json::from_str(&raw) {
+                    Ok(v) => Some(v),
+                    Err(e) => {
+                        warn!(error = %e, "row_to_memory: admission_json corrupt, degraded to None");
+                        None
+                    }
+                }
+            }
+        },
     })
 }
 
@@ -2029,6 +2203,45 @@ mod tests {
                 .unwrap();
             assert_eq!(n, 2, "v6 columns restored by migrate");
         }
+    }
+
+    // #57/#58: v10 加 scope/authority/persistence/admission_json 列 + share_grant 表;
+    // 模拟 v9 旧库 (DROP COLUMN + DROP TABLE + 回退版本) → migrate 补齐。
+    #[test]
+    fn schema_v10_safety_share_migration() {
+        let p = Persist::open_in_memory().unwrap();
+        {
+            let c = p.conn().unwrap();
+            c.execute_batch(
+                "ALTER TABLE memory_item DROP COLUMN admission_json;
+                 ALTER TABLE memory_item DROP COLUMN persistence;
+                 ALTER TABLE memory_item DROP COLUMN authority;
+                 ALTER TABLE memory_item DROP COLUMN scope;
+                 DROP TABLE IF EXISTS share_grant;",
+            )
+            .unwrap();
+            c.execute_batch("PRAGMA user_version=9").unwrap();
+            schema::migrate(&c).unwrap();
+            assert_eq!(schema::user_version(&c).unwrap(), schema::SCHEMA_VERSION);
+            let n: i64 = c
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('memory_item') WHERE name IN ('scope','authority','persistence','admission_json')",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 4, "v10 safety columns restored by migrate");
+            // share_grant 表 + 唯一约束 (幂等重复授权)。
+            c.execute_batch(
+                "INSERT INTO share_grant(grantor_key,grantee_key,namespace,created_at) VALUES('a','b','agent',1);
+                 INSERT INTO share_grant(grantor_key,grantee_key,namespace,created_at) VALUES('a','b','agent',2);",
+            )
+            .unwrap_err();
+        }
+        // 旧行 DEFAULT 值生效: 旧库行迁移后 scope/authority/persistence = 默认。
+        let g = p.list_share_grants("b", "agent").unwrap();
+        assert_eq!(g.len(), 1, "unique(grantor,grantee,namespace) dedup");
+        assert_eq!(g[0].grantor_key, "a");
     }
 
     // M6 #45: v7 加 confidence/sources_json 列; 模拟 v6 旧库 (DROP COLUMN + 回退版本) → migrate 补列。

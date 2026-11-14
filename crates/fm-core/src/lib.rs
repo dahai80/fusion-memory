@@ -11,6 +11,7 @@ pub mod interaction;
 pub mod memory;
 pub mod namespace;
 pub mod report;
+pub mod share;
 pub mod trait_def;
 
 pub use browse::{AuditEntry, ListQuery, MemoryRevision, MergeEntry, ProvenanceReport};
@@ -18,7 +19,11 @@ pub use context::{ContextBlock, FormattedContext, RetrieveQuery};
 pub use entity::{EntityNode, EntityType};
 pub use error::{MemoryError, MemoryResult};
 pub use interaction::{Interaction, ToolCall, Turn};
-pub use memory::{MemoryItem, MemoryTier, MemoryType};
+pub use memory::{
+    AdmissionRecord, MemoryItem, MemoryTier, MemoryType, SafetyAuthority, SafetyPersistence,
+    SafetyScope,
+};
 pub use namespace::NamespaceFilter;
 pub use report::{CommitOutcome, ConsolidationFailure, ConsolidationReport, MemoryId, TurnFailure};
+pub use share::{RevokeFilter, ShareGrant};
 pub use trait_def::FusionMemoryEngine;

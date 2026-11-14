@@ -21,6 +21,23 @@ Internal path-dep private ecosystem (not on crates.io); versions tag + GitHub re
 
 ## [Unreleased]
 
+## [1.10.0] — 2026-11-14
+
+MINOR release — experience admission gate + shared playbook repository (issues #57 #58). Additive only; schema v10 (4 guarded ALTERs + `share_grant` table, `CREATE IF NOT EXISTS` idempotent, no wire-contract change). One new env (`FUSION_MEMORY_ADMISSION_GATE`) + one new TOML key (`admission_gate`); six new RPCs (UDS + HTTP): `revoke`, `grant_access`, `revoke_access`, `list_grants`, `publish_playbook`, `adopt_playbook`.
+
+### Added
+- **Experience admission gate (issue #57)**: deterministic replay-style no-op rejection before persistence (Rule 5: no model call, fully offline-replayable). Rules in order: near-duplicate (KNN top-1 cosine ≥ 0.95), session-redundant (token Jaccard ≥ 0.9 vs the last 20 active same-session traces), low-novelty (novelty < `min_novelty` × authority multiplier; self ×1.0 / observed ×2.0 / team ×1.5, system always admitted). Verdicts stored per memory as `AdmissionRecord` (accepted/score/reason/gate_version); rejected turns surface in `CommitOutcome.rejected_turns` (stage `admission`) + `audit_log` (`admission/rejected`), never persisted (no vector/row/wop). Off by default; `FUSION_MEMORY_ADMISSION_GATE=1` / TOML `admission_gate = true` enables (fm-server `engine_builder.rs`).
+- **Safety metadata fields (issue #57)**: every stored memory carries `scope` (session/agent/team/global), `authority` (self/observed/team/system), `persistence` (ephemeral/normal/pinned) — schema v10 columns with guarded defaults; set via `interaction.metadata` free fields (zero wire change). Decay-as-gate: `fm_engine::scoring::authority_age_factor` stretches effective age in the forgetting curve (observed ×2.0 / team ×0.75 / system ×0.5 — low-authority fades faster); `persistence=pinned` pins weight (freshness 1.0) and exempts from recycling.
+- **Revocation by metadata (issue #57)**: `revoke` RPC tombstones memories matching a `RevokeFilter` (scope/authority/persistence/session_id/namespace, combinable); empty filter → error (fail-closed), `confirm=true` required (B5). Returns revoked count.
+- **Shared playbook repository (issue #58)**: two namespace tiers beside v1.4.0 tiers — `agent` (per-key isolation; identical content from two agents invisible to each other without an explicit grant) and `playbook` (shared). `grant_access`/`revoke_access`/`list_grants` manage cross-agent visibility (agent namespace only, grantee rows surface via `namespace_key IN (...)` SQL scoping); `publish_playbook` copies an insight into the shared repo (playbook namespace, team authority, global scope, pinned, publisher-attributed, sources = origin id, wop-replicated); `adopt_playbook` copies it into a consumer agent namespace **through the same admission gate** — similarity evaluated only against consumer-visible memories (playbook copies never self-reject; re-adopting a derivative rejected → blind propagation blocked). Adopt decision audited (`playbook/publish`, `playbook/adopt`, `admission/adopt-rejected`).
+
+### Changed
+- `memory_item` schema v9 → v10: + `scope`/`authority`/`persistence` (NOT NULL DEFAULT, guarded `pragma_table_info` ALTERs) + `admission_json` (DEFAULT '') + `share_grant` table (UNIQUE(grantor_key, grantee_key, namespace)). Old rows migrate to defaults (`session`/`self`/`normal`).
+- HTTP surface: 6 new `/v1/memory/*` routes mirroring the new UDS methods (same dispatch layer, v1.5.0 pattern).
+
+### Tests
+- 7-case offline integration suite `crates/fm-engine/tests/admission_gate.rs` (gate off/on, duplicate replay, safety metadata + pinned decay, revoke-by-metadata, gated-vs-ungated benchmark with per-fact recall floor, agent isolation + grants + publish + gated adopt + re-adopt rejection, system-authority bypass); fm-engine admission unit tests (7); fm-persist schema v10 migration test; fm-server RPC validation tests (confirm required, empty-filter fail-closed, grant key/namespace validation, playbook param validation). Workspace 575 tests green (39 suites).
+
 ## [1.9.2] — 2026-11-14
 
 PATCH release — embedding API key drift fix (issue #59). No wire-contract change; one new env (`FUSION_MEMORY_MLX_SETTINGS_JSON`).

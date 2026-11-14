@@ -62,6 +62,8 @@ pub struct MemoryEngine {
     /// M6 #45: 可选 fusion-security HTTP 扫描器 (None = 纯本地规则层, 100% 离线)。
     /// 本地规则层 LocalScanner 恒跑 — 无字段, injection_scan() 内固定组合。
     http_scanner: Option<std::sync::Arc<crate::trust::HttpScanner>>,
+    /// #57: 经验准入门配置。None = 门未装配 (旧行为, 全量入库)。
+    admission: Option<crate::admission::AdmissionConfig>,
 }
 
 /// M2 #40: 在飞请求 RAII guard。构造 +1, drop -1, early-return / 错误路径均不漏计。
@@ -100,7 +102,14 @@ impl MemoryEngine {
             tenant: String::new(),
             inflight: std::sync::atomic::AtomicUsize::new(0),
             http_scanner: None,
+            admission: None,
         }
+    }
+
+    /// #57: 装配经验准入门 (fm-server 按 FUSION_MEMORY_ADMISSION_GATE=1 注入)。
+    pub fn with_admission(mut self, cfg: crate::admission::AdmissionConfig) -> Self {
+        self.admission = Some(cfg);
+        self
     }
 
     /// M6 #45: 装配注入扫描器 (替换默认 LocalScanner 组合)。
@@ -778,7 +787,23 @@ impl MemoryEngine {
         let _inflight = InflightGuard::enter(&self.inflight);
         let mut ids = Vec::with_capacity(interaction.turns.len());
         let mut failed_turns: Vec<fm_core::TurnFailure> = Vec::new();
+        // #57: 准入门拒绝的 turn (不落库、无向量、无 wop — 与失败分列)。
+        let mut rejected_turns: Vec<fm_core::TurnFailure> = Vec::new();
         let now = Self::now_ms();
+        // #57: safety metadata 经 interaction.metadata 自由字段传入 (valid_from 同款)。
+        let (scope, authority, persistence) =
+            crate::admission::safety_from_metadata(&interaction.metadata);
+        if interaction.metadata.get("scope").is_some()
+            || interaction.metadata.get("authority").is_some()
+            || interaction.metadata.get("persistence").is_some()
+        {
+            debug!(
+                scope = scope.as_str(),
+                authority = authority.as_str(),
+                persistence = persistence.as_str(),
+                "commit: safety metadata resolved"
+            );
+        }
         for turn in &interaction.turns {
             let id = Self::new_ulid();
             let raw = Self::turn_content(turn);
@@ -821,6 +846,8 @@ impl MemoryEngine {
             // M5 #46: per-memory ACL owner — multi_tenant+ACL 模式下 fm-server 已用 JWT sub
             // 权威覆盖 interaction.owner (客户端自报值不可信); 其余模式 None = 共享。
             item.owner = interaction.owner.clone();
+            // #57: safety metadata 落每条记忆 (scope/authority/persistence)。
+            item = item.with_safety(scope, authority, persistence);
             let vec_id = vector_id_from_ulid(&id);
             // §3.7: embed 失败 (fusion-mlx 429/挂) → 跳过此 turn 不 abort 整交互。
             let vec = match self.embedder.embed(&content).await {
@@ -836,6 +863,53 @@ impl MemoryEngine {
                     continue;
                 }
             };
+            // #57: 准入门 — embed 后、插向量前判定 (候选不在库, KNN top-1 天然排除自身)。
+            // 拒绝的 turn 不插向量不落库不写 wop, 裁决记录走 audit + rejected_turns。
+            if let Some(gate) = &self.admission {
+                let knn = self.store.search_knn(&vec, 1)?;
+                let cand_sim_max = knn.first().map(|(_, s)| *s).unwrap_or(0.0);
+                let session_traces = self
+                    .persist
+                    .list_active_by_session(session_id, crate::admission::SESSION_TRACE_WINDOW)
+                    .unwrap_or_default();
+                let verdict = crate::admission::evaluate(
+                    &content,
+                    cand_sim_max,
+                    &session_traces,
+                    gate,
+                    authority,
+                );
+                item.admission = Some(fm_core::AdmissionRecord {
+                    accepted: verdict.accepted,
+                    score: verdict.score,
+                    reason: verdict.reason.clone(),
+                    gate_version: crate::admission::GATE_VERSION,
+                });
+                if !verdict.accepted {
+                    info!(
+                        id = %id,
+                        turn_idx = turn.turn_idx,
+                        reason = %verdict.reason,
+                        score = verdict.score,
+                        "commit: admission gate rejected turn"
+                    );
+                    if let Err(e) = self.persist.append_audit(
+                        now,
+                        "admission",
+                        "rejected",
+                        &id,
+                        &format!("reason={} score={:.3}", verdict.reason, verdict.score),
+                    ) {
+                        warn!(error = %e, "admission audit append failed, non-fatal");
+                    }
+                    rejected_turns.push(fm_core::TurnFailure {
+                        turn_idx: turn.turn_idx,
+                        stage: "admission".into(),
+                        error: verdict.reason,
+                    });
+                    continue;
+                }
+            }
             if let Err(e) = self.store.insert_vector(vec_id, &vec) {
                 warn!(id = %id, turn_idx = turn.turn_idx, error = %e, "commit: insert_vector failed, skip turn");
                 failed_turns.push(fm_core::TurnFailure {
@@ -901,14 +975,16 @@ impl MemoryEngine {
             turns = interaction.turns.len(),
             committed = ids.len(),
             failed = failed_turns.len(),
+            rejected = rejected_turns.len(),
             "commit done"
         );
         // P1-3: 审计日志。actor=session_id (谁), action=commit, target=interaction.id, detail=turn 统计。
         let detail = format!(
-            "turns={} committed={} failed={}",
+            "turns={} committed={} failed={} rejected={}",
             interaction.turns.len(),
             ids.len(),
-            failed_turns.len()
+            failed_turns.len(),
+            rejected_turns.len()
         );
         if let Err(e) =
             self.persist
@@ -919,6 +995,7 @@ impl MemoryEngine {
         Ok(fm_core::CommitOutcome {
             memory_ids: ids,
             failed_turns,
+            rejected_turns,
         })
     }
     async fn consolidate_impl(
@@ -1248,7 +1325,24 @@ impl fm_core::FusionMemoryEngine for MemoryEngine {
             .map_err(|e| e.to_memory())?;
         // issue #21: 作用域过滤在 KNN 之后 (store trait 无元数据过滤), 命中会被过滤掉,
         // 故激活时超采样 4x 缓解 top_k 欠填充。
-        let ns_filter = NamespaceFilter::new(query.namespace.clone(), query.namespace_key.clone());
+        let mut ns_filter =
+            NamespaceFilter::new(query.namespace.clone(), query.namespace_key.clone());
+        // #58: agent 命名空间检索展开显式授权 (grantee 收到的 share_grant → extra_keys)。
+        if ns_filter.namespace == fm_core::namespace::NS_AGENT && !ns_filter.key.is_empty() {
+            match self
+                .persist
+                .list_share_grants(&ns_filter.key, fm_core::namespace::NS_AGENT)
+            {
+                Ok(grants) => {
+                    let extra: Vec<String> = grants.into_iter().map(|g| g.grantor_key).collect();
+                    if !extra.is_empty() {
+                        debug!(granted = extra.len(), "retrieve: share grants expanded");
+                        ns_filter = ns_filter.with_grants(extra);
+                    }
+                }
+                Err(e) => warn!(error = %e, "retrieve: share grant lookup failed, own-key only"),
+            }
+        }
         let knn_k = if ns_filter.is_active() {
             query.top_k.saturating_mul(4)
         } else {
@@ -1716,6 +1810,272 @@ impl fm_core::FusionMemoryEngine for MemoryEngine {
         self.persist
             .list_revisions(id, 200)
             .map_err(|e| fm_core::MemoryError::Store(e.to_string()))
+    }
+
+    // ===== v1.10.0 #57/#58: revoke-by-meta + share grants + playbook =====
+
+    async fn revoke_by_meta(
+        &self,
+        filter: &fm_core::RevokeFilter,
+        tenant: &str,
+    ) -> fm_core::MemoryResult<u64> {
+        let n = self
+            .persist
+            .revoke_by_meta(filter, tenant)
+            .map_err(|e| e.to_memory())?;
+        if let Err(e) = self.persist.append_audit(
+            Self::now_ms(),
+            "admission",
+            "revoke",
+            "-",
+            &format!("revoked={n}"),
+        ) {
+            warn!(error = %e, "revoke audit append failed, non-fatal");
+        }
+        Ok(n)
+    }
+
+    async fn grant_access(&self, grant: &fm_core::ShareGrant) -> fm_core::MemoryResult<()> {
+        self.persist
+            .add_share_grant(grant)
+            .map_err(|e| e.to_memory())?;
+        info!(
+            grantor = %grant.grantor_key,
+            grantee = %grant.grantee_key,
+            namespace = %grant.namespace,
+            "share grant added"
+        );
+        Ok(())
+    }
+
+    async fn revoke_access(
+        &self,
+        grantor_key: &str,
+        grantee_key: &str,
+        namespace: &str,
+    ) -> fm_core::MemoryResult<u64> {
+        let n = self
+            .persist
+            .remove_share_grant(grantor_key, grantee_key, namespace)
+            .map_err(|e| e.to_memory())?;
+        info!(
+            grantor = grantor_key,
+            grantee = grantee_key,
+            removed = n,
+            "share grant removed"
+        );
+        Ok(n)
+    }
+
+    async fn list_grants(
+        &self,
+        grantee_key: &str,
+        namespace: &str,
+    ) -> fm_core::MemoryResult<Vec<fm_core::ShareGrant>> {
+        self.persist
+            .list_share_grants(grantee_key, namespace)
+            .map_err(|e| e.to_memory())
+    }
+
+    async fn publish_playbook(
+        &self,
+        memory_id: &str,
+        publisher_key: &str,
+        tenant: &str,
+    ) -> fm_core::MemoryResult<String> {
+        // 主体必须在调用方租户内可见 (跨租户 → NotFound, 不泄露存在性)。
+        let src = self
+            .get_memory_tenant(memory_id, tenant)
+            .await?
+            .ok_or_else(|| fm_core::MemoryError::NotFound(memory_id.to_string()))?;
+        let new_id = Self::new_ulid();
+        // 向量: 内容 re-embed (bge-m3 跨进程浮点不确定, 但 playbook 是新独立条目,
+        // 检索以自身 embedding 为准, 无跨条目对齐需求)。
+        let vec = self
+            .embedder
+            .embed(&src.content)
+            .await
+            .map_err(|e| e.to_memory())?;
+        let vec_id = vector_id_from_ulid(&new_id);
+        self.store
+            .insert_vector(vec_id, &vec)
+            .map_err(|e| fm_core::MemoryError::Store(e.to_string()))?;
+        let mut item = MemoryItem::new_turn_skeleton(
+            new_id.clone(),
+            src.interaction_id.clone(),
+            src.turn_idx,
+            src.session_id.clone(),
+            tenant.to_string(),
+            src.memory_type,
+            src.content.clone(),
+            Self::now_ms(),
+        )
+        .with_namespace(fm_core::namespace::NS_PLAYBOOK, publisher_key)
+        .with_safety(
+            fm_core::SafetyScope::Global,
+            fm_core::SafetyAuthority::Team,
+            // playbook 钉住 — 共享资产不随个人遗忘曲线回收。
+            fm_core::SafetyPersistence::Pinned,
+        );
+        item.vector_ref = vec_id.to_string();
+        item.entities = src.entities.clone();
+        item.entities_pending = false;
+        item.sources = vec![src.id.clone()];
+        // §2.4: 单事务落库 + wop (op=commit envelope, follower 按普通 put 回放)。
+        let envelope = fm_cluster::CommitEnvelope {
+            item: item.clone(),
+            vector: Some(vec),
+        };
+        let payload = serde_json::to_string(&envelope).map_err(fm_core::MemoryError::Serde)?;
+        let now = Self::now_ms();
+        if let Err(e) = self
+            .persist
+            .put_memory_with_wop(&item, "commit", &payload, now)
+        {
+            let _ = self.store.delete_vector(vec_id);
+            return Err(e.to_memory());
+        }
+        if let Err(e) = self.persist.append_audit(
+            now,
+            "playbook",
+            "publish",
+            &new_id,
+            &format!("source={} publisher={publisher_key}", src.id),
+        ) {
+            warn!(error = %e, "publish audit append failed, non-fatal");
+        }
+        info!(playbook = %new_id, source = %src.id, publisher = publisher_key, "playbook published");
+        Ok(new_id)
+    }
+
+    async fn adopt_playbook(
+        &self,
+        playbook_id: &str,
+        consumer_namespace: &str,
+        consumer_key: &str,
+        tenant: &str,
+    ) -> fm_core::MemoryResult<Option<String>> {
+        // 消费方命名空间 fail-closed 校验 (非法层级拒绝, 不静默降级)。
+        if !fm_core::namespace::is_valid_namespace(consumer_namespace) {
+            return Err(fm_core::MemoryError::Unsupported(format!(
+                "invalid consumer namespace: {consumer_namespace}"
+            )));
+        }
+        // playbook 条目必须真在共享仓库 (namespace=playbook), 否则 NotFound。
+        let src = self
+            .get_memory_tenant(playbook_id, tenant)
+            .await?
+            .ok_or_else(|| fm_core::MemoryError::NotFound(playbook_id.to_string()))?;
+        if src.namespace != fm_core::namespace::NS_PLAYBOOK {
+            return Err(fm_core::MemoryError::NotFound(playbook_id.to_string()));
+        }
+        // #58: 采纳必过 #57 准入门 — 近重复拒绝, 无盲传播。
+        // 裁决对照 = 消费方命名空间内已有条目的最近邻: KNN 全库取 top-10 候选,
+        // 再按消费方 namespace 过滤 (store trait 无元数据过滤, 检索主路径同款超采样思路)。
+        // 消费方没有的知识才采纳 — 已有同内容 (含上次采纳副本) → 拒绝。
+        let vec = self
+            .embedder
+            .embed(&src.content)
+            .await
+            .map_err(|e| e.to_memory())?;
+        let knn = self
+            .store
+            .search_knn(&vec, 10)
+            .map_err(|e| fm_core::MemoryError::Store(e.to_string()))?;
+        let vids: Vec<u64> = knn.iter().map(|(v, _)| *v).collect();
+        let ns_filter = NamespaceFilter::new(consumer_namespace, consumer_key);
+        let hits = self
+            .persist
+            .get_by_vector_refs_tenant_scoped(&vids, tenant, &ns_filter)
+            .map_err(|e| e.to_memory())?;
+        let visible_refs: std::collections::HashSet<u64> = hits
+            .iter()
+            .filter_map(|m| m.vector_ref.parse::<u64>().ok())
+            .collect();
+        let cand_sim_max = knn
+            .iter()
+            .filter(|(vid, _)| visible_refs.contains(vid))
+            .map(|(_, s)| *s)
+            .fold(0.0f32, f32::max);
+        let verdict = crate::admission::evaluate(
+            &src.content,
+            cand_sim_max,
+            &[],
+            &crate::admission::AdmissionConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            fm_core::SafetyAuthority::Team,
+        );
+        let now = Self::now_ms();
+        if !verdict.accepted {
+            info!(playbook = playbook_id, reason = %verdict.reason, "adopt: admission gate rejected");
+            if let Err(e) = self.persist.append_audit(
+                now,
+                "admission",
+                "adopt-rejected",
+                playbook_id,
+                &format!("consumer={consumer_key} reason={}", verdict.reason),
+            ) {
+                warn!(error = %e, "adopt audit append failed, non-fatal");
+            }
+            return Ok(None);
+        }
+        let new_id = Self::new_ulid();
+        let vec_id = vector_id_from_ulid(&new_id);
+        self.store
+            .insert_vector(vec_id, &vec)
+            .map_err(|e| fm_core::MemoryError::Store(e.to_string()))?;
+        let mut item = MemoryItem::new_turn_skeleton(
+            new_id.clone(),
+            src.interaction_id.clone(),
+            src.turn_idx,
+            src.session_id.clone(),
+            tenant.to_string(),
+            src.memory_type,
+            src.content.clone(),
+            now,
+        )
+        .with_namespace(consumer_namespace, consumer_key)
+        .with_safety(
+            fm_core::SafetyScope::Agent,
+            // 采纳来源 = 团队共享, 权威 team (衰减比 observed 慢, 比 self 快)。
+            fm_core::SafetyAuthority::Team,
+            fm_core::SafetyPersistence::Normal,
+        );
+        item.vector_ref = vec_id.to_string();
+        item.entities = src.entities.clone();
+        item.entities_pending = false;
+        item.sources = vec![src.id.clone()];
+        item.admission = Some(fm_core::AdmissionRecord {
+            accepted: true,
+            score: verdict.score,
+            reason: "adopted".into(),
+            gate_version: crate::admission::GATE_VERSION,
+        });
+        let envelope = fm_cluster::CommitEnvelope {
+            item: item.clone(),
+            vector: Some(vec),
+        };
+        let payload = serde_json::to_string(&envelope).map_err(fm_core::MemoryError::Serde)?;
+        if let Err(e) = self
+            .persist
+            .put_memory_with_wop(&item, "commit", &payload, now)
+        {
+            let _ = self.store.delete_vector(vec_id);
+            return Err(e.to_memory());
+        }
+        if let Err(e) = self.persist.append_audit(
+            now,
+            "playbook",
+            "adopt",
+            &new_id,
+            &format!("source={} consumer={consumer_key}", src.id),
+        ) {
+            warn!(error = %e, "adopt audit append failed, non-fatal");
+        }
+        info!(adopted = %new_id, playbook = playbook_id, consumer = consumer_key, "playbook adopted");
+        Ok(Some(new_id))
     }
 }
 
