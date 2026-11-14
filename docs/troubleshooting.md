@@ -30,6 +30,7 @@ source_of_truth:
 | HTTP 401 | Bearer 缺失/错误；多租户模式空租户 | 带 `Authorization: Bearer`；多租户下必须携带含租户的身份 JWT |
 | HTTP 403 | JWT tid 与请求租户不匹配 | 核对 fusion-identity 签发的 tid 与调用参数 |
 | 检索结果质量差 | StubEmbedder 在用（FNV 嵌入）或 MLX 不可达 | 确认 `FUSION_MEMORY_STUB` 未设、`FUSION_MLX_URL` 可达、bge-m3 已加载 |
+| embedding 报 401 Unauthorized（`invalid_api_key`） | #59：手管 key 文件与 fusion-mlx settings.json 漂移（key 轮换后文件失效） | 删除 `[embed].mlx_api_key_file` 指向的文件并取消配置 → 服务端回落读 `~/.fusion-mlx/settings.json` 的 `auth.api_key`（`FUSION_MEMORY_MLX_SETTINGS_JSON` 可覆盖路径）；`fm doctor` / `./start.sh doctor` 可交叉比对 |
 | commit 报错维度不符 | `FUSION_MEMORY_DIM` 与实际嵌入维度不一致 | 保持 1024（bge-m3）或与模型一致 |
 | delete/unmerge/reconcile 被拒 | 破坏性操作缺 confirm | 请求 params 加 `"confirm": true` |
 | `-32602` | namespace 等参数非法（fail-closed） | 修正参数；合法可见性层级为 user/project/local |

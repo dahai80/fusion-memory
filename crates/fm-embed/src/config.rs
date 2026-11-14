@@ -1,5 +1,7 @@
 //! fm-embed 配置。PRD §12.3。
 
+use tracing::info;
+
 /// embedding 配置。env 覆盖见 from_env。
 #[derive(Debug, Clone)]
 pub struct EmbedConfig {
@@ -67,6 +69,55 @@ impl EmbedConfig {
     pub fn embeddings_url(&self) -> String {
         format!("{}/embeddings", self.mlx_url.trim_end_matches('/'))
     }
+
+    /// #59: api_key 为空时回落读 fusion-mlx settings.json 的 auth.api_key (单一事实来源,
+    /// 免手工 key 文件漂移)。路径 env FUSION_MEMORY_MLX_SETTINGS_JSON 可覆盖, 默认
+    /// ~/.fusion-mlx/settings.json。已配 key 不覆盖 (显式配置优先)。读失败静默跳过 (回落
+    /// 失败不应阻塞启动; 401 时 mlx.rs 错误信息给出排查提示)。
+    pub fn with_settings_fallback(mut self) -> Self {
+        if self.api_key.is_empty() {
+            if let Some(key) = mlx_settings_api_key() {
+                info!(
+                    path = %mlx_settings_path().display(),
+                    "embed api_key empty, fell back to fusion-mlx settings.json auth.api_key (#59)"
+                );
+                self.api_key = key;
+            }
+        }
+        self
+    }
+}
+
+/// #59: fusion-mlx settings.json 路径。env FUSION_MEMORY_MLX_SETTINGS_JSON 覆盖,
+/// 默认 $HOME/.fusion-mlx/settings.json。
+pub fn mlx_settings_path() -> std::path::PathBuf {
+    if let Ok(p) = std::env::var("FUSION_MEMORY_MLX_SETTINGS_JSON") {
+        return std::path::PathBuf::from(p);
+    }
+    if let Some(h) = std::env::var_os("HOME") {
+        return std::path::PathBuf::from(h)
+            .join(".fusion-mlx")
+            .join("settings.json");
+    }
+    std::path::PathBuf::from(".fusion-mlx/settings.json")
+}
+
+/// #59: 读 fusion-mlx settings.json 的 auth.api_key。文件缺失/无 auth/api_key/空串 → None。
+pub fn mlx_settings_api_key() -> Option<String> {
+    let path = mlx_settings_path();
+    let raw = std::fs::read_to_string(&path).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let key = v.get("auth")?.get("api_key")?.as_str()?.trim().to_string();
+    if key.is_empty() {
+        None
+    } else {
+        Some(key)
+    }
+}
+
+/// #59: 401 时附带的排查提示 (fail-visible, 免 store 层 goose chase)。
+pub fn auth_rejected_hint() -> &'static str {
+    "embedding key rejected by fusion-mlx — check [embed] mlx_api_key/mlx_api_key_file vs fusion-mlx settings.json auth.api_key (or unset them to use the settings.json fallback)"
 }
 
 #[cfg(test)]
@@ -144,5 +195,58 @@ mod tests {
         assert_eq!(c.embed_model, "custom-model");
         assert_eq!(c.api_key, "env-key", "env 设 → 覆盖 base");
         std::env::remove_var("FUSION_MEMORY_MLX_API_KEY");
+    }
+
+    // #59: settings.json 回落。临时目录 + env 路径覆盖, ENV_LOCK 串行化。
+    #[test]
+    fn settings_fallback_only_when_key_empty() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("fm-embed-59-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        std::fs::write(&path, r#"{"auth": {"api_key": "settings-key-59"}}"#).unwrap();
+        std::env::set_var("FUSION_MEMORY_MLX_SETTINGS_JSON", &path);
+
+        // 空 key → 回落 settings.json
+        let empty = EmbedConfig {
+            api_key: String::new(),
+            ..Default::default()
+        };
+        assert_eq!(empty.with_settings_fallback().api_key, "settings-key-59");
+        // 已配 key → 不覆盖 (显式配置优先)
+        let explicit = EmbedConfig {
+            api_key: "explicit-key".into(),
+            ..Default::default()
+        };
+        assert_eq!(explicit.with_settings_fallback().api_key, "explicit-key");
+
+        std::env::remove_var("FUSION_MEMORY_MLX_SETTINGS_JSON");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn settings_api_key_missing_or_bad_returns_none() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("fm-embed-59b-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        // 文件缺失
+        std::env::set_var("FUSION_MEMORY_MLX_SETTINGS_JSON", &path);
+        assert!(mlx_settings_api_key().is_none());
+        // 坏 json
+        std::fs::write(&path, "not-json").unwrap();
+        assert!(mlx_settings_api_key().is_none());
+        // 空 api_key
+        std::fs::write(&path, r#"{"auth": {"api_key": ""}}"#).unwrap();
+        assert!(mlx_settings_api_key().is_none());
+        std::env::remove_var("FUSION_MEMORY_MLX_SETTINGS_JSON");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn auth_hint_nonempty_and_actionable() {
+        let h = auth_rejected_hint();
+        assert!(h.contains("settings.json"));
+        assert!(h.contains("mlx_api_key"));
     }
 }

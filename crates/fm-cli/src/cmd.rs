@@ -12,6 +12,58 @@ use tracing::info;
 use crate::paths::resolve_home;
 use crate::{Cli, ClusterCmd, Cmd};
 
+fn mask(key: &str) -> String {
+    let n = key.chars().count();
+    if n <= 6 {
+        "<short key>".into()
+    } else {
+        format!("{}…({n} chars)", key.chars().take(6).collect::<String>())
+    }
+}
+
+/// #59: embed key 漂移检查 — FM_HOME/mlx_api_key 文件 vs fusion-mlx settings.json
+/// auth.api_key (单一事实来源)。不一致 warn + 提示 (文件失效是 401 高频根因)。
+fn check_embed_key_drift(home: &Option<String>) {
+    let settings_key = fm_embed::config::mlx_settings_api_key();
+    println!(
+        "  mlx settings.json: {} ({})",
+        settings_key
+            .as_ref()
+            .map(|k| mask(k))
+            .as_deref()
+            .unwrap_or("not found / no auth.api_key"),
+        fm_embed::config::mlx_settings_path().display()
+    );
+    let key_file = resolve_home(home).join("mlx_api_key");
+    let file_key = std::fs::read_to_string(&key_file)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    match (&file_key, &settings_key) {
+        (Some(f), Some(s)) if f != s => {
+            println!(
+                "  embed key file: {} — DRIFT vs settings.json {} → 401 risk; update the file or delete it and unset [embed].mlx_api_key_file to use the settings.json fallback",
+                key_file.display(),
+                mask(s)
+            );
+        }
+        (Some(_), Some(_)) => println!("  embed key file: matches settings.json (ok)"),
+        (Some(f), None) => {
+            println!(
+                "  embed key file: {} (settings.json unreadable — cannot cross-check)",
+                mask(f)
+            );
+        }
+        (None, Some(s)) => println!(
+            "  embed key file: absent — server will fall back to settings.json key {} (#59)",
+            mask(s)
+        ),
+        (None, None) => println!(
+            "  embed key: none found in file or settings.json — embeddings will 401 if fusion-mlx auth is on"
+        ),
+    }
+}
+
 fn build_engine(home: &Option<String>, dim: usize) -> Result<MemoryEngine, String> {
     let dir = resolve_home(home);
     std::fs::create_dir_all(&dir).map_err(|e| format!("create home dir: {e}"))?;
@@ -35,7 +87,7 @@ pub async fn run(cli: &Cli) -> Result<(), String> {
         } => query(&engine, text, *top_k, *budget).await,
         Cmd::Stats => stats(&engine).await,
         Cmd::Delete { id, confirm } => delete(&engine, id, *confirm).await,
-        Cmd::Doctor => doctor(&engine).await,
+        Cmd::Doctor => doctor(&engine, &cli.home).await,
         Cmd::Consolidate => consolidate(&engine).await,
         Cmd::Merges => merges(&engine).await,
         Cmd::Unmerge { id } => unmerge(&engine, *id).await,
@@ -118,7 +170,7 @@ async fn delete(engine: &MemoryEngine, id: &str, confirm: bool) -> Result<(), St
     Ok(())
 }
 
-async fn doctor(engine: &MemoryEngine) -> Result<(), String> {
+async fn doctor(engine: &MemoryEngine, home: &Option<String>) -> Result<(), String> {
     let store_ok = engine.store().dimension() > 0;
     let n = engine
         .persist()
@@ -128,6 +180,7 @@ async fn doctor(engine: &MemoryEngine) -> Result<(), String> {
     println!("  store:  {}", if store_ok { "ok" } else { "fail" });
     println!("  persist: ok");
     println!("  memories: {n}");
+    check_embed_key_drift(home);
     info!("doctor done");
     Ok(())
 }
@@ -533,7 +586,7 @@ mod tests {
     #[tokio::test]
     async fn doctor_runs() {
         let eng = build(32);
-        doctor(&eng).await.unwrap();
+        doctor(&eng, &None).await.unwrap();
     }
 
     #[tokio::test]
