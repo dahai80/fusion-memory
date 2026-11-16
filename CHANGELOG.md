@@ -21,6 +21,13 @@ Internal path-dep private ecosystem (not on crates.io); versions tag + GitHub re
 
 ## [Unreleased]
 
+## [1.12.1] — 2026-11-16
+
+PATCH release — CI efficiency retrofit (issue #66, fusion#2 checklist). Workflow-only; zero Rust code/API change; crate versions bumped for release bookkeeping only.
+
+### Changed
+- **CI**: `concurrency` group by `github.ref` with `cancel-in-progress` (superseded runs cancelled, no queued duplicate builds); `Swatinem/rust-cache@v2` on `check` + `live-compile` (separate `mlx-live` cache key) — the 12-crate workspace previously paid a full cold build every run (~2m12s avg). Test sharding and tiered gate assessed and not adopted (rationale in PR #67).
+
 ## [1.12.0] — 2026-11-14
 
 MINOR release — team namespace tier (issue #64). Additive only; no schema change. One new namespace tier + one new RPC (`list_namespaces`, UDS + HTTP).
