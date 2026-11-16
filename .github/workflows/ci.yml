@@ -15,6 +15,12 @@ on:
   pull_request:
     branches: [main]
 
+# fusion#2 / issue #66: cancel superseded runs on the same branch/PR — repeated
+# push does not queue another full build behind the previous one.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
@@ -27,6 +33,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      # fusion#2 / issue #66: cargo registry + target cache — the 12-crate
+      # workspace paid a full cold build every run (~2m; most of it compile).
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
       - name: fmt
         run: cargo fmt --all --check
       - name: clippy
@@ -46,6 +57,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          # mlx-live feature gates pull extra code paths — separate cache key.
+          key: mlx-live
       - name: compile mlx-live test paths
         run: |
           cargo test -p fm-embed  --features mlx-live --no-run
