@@ -49,6 +49,7 @@ async fn live_build_real_engine_retrieve() {
         tenant: String::new(),
         namespace: String::new(),
         namespace_key: String::new(),
+        op_class: None,
         tier_filter: None,
         token_budget: 256,
         aggregate: false,

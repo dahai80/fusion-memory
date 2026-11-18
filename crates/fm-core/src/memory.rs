@@ -251,6 +251,11 @@ pub struct MemoryItem {
     /// #57 准入门裁决 (None = 门未启用 / 门前数据)。
     #[serde(default)]
     pub admission: Option<AdmissionRecord>,
+    /// #68 B5 级联遗忘: 本条记忆引用过的、已被遗忘 (tombstone) 的来源 id 列表。
+    /// 空列表 = 无陈旧引用 (serde default + 列 DEFAULT '[]', 旧数据向后兼容)。
+    /// 下游读路径 (get/retrieve/provenance) 携带此字段, 孤儿引用不再静默。
+    #[serde(default)]
+    pub stale_sources: Vec<String>,
 }
 
 impl MemoryItem {
@@ -296,6 +301,7 @@ impl MemoryItem {
             authority: SafetyAuthority::SelfAuth,
             persistence: SafetyPersistence::Normal,
             admission: None,
+            stale_sources: Vec::new(),
         }
     }
 

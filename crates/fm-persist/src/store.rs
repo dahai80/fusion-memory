@@ -13,7 +13,7 @@ use crate::error::{PersistError, PersistResult};
 use crate::schema;
 use fm_core::{
     ConsolidationReport, EntityNode, MemoryItem, MemoryRevision, MemoryTier, MemoryType,
-    NamespaceFilter,
+    NamespaceFilter, OpCostRecord,
 };
 
 // P4: 递归 CTE 结果集扇出上限 (graph_affinity 远端节点贡献 0.5^h 指数衰减, 截断无损精度)。
@@ -204,6 +204,7 @@ impl Persist {
                     .as_ref()
                     .map(|a| serde_json::to_string(a).expect("admission_json serialize"))
                     .unwrap_or_default(),
+                serde_json::to_string(&item.stale_sources).expect("stale_sources_json serialize"),
             ],
         )?;
         for e in &item.entities {
@@ -295,6 +296,7 @@ impl Persist {
                     .as_ref()
                     .map(|a| serde_json::to_string(a).expect("admission_json serialize"))
                     .unwrap_or_default(),
+                serde_json::to_string(&item.stale_sources).expect("stale_sources_json serialize"),
             ],
         )?;
         for e in &item.entities {
@@ -710,6 +712,154 @@ impl Persist {
         conn.execute(
             "UPDATE memory_item SET tombstone=0 WHERE id=?1",
             params![id],
+        )?;
+        Ok(())
+    }
+
+    // #68 B5: cascade forgetting — dependent discovery for stale-source annotation.
+
+    /// #68 B5: ids of live (non-tombstoned) memories that depend on `id` — either
+    /// citing it in `sources_json` or having absorbed it via a merge (merge_log
+    /// target rows). LIKE is only a cheap prefilter; exact membership is verified
+    /// by JSON parse, so false-positive LIKE hits are dropped.
+    pub fn dependents_of(&self, id: &str, tenant: &str) -> PersistResult<Vec<String>> {
+        let conn = self.conn()?;
+        let mut out: Vec<String> = Vec::new();
+        let mut stmt = conn.prepare(
+            "SELECT id, sources_json FROM memory_item \
+             WHERE tombstone=0 AND id != ?1 AND tenant=?2 AND sources_json LIKE ?3",
+        )?;
+        let rows = stmt.query_map(params![id, tenant, format!("%{id}%")], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
+        for r in rows {
+            let (mid, sources_json) = r?;
+            let sources: Vec<String> = serde_json::from_str(&sources_json).unwrap_or_default();
+            if sources.iter().any(|s| s == id) {
+                out.push(mid);
+            }
+        }
+        // Merge absorption: targets that absorbed this source are dependents too
+        // (their merged content references the forgotten source).
+        let mut stmt2 = conn.prepare(
+            "SELECT DISTINCT m.target_id FROM merge_log m \
+             JOIN memory_item t ON t.id = m.target_id AND t.tombstone=0 AND t.tenant=?2 \
+             WHERE m.source_id = ?1 AND m.target_id != ?1",
+        )?;
+        let rows2 = stmt2.query_map(params![id, tenant], |r| r.get::<_, String>(0))?;
+        for r in rows2 {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    // #68 B4: net-value ledger (policy lives in engine; persist does raw rows).
+
+    /// #68 B4: record one caller-supplied op cost row.
+    pub fn ledger_insert(&self, rec: &OpCostRecord, tenant: &str, at: u64) -> PersistResult<()> {
+        let conn = self.conn()?;
+        conn.execute(
+            "INSERT INTO op_ledger(at,tenant,op,class,memory_id,benefit,tax) \
+             VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            params![
+                at as i64,
+                tenant,
+                rec.op,
+                rec.class,
+                rec.memory_id,
+                rec.benefit,
+                rec.tax
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// #68 B4: per-class windowed aggregation since `since` (inclusive).
+    /// Returns (class, ops, benefit_sum, tax_sum) ordered by class.
+    pub fn ledger_class_sums(
+        &self,
+        tenant: &str,
+        since: u64,
+    ) -> PersistResult<Vec<(String, u64, f64, f64)>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT class, COUNT(*), SUM(benefit), SUM(tax) FROM op_ledger \
+             WHERE tenant=?1 AND at>=?2 GROUP BY class ORDER BY class",
+        )?;
+        let rows = stmt.query_map(params![tenant, since as i64], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)? as u64,
+                r.get::<_, f64>(2)?,
+                r.get::<_, f64>(3)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// #68 B4: all shutdown-state rows for one tenant: (class, shutdown, at, reason).
+    pub fn shutdown_all(&self, tenant: &str) -> PersistResult<Vec<(String, bool, u64, String)>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT class, shutdown, at, reason FROM shutdown_state \
+             WHERE tenant=?1 ORDER BY class",
+        )?;
+        let rows = stmt.query_map(params![tenant], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)? != 0,
+                r.get::<_, i64>(2)? as u64,
+                r.get::<_, String>(3)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// #68 B4: shutdown state for one class. None = never evaluated.
+    pub fn shutdown_get(
+        &self,
+        tenant: &str,
+        class: &str,
+    ) -> PersistResult<Option<(bool, u64, String)>> {
+        let conn = self.conn()?;
+        let row = conn
+            .query_row(
+                "SELECT shutdown, at, reason FROM shutdown_state WHERE tenant=?1 AND class=?2",
+                params![tenant, class],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)? != 0,
+                        r.get::<_, i64>(1)? as u64,
+                        r.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// #68 B4: write shutdown state for one class (upsert; reenable sets shutdown=false).
+    pub fn shutdown_set(
+        &self,
+        tenant: &str,
+        class: &str,
+        shutdown: bool,
+        at: u64,
+        reason: &str,
+    ) -> PersistResult<()> {
+        let conn = self.conn()?;
+        conn.execute(
+            "INSERT OR REPLACE INTO shutdown_state(class,tenant,shutdown,at,reason) \
+             VALUES(?1,?2,?3,?4,?5)",
+            params![class, tenant, shutdown as i64, at as i64, reason],
         )?;
         Ok(())
     }
@@ -1637,6 +1787,13 @@ fn row_to_memory(
                 }
             }
         },
+        // #68 B5: cascade-forget stale source annotations (corrupt JSON degrades
+        // to empty, same semantics as sources_json).
+        stale_sources: serde_json::from_str(
+            &row.get::<_, String>("stale_sources_json")
+                .unwrap_or_default(),
+        )
+        .unwrap_or_default(),
     })
 }
 
@@ -2349,6 +2506,204 @@ mod tests {
         // replay identical content → no duplicate revision
         p.put_memory(&item).unwrap();
         assert_eq!(p.list_revisions("r1", 10).unwrap().len(), 1);
+    }
+
+    // #68 B5/B4: v11 加 stale_sources_json 列 + op_ledger/shutdown_state 表;
+    // 模拟 v10 旧库 (DROP COLUMN + DROP TABLE + 回退版本) → migrate 补齐。
+    #[test]
+    fn schema_v11_cascade_ledger_migration() {
+        let p = Persist::open_in_memory().unwrap();
+        {
+            let c = p.conn().unwrap();
+            c.execute_batch(
+                "ALTER TABLE memory_item DROP COLUMN stale_sources_json;
+                 DROP TABLE IF EXISTS op_ledger;
+                 DROP TABLE IF EXISTS shutdown_state;",
+            )
+            .unwrap();
+            c.execute_batch("PRAGMA user_version=10").unwrap();
+            schema::migrate(&c).unwrap();
+            assert_eq!(schema::user_version(&c).unwrap(), schema::SCHEMA_VERSION);
+            let n: i64 = c
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('memory_item') WHERE name='stale_sources_json'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 1, "v11 stale_sources_json column restored by migrate");
+            let t: i64 = c
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('op_ledger','shutdown_state')",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                t, 2,
+                "v11 ledger + shutdown_state tables restored by migrate"
+            );
+        }
+        // 旧行 DEFAULT '[]' 生效: 旧库行迁移后 stale_sources 可读且为空。
+        let item = MemoryItem::new_turn_skeleton(
+            "old1".into(),
+            "ix".into(),
+            0,
+            "s".into(),
+            String::new(),
+            MemoryType::Episodic,
+            "legacy row".into(),
+            1000,
+        );
+        p.put_memory(&item).unwrap();
+        assert!(p
+            .get_memory("old1")
+            .unwrap()
+            .unwrap()
+            .stale_sources
+            .is_empty());
+    }
+
+    // #68 B4: ledger raw rows — insert + windowed per-class sums + shutdown upsert.
+    #[test]
+    fn ledger_rows_and_shutdown_state() {
+        let p = Persist::open_in_memory().unwrap();
+        let rec = |class: &str, benefit: f64, tax: f64| fm_core::OpCostRecord {
+            op: "retrieve".into(),
+            class: class.into(),
+            memory_id: None,
+            benefit,
+            tax,
+            at: 0,
+        };
+        p.ledger_insert(&rec("retrieve:default", 1.0, 3.0), "", 1000)
+            .unwrap();
+        p.ledger_insert(&rec("retrieve:default", 2.0, 3.0), "", 2000)
+            .unwrap();
+        p.ledger_insert(&rec("retrieve:playbook", 5.0, 1.0), "", 1500)
+            .unwrap();
+        p.ledger_insert(&rec("retrieve:default", 9.0, 9.0), "t2", 1200)
+            .unwrap();
+        // window since 1000: default class (tenant "") = 2 ops, net (1+2)-(3+3) = -3
+        let sums = p.ledger_class_sums("", 1000).unwrap();
+        assert_eq!(sums.len(), 2);
+        let (class, ops, benefit, tax) =
+            &sums.iter().find(|(c, ..)| c == "retrieve:default").unwrap();
+        assert_eq!((class.as_str(), *ops), ("retrieve:default", 2));
+        assert!((benefit - 3.0).abs() < 1e-9 && (tax - 6.0).abs() < 1e-9);
+        assert!(sums
+            .iter()
+            .any(|(c, ops, ..)| c == "retrieve:playbook" && *ops == 1));
+        // tenant scoping: t2 sees only its own row
+        assert_eq!(p.ledger_class_sums("t2", 0).unwrap().len(), 1);
+        // window filter: since 1500 excludes the 1000 row → default = 1 op
+        assert_eq!(
+            p.ledger_class_sums("", 1500)
+                .unwrap()
+                .iter()
+                .find(|(c, ..)| c == "retrieve:default")
+                .map(|(_, ops, ..)| *ops)
+                .unwrap(),
+            1
+        );
+        // shutdown state upsert + read-back
+        assert!(p.shutdown_get("", "retrieve:default").unwrap().is_none());
+        p.shutdown_set("", "retrieve:default", true, 3000, "below floor")
+            .unwrap();
+        let (shutdown, at, reason) = p.shutdown_get("", "retrieve:default").unwrap().unwrap();
+        assert!(shutdown && at == 3000 && reason == "below floor");
+        p.shutdown_set("", "retrieve:default", false, 4000, "manual reenable")
+            .unwrap();
+        assert!(!p.shutdown_get("", "retrieve:default").unwrap().unwrap().0);
+        assert!(
+            p.shutdown_get("t2", "retrieve:default").unwrap().is_none(),
+            "tenant isolated"
+        );
+        assert_eq!(p.shutdown_all("").unwrap().len(), 1);
+    }
+
+    // #68 B5: dependents_of — sources_json citations + merge absorption, tenant-scoped.
+    #[test]
+    fn dependents_of_sources_and_merge() {
+        let p = Persist::open_in_memory().unwrap();
+        let mk = |id: &str, sources: Vec<String>| {
+            let mut m = MemoryItem::new_turn_skeleton(
+                id.into(),
+                "ix".into(),
+                0,
+                "s".into(),
+                String::new(),
+                MemoryType::Semantic,
+                format!("content of {id}"),
+                1000,
+            );
+            m.sources = sources;
+            m
+        };
+        p.put_memory(&mk("src", vec![])).unwrap();
+        p.put_memory(&mk("dep1", vec!["src".into()])).unwrap();
+        p.put_memory(&mk("dep2", vec!["src".into(), "other".into()]))
+            .unwrap();
+        let mut foreign = mk("dep3", vec!["src".into()]);
+        foreign.tenant = "t2".into();
+        p.put_memory(&foreign).unwrap();
+        // merge absorption: target row exists + absorbed src
+        p.put_memory(&mk("merged-target", vec![])).unwrap();
+        p.record_merge("src", "merged-target", "test merge", 2000)
+            .unwrap();
+        let deps = p.dependents_of("src", "").unwrap();
+        assert!(deps.contains(&"dep1".to_string()) && deps.contains(&"dep2".to_string()));
+        assert!(
+            deps.contains(&"merged-target".to_string()),
+            "merge target is a dependent"
+        );
+        assert!(
+            !deps.contains(&"dep3".to_string()),
+            "cross-tenant dependent invisible"
+        );
+        assert!(!deps.contains(&"src".to_string()), "self excluded");
+        // LIKE prefilter false positives (substring) must not leak
+        p.put_memory(&mk("decoy", vec!["src-extra-id".into()]))
+            .unwrap();
+        let deps2 = p.dependents_of("src", "").unwrap();
+        assert!(
+            !deps2.contains(&"decoy".to_string()),
+            "JSON membership verified, not LIKE"
+        );
+        // tombstoned dependents excluded
+        p.tombstone_memory("dep1").unwrap();
+        let deps3 = p.dependents_of("src", "").unwrap();
+        assert!(!deps3.contains(&"dep1".to_string()));
+    }
+
+    // #68 B5: stale_sources round-trips through put/get (full item fidelity).
+    #[test]
+    fn stale_sources_roundtrip() {
+        let p = Persist::open_in_memory().unwrap();
+        let mut item = MemoryItem::new_turn_skeleton(
+            "m1".into(),
+            "ix".into(),
+            0,
+            "s".into(),
+            String::new(),
+            MemoryType::Episodic,
+            "cites a forgotten source".into(),
+            1000,
+        );
+        p.put_memory(&item).unwrap();
+        assert!(p
+            .get_memory("m1")
+            .unwrap()
+            .unwrap()
+            .stale_sources
+            .is_empty());
+        item.stale_sources = vec!["forgotten-1".into(), "forgotten-2".into()];
+        p.put_memory(&item).unwrap();
+        let got = p.get_memory("m1").unwrap().unwrap();
+        assert_eq!(
+            got.stale_sources,
+            vec!["forgotten-1".to_string(), "forgotten-2".to_string()]
+        );
     }
 
     // M5 #46: v8 加 owner 列; 模拟 v7 旧库 (DROP COLUMN + 回退版本) → migrate 补列。

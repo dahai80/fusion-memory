@@ -8,6 +8,7 @@ pub mod context;
 pub mod entity;
 pub mod error;
 pub mod interaction;
+pub mod ledger;
 pub mod memory;
 pub mod namespace;
 pub mod report;
@@ -19,6 +20,7 @@ pub use context::{ContextBlock, FormattedContext, RetrieveQuery};
 pub use entity::{EntityNode, EntityType};
 pub use error::{MemoryError, MemoryResult};
 pub use interaction::{Interaction, ToolCall, Turn};
+pub use ledger::{LedgerStatus, OpClassNet, OpCostRecord};
 pub use memory::{
     AdmissionRecord, MemoryItem, MemoryTier, MemoryType, SafetyAuthority, SafetyPersistence,
     SafetyScope,

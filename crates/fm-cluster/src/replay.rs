@@ -184,6 +184,15 @@ pub async fn replay_one(sink: &dyn ReplaySink, entry: &WopEntry) -> ClusterResul
             sink.put_item(&item).await?;
             Ok(true)
         }
+        // #68 B5: cascade forgetting — full item overwrite (stale_sources updated,
+        // vector unchanged). payload = MemoryItem JSON, follower put_item.
+        "cascade_forget" => {
+            let item: MemoryItem = serde_json::from_str(&entry.payload).map_err(|e| {
+                ClusterError::PermanentReplay(format!("cascade_forget payload decode: {e}"))
+            })?;
+            sink.put_item(&item).await?;
+            Ok(true)
+        }
         other => {
             // summarize/reextract/未知 op: 本地 consolidate 各节点独立, 跳过。
             // (summarize 产生新 Semantic 记忆, follower 经其 own consolidate 生成, 跳过避免双重摘要)
@@ -349,6 +358,46 @@ mod tests {
         assert_eq!(sink.vectors.lock().unwrap()[0].0, 42);
         let tombs: Vec<String> = sink.tombstones.lock().unwrap().clone();
         assert_eq!(tombs, vec!["01H".to_string()]);
+    }
+
+    // #68 B5: cascade_forget wop = full-item overwrite via put_item (stale_sources
+    // updated, vector untouched); corrupt payload = permanent replay error.
+    #[tokio::test]
+    async fn replay_cascade_forget_overwrites_item() {
+        let sink = FakeSink::new();
+        let mut item = sample_item();
+        item.stale_sources = vec!["forgotten-1".into()];
+        let payload = serde_json::to_string(&item).unwrap();
+        let entries = vec![WopEntry {
+            seq: 7,
+            op: "cascade_forget".into(),
+            payload,
+            at: 300,
+        }];
+        let out = replay_wops(&sink, &entries).await;
+        assert_eq!(out.applied, 1);
+        assert!(!out.failed);
+        assert!(
+            sink.vectors.lock().unwrap().is_empty(),
+            "vector untouched by cascade_forget"
+        );
+        let puts = sink.puts.lock().unwrap();
+        assert_eq!(puts.len(), 1);
+        assert_eq!(puts[0].stale_sources, vec!["forgotten-1".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn replay_cascade_forget_bad_payload_permanent() {
+        let sink = FakeSink::new();
+        let entries = vec![WopEntry {
+            seq: 8,
+            op: "cascade_forget".into(),
+            payload: "not-json".into(),
+            at: 300,
+        }];
+        let out = replay_wops(&sink, &entries).await;
+        assert_eq!(out.applied, 0);
+        assert!(out.permanent, "corrupt payload is permanent, not transient");
     }
 
     #[tokio::test]

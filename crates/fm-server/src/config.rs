@@ -57,6 +57,15 @@ pub struct ServerConfig {
     pub mlx_api_key: String,
     /// #57: 经验准入门开关 (env FUSION_MEMORY_ADMISSION_GATE, 默认 false = 旧行为全量入库)。
     pub admission_gate: bool,
+    /// #68 B4: net-value auto-shutdown floor on window-avg net value
+    /// (env FUSION_MEMORY_NET_VALUE_FLOOR, default 0.0).
+    pub net_value_floor: f64,
+    /// #68 B4: ledger aggregation window ms
+    /// (env FUSION_MEMORY_NET_VALUE_WINDOW_MS, default 7 days).
+    pub net_value_window_ms: u64,
+    /// #68 B4: min samples before a class can be shut down
+    /// (env FUSION_MEMORY_NET_VALUE_MIN_SAMPLES, default 10).
+    pub net_value_min_samples: u64,
 }
 
 /// P1-8: TOML 配置文件镜像。全字段可选 — 仅出现的字段覆盖默认。
@@ -159,6 +168,9 @@ impl Default for ServerConfig {
             embed_model: EmbedConfig::default().embed_model,
             mlx_api_key: String::new(),
             admission_gate: false,
+            net_value_floor: 0.0,
+            net_value_window_ms: 7 * 24 * 3600 * 1000,
+            net_value_min_samples: 10,
         }
     }
 }
@@ -365,6 +377,35 @@ impl ServerConfig {
                     raw = %v,
                     error = %e,
                     "FUSION_MEMORY_ADMISSION_GATE bad value (expect true/false), fallback default"
+                ),
+            }
+        }
+        // #68 B4: net-value auto-shutdown policy knobs.
+        if let Ok(v) = std::env::var("FUSION_MEMORY_NET_VALUE_FLOOR") {
+            match v.parse::<f64>() {
+                Ok(x) if x.is_finite() => self.net_value_floor = x,
+                _ => warn!(
+                    raw = %v,
+                    "FUSION_MEMORY_NET_VALUE_FLOOR bad value (expect finite f64), fallback default"
+                ),
+            }
+        }
+        if let Ok(v) = std::env::var("FUSION_MEMORY_NET_VALUE_WINDOW_MS") {
+            match v.parse::<u64>() {
+                Ok(x) if x > 0 => self.net_value_window_ms = x,
+                _ => warn!(
+                    raw = %v,
+                    "FUSION_MEMORY_NET_VALUE_WINDOW_MS bad value (expect positive u64), fallback default"
+                ),
+            }
+        }
+        if let Ok(v) = std::env::var("FUSION_MEMORY_NET_VALUE_MIN_SAMPLES") {
+            match v.parse::<u64>() {
+                Ok(x) => self.net_value_min_samples = x,
+                Err(e) => warn!(
+                    raw = %v,
+                    error = %e,
+                    "FUSION_MEMORY_NET_VALUE_MIN_SAMPLES bad value (expect u64), fallback default"
                 ),
             }
         }

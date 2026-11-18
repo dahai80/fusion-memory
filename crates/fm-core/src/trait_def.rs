@@ -135,6 +135,37 @@ pub trait FusionMemoryEngine: Send + Sync {
         ))
     }
 
+    /// #68 B4: record one caller-measured op cost (harness owns measurement;
+    /// memory owns ledger + auto-shutdown policy). Returns the live shutdown
+    /// decision for the op class.
+    async fn record_op_cost(
+        &self,
+        _rec: crate::ledger::OpCostRecord,
+        _tenant: &str,
+    ) -> MemoryResult<crate::ledger::LedgerStatus> {
+        Err(crate::error::MemoryError::Unsupported(
+            "record_op_cost not implemented for this engine".into(),
+        ))
+    }
+
+    /// #68 B4: net-value report per op class (window aggregation + shutdown state).
+    async fn net_value_report(
+        &self,
+        _tenant: &str,
+    ) -> MemoryResult<Vec<crate::ledger::OpClassNet>> {
+        Err(crate::error::MemoryError::Unsupported(
+            "net_value_report not implemented for this engine".into(),
+        ))
+    }
+
+    /// #68 B4: re-enable an auto-shut-down op class (ops escape hatch, audited).
+    /// Returns whether the class was shut down before this call.
+    async fn net_value_reenable(&self, _class: &str, _tenant: &str) -> MemoryResult<bool> {
+        Err(crate::error::MemoryError::Unsupported(
+            "net_value_reenable not implemented for this engine".into(),
+        ))
+    }
+
     /// #64 T2: distinct namespace_key values per tenant + tier (team anchors
     /// enumeration for agent-studio). Returns keys only, never content.
     /// Empty/unknown tier → Unsupported-style error (fail-closed).

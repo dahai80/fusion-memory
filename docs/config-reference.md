@@ -72,6 +72,9 @@ source_of_truth:
 |-----|---------|---------|
 | `FUSION_MEMORY_SLEEP_INTERVAL_SECS` | `0`（关） | v1.11.0 #60 睡眠治理调度 tick 秒数；`0`/未设 = 完全禁用（手动 `sleep_run` RPC 始终可用） |
 | `FUSION_MEMORY_ADMISSION_GATE` | `0`（关） | v1.10.0 #57 经验准入门；`1` = 持久化前拒绝 no-op 候选（近重复/会话冗余/低新颖性），裁决随记忆落库 |
+| `FUSION_MEMORY_NET_VALUE_FLOOR` | `0.0` | v1.13.0 #68 B4 净值自动关停下限：样本充足的 class 窗口均净值（`benefit − tax`）低于此值即关停 |
+| `FUSION_MEMORY_NET_VALUE_WINDOW_MS` | `604800000`（7 天） | v1.13.0 #68 B4 台账聚合窗口（ms） |
+| `FUSION_MEMORY_NET_VALUE_MIN_SAMPLES` | `10` | v1.13.0 #68 B4 触发关停前每 class 最少台账记录数 |
 | `FUSION_MEMORY_DREAM_INTERVAL_SECS` | `0`（关） | 调度 tick 秒数；`0`/未设 = 完全禁用 dreaming 任务 |
 | `FUSION_MEMORY_DREAM_PENDING_THRESHOLD` | `1` | 触发巩固的最小 pending 实体数 |
 

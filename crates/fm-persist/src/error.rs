@@ -158,8 +158,10 @@ mod tests {
         let res = pool.get();
         let elapsed = t0.elapsed();
         assert!(res.is_err(), "second get must time out, got {res:?}");
+        // Load-tolerant bound: full-suite parallel runs starve the scheduler
+        // (observed >2s on a loaded machine); intent is "not forever", not latency.
         assert!(
-            elapsed < Duration::from_secs(2),
+            elapsed < Duration::from_secs(10),
             "must not block forever, elapsed {elapsed:?}"
         );
         // 映射到 MemoryError::Busy
