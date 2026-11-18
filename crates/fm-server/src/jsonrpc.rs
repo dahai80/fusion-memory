@@ -214,6 +214,10 @@ pub async fn dispatch(
         "sleep_run" => sleep_run(engine).await,
         // #64 T2: distinct namespace_key per tier (team anchors enumeration, keys only).
         "list_namespaces" => list_namespaces(params, engine, tenant).await,
+        // #68 B4: net-value ledger — caller-measured cost in, shutdown decision out.
+        "record_op_cost" => record_op_cost(params, engine, tenant).await,
+        "net_value" => net_value(engine, tenant).await,
+        "net_value_reenable" => net_value_reenable(params, engine, tenant).await,
         // v1.9.0 #53: governance panel — read-only scoring/forgetting parameter snapshot.
         "config" => Ok(fm_engine::scoring::governance_snapshot()),
         "health" => Ok(Value::String("ok".into())),
@@ -349,6 +353,9 @@ struct RetrieveParams {
     namespace: Option<String>,
     #[serde(default)]
     namespace_key: Option<String>,
+    /// #68 B4: caller-declared op class (net-value gate key), omit = ungated.
+    #[serde(default)]
+    op_class: Option<String>,
 }
 
 fn default_top_k() -> usize {
@@ -379,6 +386,8 @@ async fn retrieve(
         tenant: tenant.to_string(),
         namespace,
         namespace_key: p.namespace_key.unwrap_or_default(),
+        // #68 B4: op-class gate key (optional; empty = no gating).
+        op_class: p.op_class,
         tier_filter: None,
         token_budget: p.token_budget,
         aggregate: p.aggregate,
@@ -434,6 +443,72 @@ async fn list_namespaces(
         .await
         .map_err(|e| RpcError::from_engine(&e))?;
     serde_json::to_value(keys).map_err(|e| RpcError::internal(e.to_string()))
+}
+
+/// #68 B4: record one caller-measured op cost (harness measures; memory owns
+/// the ledger + auto-shutdown policy). Returns the live shutdown decision.
+async fn record_op_cost(
+    params: Value,
+    engine: &EngineHandle,
+    tenant: &str,
+) -> Result<Value, RpcError> {
+    let rec: fm_core::OpCostRecord =
+        serde_json::from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+    if rec.class.trim().is_empty() {
+        return Err(RpcError::invalid_params(
+            "record_op_cost: class must be a non-empty op class key",
+        ));
+    }
+    if rec.op.trim().is_empty() {
+        return Err(RpcError::invalid_params(
+            "record_op_cost: op must be a non-empty operation kind",
+        ));
+    }
+    let status = engine
+        .record_op_cost(rec, tenant)
+        .await
+        .map_err(|e| RpcError::from_engine(&e))?;
+    serde_json::to_value(status).map_err(|e| RpcError::internal(e.to_string()))
+}
+
+/// #68 B4: net-value report per op class over the policy window.
+async fn net_value(engine: &EngineHandle, tenant: &str) -> Result<Value, RpcError> {
+    let rows = engine
+        .net_value_report(tenant)
+        .await
+        .map_err(|e| RpcError::from_engine(&e))?;
+    serde_json::to_value(rows).map_err(|e| RpcError::internal(e.to_string()))
+}
+
+/// #68 B4: operator re-enable of an auto-shut-down op class (audited).
+async fn net_value_reenable(
+    params: Value,
+    engine: &EngineHandle,
+    tenant: &str,
+) -> Result<Value, RpcError> {
+    #[derive(Debug, Deserialize)]
+    struct ReenableParams {
+        class: String,
+        /// B5 confirm pattern: destructive-ish state flip requires explicit confirm.
+        confirm: bool,
+    }
+    let p: ReenableParams =
+        serde_json::from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+    if p.class.trim().is_empty() {
+        return Err(RpcError::invalid_params(
+            "net_value_reenable: class must be a non-empty op class key",
+        ));
+    }
+    if !p.confirm {
+        return Err(RpcError::invalid_params(
+            "net_value_reenable: confirm=true required (B5 irreversible-op pattern)",
+        ));
+    }
+    let was = engine
+        .net_value_reenable(&p.class, tenant)
+        .await
+        .map_err(|e| RpcError::from_engine(&e))?;
+    Ok(serde_json::json!({ "class": p.class, "was_shutdown": was }))
 }
 
 async fn consolidate(params: Value, engine: &EngineHandle) -> Result<Value, RpcError> {
@@ -1115,6 +1190,9 @@ struct RetrieveContextContractParams {
     namespace: Option<String>,
     #[serde(default)]
     namespace_key: Option<String>,
+    /// #68 B4: caller-declared op class (net-value gate key), omit = ungated.
+    #[serde(default)]
+    op_class: Option<String>,
 }
 
 /// 契约返回: {context, memory_ids, cache_hit}。context = block turns_text 拼接;
@@ -1138,6 +1216,8 @@ async fn retrieve_context_contract(
         tenant: tenant.to_string(),
         namespace,
         namespace_key: p.namespace_key.unwrap_or_default(),
+        // #68 B4: op-class gate key (optional; empty = no gating).
+        op_class: p.op_class,
         tier_filter: None,
         token_budget: default_budget(),
         aggregate: true,
@@ -1381,6 +1461,40 @@ mod tests {
         }
         async fn reconcile(&self) -> fm_core::MemoryResult<usize> {
             Ok(5)
+        }
+        // #68 B4: canned ledger responses (wire-level tests only).
+        async fn record_op_cost(
+            &self,
+            rec: fm_core::OpCostRecord,
+            _tenant: &str,
+        ) -> fm_core::MemoryResult<fm_core::LedgerStatus> {
+            Ok(fm_core::LedgerStatus {
+                class: rec.class,
+                ops: 1,
+                net: rec.benefit - rec.tax,
+                shutdown: rec.tax > rec.benefit,
+                just_shutdown: rec.tax > rec.benefit,
+            })
+        }
+        async fn net_value_report(
+            &self,
+            _tenant: &str,
+        ) -> fm_core::MemoryResult<Vec<fm_core::OpClassNet>> {
+            Ok(vec![fm_core::OpClassNet {
+                class: "retrieve:default".into(),
+                ops: 2,
+                benefit: 3.0,
+                tax: 7.0,
+                net: -4.0,
+                shutdown: true,
+            }])
+        }
+        async fn net_value_reenable(
+            &self,
+            class: &str,
+            _tenant: &str,
+        ) -> fm_core::MemoryResult<bool> {
+            Ok(class == "retrieve:default")
         }
     }
 
@@ -2055,6 +2169,118 @@ mod tests {
         )
         .await;
         assert_ne!(err.code, -32602, "valid tier passes params validation");
+    }
+
+    // ── v1.13.0 #68 B4: net-value ledger RPCs (param validation + wire shape). ──
+
+    #[tokio::test]
+    async fn record_op_cost_validates_fields() {
+        let (eng, _) = stub_handle();
+        let err = dispatch_err(
+            &rpc(
+                "record_op_cost",
+                serde_json::json!({"op": "retrieve", "class": "  "}),
+                40,
+            ),
+            &eng,
+        )
+        .await;
+        assert_eq!(err.code, -32602, "empty class rejected");
+        let err = dispatch_err(
+            &rpc("record_op_cost", serde_json::json!({"class": "c"}), 41),
+            &eng,
+        )
+        .await;
+        assert_eq!(err.code, -32602, "missing op rejected");
+        let err = dispatch_err(
+            &rpc(
+                "record_op_cost",
+                serde_json::json!({"op": "retrieve", "class": "c"}),
+                42,
+            ),
+            &eng,
+        )
+        .await;
+        assert_eq!(
+            err.code, -32602,
+            "missing tax rejected (caller must supply)"
+        );
+    }
+
+    #[tokio::test]
+    async fn record_op_cost_roundtrip_returns_shutdown_decision() {
+        let (eng, _) = stub_handle();
+        let v = dispatch_ok(
+            &rpc(
+                "record_op_cost",
+                serde_json::json!({"op": "retrieve", "class": "retrieve:x", "benefit": 1.0, "tax": 5.0}),
+                43,
+            ),
+            &eng,
+        )
+        .await;
+        assert_eq!(v["class"], "retrieve:x");
+        assert_eq!(v["shutdown"], true, "stub marks loss-making op shutdown");
+        assert_eq!(v["just_shutdown"], true);
+    }
+
+    #[tokio::test]
+    async fn net_value_report_wire_shape() {
+        let (eng, _) = stub_handle();
+        let v = dispatch_ok(&rpc("net_value", serde_json::json!({}), 44), &eng).await;
+        assert_eq!(v[0]["class"], "retrieve:default");
+        assert_eq!(v[0]["shutdown"], true);
+        assert_eq!(v[0]["ops"], 2);
+    }
+
+    #[tokio::test]
+    async fn net_value_reenable_requires_confirm() {
+        let (eng, _) = stub_handle();
+        let err = dispatch_err(
+            &rpc(
+                "net_value_reenable",
+                serde_json::json!({"class": "retrieve:default"}),
+                45,
+            ),
+            &eng,
+        )
+        .await;
+        assert_eq!(err.code, -32602, "B5 confirm pattern");
+        let err = dispatch_err(
+            &rpc(
+                "net_value_reenable",
+                serde_json::json!({"class": "  ", "confirm": true}),
+                46,
+            ),
+            &eng,
+        )
+        .await;
+        assert_eq!(err.code, -32602, "empty class rejected");
+    }
+
+    #[tokio::test]
+    async fn net_value_reenable_roundtrip() {
+        let (eng, _) = stub_handle();
+        let v = dispatch_ok(
+            &rpc(
+                "net_value_reenable",
+                serde_json::json!({"class": "retrieve:default", "confirm": true}),
+                47,
+            ),
+            &eng,
+        )
+        .await;
+        assert_eq!(v["was_shutdown"], true);
+        let v = dispatch_ok(
+            &rpc(
+                "net_value_reenable",
+                serde_json::json!({"class": "never-shut-down", "confirm": true}),
+                48,
+            ),
+            &eng,
+        )
+        .await;
+        assert_eq!(v["was_shutdown"], false);
     }
 
     #[tokio::test]

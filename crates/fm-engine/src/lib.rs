@@ -16,7 +16,7 @@ pub mod trust;
 
 mod engine;
 
-pub use engine::MemoryEngine;
+pub use engine::{MemoryEngine, NetValuePolicy};
 pub use entity_extract::{
     chat_completion, parse_extraction, EntityExtractor, ExtractConfig, ExtractResult,
     MlxEntityExtractor,

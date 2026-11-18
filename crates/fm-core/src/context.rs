@@ -26,6 +26,9 @@ pub struct RetrieveQuery {
     pub token_budget: usize,
     /// 默认 true: 按 interaction_id 聚合还原完整对话。
     pub aggregate: bool,
+    /// #68 B4: 调用方 op class 标签 (净值台账 shutdown 门控)。None = 不参与门控。
+    #[serde(default)]
+    pub op_class: Option<String>,
 }
 
 impl RetrieveQuery {
@@ -40,6 +43,7 @@ impl RetrieveQuery {
             tier_filter: None,
             token_budget,
             aggregate: true,
+            op_class: None,
         }
     }
 }

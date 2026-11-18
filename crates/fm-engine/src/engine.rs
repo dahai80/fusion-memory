@@ -10,8 +10,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use fm_core::{
     AdmissionRecord, ConsolidationFailure, ConsolidationReport, ContextBlock, FormattedContext,
-    Interaction, MemoryId, MemoryItem, MemoryTier, MemoryType, NamespaceFilter, RetrieveQuery,
-    SafetyAuthority, SafetyPersistence, SleepReport, Turn,
+    Interaction, LedgerStatus, MemoryId, MemoryItem, MemoryTier, MemoryType, NamespaceFilter,
+    OpClassNet, OpCostRecord, RetrieveQuery, SafetyAuthority, SafetyPersistence, SleepReport, Turn,
 };
 use fm_embed::{vector_id_from_ulid, Embedder};
 use fm_persist::{MergeLogEntry, Persist};
@@ -65,6 +65,30 @@ pub struct MemoryEngine {
     http_scanner: Option<std::sync::Arc<crate::trust::HttpScanner>>,
     /// #57: 经验准入门配置。None = 门未装配 (旧行为, 全量入库)。
     admission: Option<crate::admission::AdmissionConfig>,
+    /// #68 B4: net-value ledger 自动关停策略 (fm-server 按 env 注入)。
+    net_value: NetValuePolicy,
+}
+
+/// #68 B4: net-value 自动关停策略。边界裁定 (issue #68): memory 持有 ledger + 关停
+/// 策略, harness 持有成本计量 — memory 永不自行估算 token 成本, 每条记录带调用方 tax。
+#[derive(Debug, Clone)]
+pub struct NetValuePolicy {
+    /// 窗口均净值低于此值 → 关停该 op class (默认 0.0)。
+    pub floor: f64,
+    /// 聚合窗口 (ms, 默认 7 天)。
+    pub window_ms: u64,
+    /// 关停前最少样本数 (默认 10 — 小样本不满则不判)。
+    pub min_samples: u64,
+}
+
+impl Default for NetValuePolicy {
+    fn default() -> Self {
+        Self {
+            floor: 0.0,
+            window_ms: 7 * 24 * 3600 * 1000,
+            min_samples: 10,
+        }
+    }
 }
 
 /// M2 #40: 在飞请求 RAII guard。构造 +1, drop -1, early-return / 错误路径均不漏计。
@@ -104,6 +128,7 @@ impl MemoryEngine {
             inflight: std::sync::atomic::AtomicUsize::new(0),
             http_scanner: None,
             admission: None,
+            net_value: NetValuePolicy::default(),
         }
     }
 
@@ -116,6 +141,12 @@ impl MemoryEngine {
     /// M6 #45: 装配注入扫描器 (替换默认 LocalScanner 组合)。
     pub fn with_scanner(mut self, http: Option<std::sync::Arc<crate::trust::HttpScanner>>) -> Self {
         self.http_scanner = http;
+        self
+    }
+
+    /// #68 B4: 装配 net-value ledger 自动关停策略 (fm-server 按 env 注入)。
+    pub fn with_net_value(mut self, policy: NetValuePolicy) -> Self {
+        self.net_value = policy;
         self
     }
 
@@ -741,6 +772,7 @@ impl MemoryEngine {
             .list_by_session_tenant(session_id, &self.tenant)
             .map_err(|e| e.to_memory())?;
         let mut deleted = 0u64;
+        let mut forgotten: Vec<(String, String)> = Vec::new();
         for m in &items {
             match m.vector_ref.parse::<u64>() {
                 Ok(vec_id) => {
@@ -756,6 +788,7 @@ impl MemoryEngine {
                 warn!(id = %m.id, error = %e, "delete_scope: tombstone_memory failed, skip");
                 continue;
             }
+            forgotten.push((m.id.clone(), m.tenant.clone()));
             deleted += 1;
         }
         if deleted > 0 {
@@ -763,6 +796,10 @@ impl MemoryEngine {
             self.persist
                 .append_wop("delete_scope", session_id, now)
                 .map_err(|e| e.to_memory())?;
+            // #68 B5: cascade-forget annotation on live dependents of each deletion.
+            for (id, tenant) in &forgotten {
+                MemoryEngine::cascade_forget(&self.persist, id, tenant, now);
+            }
         }
         info!(session = session_id, deleted, "delete_scope done");
         Ok(deleted)
@@ -774,6 +811,200 @@ impl MemoryEngine {
         self.persist
             .count_by_session_tenant(scope, &self.tenant)
             .map_err(|e| e.to_memory())
+    }
+
+    // #68 B4: net-value ledger — policy evaluation lives here (engine owns the
+    // auto-shutdown decision), raw rows live in persist, measurement in harness.
+
+    /// #68 B4: record one caller-measured op cost + evaluate the shutdown policy
+    /// for its class. at=0 → engine clock fills.
+    pub fn record_op_cost_core(
+        &self,
+        rec: OpCostRecord,
+        tenant: &str,
+    ) -> fm_core::MemoryResult<LedgerStatus> {
+        let policy = self.net_value.clone();
+        let now = if rec.at > 0 { rec.at } else { Self::now_ms() };
+        self.persist
+            .ledger_insert(&rec, tenant, now)
+            .map_err(|e| e.to_memory())?;
+        let since = now.saturating_sub(policy.window_ms);
+        let sums = self
+            .persist
+            .ledger_class_sums(tenant, since)
+            .map_err(|e| e.to_memory())?;
+        let (ops, net) = match sums.iter().find(|(c, ..)| c == &rec.class) {
+            Some((_, ops, benefit, tax)) => (*ops, benefit - tax),
+            None => (0, 0.0),
+        };
+        let prev = self
+            .persist
+            .shutdown_get(tenant, &rec.class)
+            .map_err(|e| e.to_memory())?;
+        let was_shutdown = matches!(prev, Some((true, _, _)));
+        let mut just_shutdown = false;
+        if !was_shutdown && ops > 0 && ops >= policy.min_samples {
+            let avg = net / ops as f64;
+            if avg < policy.floor {
+                let reason = format!(
+                    "window avg net {avg:.6} below floor {:.6} (ops={ops})",
+                    policy.floor
+                );
+                self.persist
+                    .shutdown_set(tenant, &rec.class, true, now, &reason)
+                    .map_err(|e| e.to_memory())?;
+                just_shutdown = true;
+                warn!(
+                    class = %rec.class,
+                    ops,
+                    avg,
+                    floor = policy.floor,
+                    "net-value floor breached, op class shut down"
+                );
+                if let Err(e) = self
+                    .persist
+                    .append_audit(now, "netvalue", "shutdown", &rec.class, &reason)
+                {
+                    warn!(error = %e, "audit_log append failed (netvalue shutdown), non-fatal");
+                }
+            }
+        }
+        debug!(
+            class = %rec.class,
+            ops,
+            net,
+            shutdown = was_shutdown || just_shutdown,
+            "record_op_cost: ledger updated"
+        );
+        Ok(LedgerStatus {
+            class: rec.class,
+            ops,
+            net,
+            shutdown: was_shutdown || just_shutdown,
+            just_shutdown,
+        })
+    }
+
+    /// #68 B4: net-value report per op class over the policy window.
+    pub fn net_value_report_core(&self, tenant: &str) -> fm_core::MemoryResult<Vec<OpClassNet>> {
+        let policy = self.net_value.clone();
+        let since = Self::now_ms().saturating_sub(policy.window_ms);
+        let sums = self
+            .persist
+            .ledger_class_sums(tenant, since)
+            .map_err(|e| e.to_memory())?;
+        let shutdowns = self
+            .persist
+            .shutdown_all(tenant)
+            .map_err(|e| e.to_memory())?;
+        Ok(sums
+            .into_iter()
+            .map(|(class, ops, benefit, tax)| {
+                let shutdown = shutdowns.iter().any(|(c, s, _, _)| c == &class && *s);
+                OpClassNet {
+                    class,
+                    ops,
+                    benefit,
+                    tax,
+                    net: benefit - tax,
+                    shutdown,
+                }
+            })
+            .collect())
+    }
+
+    /// #68 B4: operator re-enable of an auto-shut-down class (audited escape hatch).
+    /// Returns whether the class was shut down before this call.
+    pub fn net_value_reenable_core(
+        &self,
+        class: &str,
+        tenant: &str,
+    ) -> fm_core::MemoryResult<bool> {
+        let prev = self
+            .persist
+            .shutdown_get(tenant, class)
+            .map_err(|e| e.to_memory())?;
+        let was = matches!(prev, Some((true, _, _)));
+        if was {
+            let now = Self::now_ms();
+            self.persist
+                .shutdown_set(tenant, class, false, now, "manual reenable")
+                .map_err(|e| e.to_memory())?;
+            if let Err(e) =
+                self.persist
+                    .append_audit(now, "netvalue", "reenable", class, "manual reenable")
+            {
+                warn!(error = %e, "audit_log append failed (netvalue reenable), non-fatal");
+            }
+            info!(class, tenant, "op class re-enabled by operator");
+        }
+        Ok(was)
+    }
+
+    /// #68 B4: gate — reject ops whose class is auto-shut down (fail-closed).
+    /// class=None → no gating (caller didn't declare an op class).
+    fn check_op_class_gate(&self, class: Option<&str>, tenant: &str) -> fm_core::MemoryResult<()> {
+        let Some(class) = class else {
+            return Ok(());
+        };
+        if let Some((true, _, _)) = self
+            .persist
+            .shutdown_get(tenant, class)
+            .map_err(|e| e.to_memory())?
+        {
+            return Err(fm_core::MemoryError::Unsupported(format!(
+                "op class '{class}' is auto-shut down (net value below floor); re-enable via net_value_reenable"
+            )));
+        }
+        Ok(())
+    }
+
+    /// #68 B5: cascade forgetting — annotate live dependents of a forgotten
+    /// memory with `stale_sources`, persist via full-item wop (cascade_forget
+    /// op → follower put_item replay). One hop per forget event; transitivity
+    /// emerges because each dependent's own forget cascades again. Best-effort:
+    /// failures warn, never fail the originating delete.
+    fn cascade_forget(persist: &Persist, forgotten_id: &str, tenant: &str, now: u64) {
+        let deps = match persist.dependents_of(forgotten_id, tenant) {
+            Ok(d) => d,
+            Err(e) => {
+                warn!(id = forgotten_id, error = %e, "cascade_forget: dependents_of failed");
+                return;
+            }
+        };
+        for dep_id in deps {
+            let mut item = match persist.get_memory(&dep_id) {
+                Ok(Some(m)) => m,
+                Ok(None) => continue,
+                Err(e) => {
+                    warn!(dependent = %dep_id, error = %e, "cascade_forget: load dependent failed");
+                    continue;
+                }
+            };
+            if item.stale_sources.iter().any(|s| s == forgotten_id) {
+                continue;
+            }
+            item.stale_sources.push(forgotten_id.to_string());
+            let payload = match serde_json::to_string(&item) {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!(dependent = %dep_id, error = %e, "cascade_forget: serialize failed");
+                    continue;
+                }
+            };
+            if let Err(e) = persist.put_memory_with_wop(&item, "cascade_forget", &payload, now) {
+                warn!(dependent = %dep_id, error = %e, "cascade_forget: put with wop failed");
+                continue;
+            }
+            if let Err(e) = persist.append_audit(now, "forget", "cascade", &dep_id, forgotten_id) {
+                warn!(error = %e, "audit_log append failed (forget/cascade), non-fatal");
+            }
+            info!(
+                forgotten = forgotten_id,
+                dependent = %dep_id,
+                "cascade_forget: stale_sources annotated"
+            );
+        }
     }
 
     /// P1-1: commit 共享核心, 返回 CommitOutcome (成功/失败 turn 分列)。
@@ -794,6 +1025,15 @@ impl MemoryEngine {
         // #57: safety metadata 经 interaction.metadata 自由字段传入 (valid_from 同款)。
         let (scope, authority, persistence) =
             crate::admission::safety_from_metadata(&interaction.metadata);
+        // #68 B4: op-class gate — reject commits of auto-shut-down op classes.
+        MemoryEngine::check_op_class_gate(
+            self,
+            interaction
+                .metadata
+                .get("op_class")
+                .and_then(|v| v.as_str()),
+            &interaction.tenant,
+        )?;
         if interaction.metadata.get("scope").is_some()
             || interaction.metadata.get("authority").is_some()
             || interaction.metadata.get("persistence").is_some()
@@ -1059,6 +1299,8 @@ impl MemoryEngine {
                         if let Err(e) = persist.append_wop("recycle", &m.id, now) {
                             warn!(id = %m.id, error = %e, "recycle wop append failed, follower may diverge");
                         }
+                        // #68 B5: recycle = forgetting — cascade annotate live dependents.
+                        MemoryEngine::cascade_forget(&persist, &m.id, &m.tenant, now);
                         d += 1;
                         continue;
                     }
@@ -1302,6 +1544,8 @@ impl fm_core::FusionMemoryEngine for MemoryEngine {
         // M2 #40: 在飞计数 — dreaming 空闲判定窗口
         let _inflight = InflightGuard::enter(&self.inflight);
         let now = Self::now_ms();
+        // #68 B4: op-class gate — reject retrieves of auto-shut-down op classes.
+        MemoryEngine::check_op_class_gate(self, query.op_class.as_deref(), &self.tenant)?;
         // L1: 抽 query 实体 → 传 score_candidate 接通 graph_affinity (γ=0.2, PRD §6.4)。
         // 有 extractor 则抽, 无则空 (graph_aff=0, 退化为二因子, 落 debug 留痕)。
         let query_entity_ids: Vec<String> = if let Some(extractor) = &self.extractor {
@@ -1692,7 +1936,9 @@ impl fm_core::FusionMemoryEngine for MemoryEngine {
     }
 
     async fn delete_memory(&self, id: &str) -> fm_core::MemoryResult<()> {
+        let mut forgotten_tenant = self.tenant.clone();
         if let Some(item) = self.persist.get_memory(id).map_err(|e| e.to_memory())? {
+            forgotten_tenant = item.tenant.clone();
             match item.vector_ref.parse::<u64>() {
                 Ok(vec_id) => {
                     self.store.delete_vector(vec_id)?;
@@ -1720,6 +1966,8 @@ impl fm_core::FusionMemoryEngine for MemoryEngine {
         {
             warn!(error = %e, "audit_log append failed (delete), non-fatal");
         }
+        // #68 B5: cascade-forget annotation on live dependents (stale_sources + wop).
+        MemoryEngine::cascade_forget(&self.persist, id, &forgotten_tenant, now);
         Ok(())
     }
 
@@ -1775,6 +2023,7 @@ impl fm_core::FusionMemoryEngine for MemoryEngine {
             .list_by_session_tenant(scope, tenant)
             .map_err(|e| e.to_memory())?;
         let mut deleted = 0u64;
+        let mut forgotten: Vec<(String, String)> = Vec::new();
         for m in &items {
             match m.vector_ref.parse::<u64>() {
                 Ok(vec_id) => {
@@ -1790,6 +2039,7 @@ impl fm_core::FusionMemoryEngine for MemoryEngine {
                 warn!(id = %m.id, error = %e, "delete_scope_tenant: tombstone_memory failed, skip");
                 continue;
             }
+            forgotten.push((m.id.clone(), m.tenant.clone()));
             deleted += 1;
         }
         if deleted > 0 {
@@ -1797,6 +2047,10 @@ impl fm_core::FusionMemoryEngine for MemoryEngine {
             self.persist
                 .append_wop("delete_scope", scope, now)
                 .map_err(|e| e.to_memory())?;
+            // #68 B5: cascade-forget annotation on live dependents of each deletion.
+            for (id, tenant) in &forgotten {
+                MemoryEngine::cascade_forget(&self.persist, id, tenant, now);
+            }
         }
         info!(session = scope, tenant = %tenant, deleted, "delete_scope_tenant done");
         Ok(deleted)
@@ -1864,6 +2118,23 @@ impl fm_core::FusionMemoryEngine for MemoryEngine {
         self.persist
             .list_namespace_keys(tenant, tier)
             .map_err(|e| e.to_memory())
+    }
+
+    // #68 B4: net-value ledger RPC impls (policy in engine core fns above).
+    async fn record_op_cost(
+        &self,
+        rec: OpCostRecord,
+        tenant: &str,
+    ) -> fm_core::MemoryResult<LedgerStatus> {
+        MemoryEngine::record_op_cost_core(self, rec, tenant)
+    }
+
+    async fn net_value_report(&self, tenant: &str) -> fm_core::MemoryResult<Vec<OpClassNet>> {
+        MemoryEngine::net_value_report_core(self, tenant)
+    }
+
+    async fn net_value_reenable(&self, class: &str, tenant: &str) -> fm_core::MemoryResult<bool> {
+        MemoryEngine::net_value_reenable_core(self, class, tenant)
     }
 
     async fn list_audit_log(
@@ -3050,6 +3321,7 @@ mod tests {
             tenant: String::new(),
             namespace: String::new(),
             namespace_key: String::new(),
+            op_class: None,
             tier_filter: None,
             token_budget: 1024,
             aggregate: false,

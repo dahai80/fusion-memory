@@ -28,7 +28,7 @@ source_of_truth:
 | `GET /v1/memory/version` | — | 服务版本 |
 |---|---|---|
 | `POST /v1/memory/commit` | — | 提交记忆片段，自动抽取实体入图谱 |
-| `POST /v1/memory/retrieve` | — | 检索并组装压缩上下文 |
+| `POST /v1/memory/retrieve` | — | 检索并组装压缩上下文；可选 `op_class`（v1.13.0 #68 B4 门禁 key，该 class 被净值关停时 fail-closed 拒绝） |
 | `POST /v1/memory/consolidate` | — | 触发遗忘 + 巩固，返回报告 |
 | `POST /v1/memory/audit` | — | 审计查询 |
 | `GET /v1/memory/{id}` | — | 单条记忆 |
@@ -53,6 +53,9 @@ source_of_truth:
 | `POST /v1/memory/publish_playbook` | — | v1.10.0 #58 发布到共享库：`{memory_id, publisher_key}` → `{playbook_id}`（playbook 命名空间 / team 权威 / pinned / 署名） |
 | `POST /v1/memory/sleep_run` | — | v1.11.0 #60 睡眠治理：无参数，幂等触发一趟离线预计算 + 准入门重放 → `SleepReport`（consolidated/replay_checked/replay_downweighted/playbook_demoted/duration_ms） |
 | `POST /v1/memory/list_namespaces` | — | v1.12.0 #64 命名空间 key 枚举：`{namespace: <tier>}` → 该租户该层的 distinct `namespace_key` 列表（只出 key 不出内容；空/未知层 invalid_params） |
+| `POST /v1/memory/record_op_cost` | — | v1.13.0 #68 B4 净值台账：`{op, class, memory_id?, benefit?, tax, at?}`（tax 为调用方实测 — memory 永不估算成本）→ `LedgerStatus`（class/ops/net/shutdown/just_shutdown）；样本足够且窗口均净值破下限时该 class 关停 |
+| `POST /v1/memory/net_value` | — | v1.13.0 #68 B4 净值报告：无参数 → `[{class, ops, benefit, tax, net, shutdown}]`（按策略窗口聚合，租户作用域） |
+| `POST /v1/memory/net_value_reenable` | ✔ | v1.13.0 #68 B4 运维重新启用：`{class, confirm=true}` → `{class, was_shutdown}`；审计 `netvalue/reenable` |
 | `POST /v1/memory/adopt_playbook` | — | v1.10.0 #58 采纳 playbook：`{playbook_id, consumer_namespace, consumer_key}` → `{memory_id}` 或 `{memory_id: null}`（准入门拒绝） |
 | `GET /app` + `/app/*path` | 壳公开 | 内嵌 Web 控制台（数据全部走 Bearer /v1/*；v1.9.0 增 Governance 页 + Audit 页 trust 事件过滤） |
 

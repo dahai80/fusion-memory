@@ -74,6 +74,20 @@ pub fn build_server_engine(cfg: &ServerConfig, stub: bool) -> Result<ServerEngin
         info!("admission gate enabled (#57)");
     }
 
+    // #68 B4: net-value ledger auto-shutdown policy (env-overridable; ledger
+    // records accumulate from the first op, gate only fires past min_samples).
+    engine = engine.with_net_value(fm_engine::NetValuePolicy {
+        floor: cfg.net_value_floor,
+        window_ms: cfg.net_value_window_ms,
+        min_samples: cfg.net_value_min_samples,
+    });
+    info!(
+        floor = cfg.net_value_floor,
+        window_ms = cfg.net_value_window_ms,
+        min_samples = cfg.net_value_min_samples,
+        "net-value ledger policy configured (#68)"
+    );
+
     // M6 #45: 注入检测 — 本地规则层恒开 (离线 fail-safe); FUSION_MEMORY_INJECTION_URL
     // 配置时叠加 fusion-security 委托 (仅 loopback, 防线 1)。未配置 = 零外联。
     if let Ok(url) = std::env::var("FUSION_MEMORY_INJECTION_URL") {

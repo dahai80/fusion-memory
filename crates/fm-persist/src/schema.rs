@@ -30,7 +30,8 @@ CREATE TABLE IF NOT EXISTS memory_item (\
   valid_until INTEGER,\
   confidence REAL,\
   sources_json TEXT NOT NULL DEFAULT '[]',\
-  owner TEXT\
+  owner TEXT,\
+  stale_sources_json TEXT NOT NULL DEFAULT '[]'\
 )";
 
 pub const MEMORY_ITEM_DDL_INSERT: &str = "\
@@ -38,8 +39,8 @@ INSERT OR REPLACE INTO memory_item(\
   id,interaction_id,turn_idx,session_id,tenant,memory_type,tier,content,vector_ref,weight,\
   access_count,last_accessed_timestamp,created_timestamp,provenance,tombstone,entities_pending,entities_json,\
   namespace,namespace_key,valid_from,valid_until,confidence,sources_json,owner,\
-  scope,authority,persistence,admission_json\
-) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28)";
+  scope,authority,persistence,admission_json,stale_sources_json\
+) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29)";
 
 pub const MEMORY_ITEM_DDL_SELECT_BY_ID: &str = "SELECT * FROM memory_item WHERE id=?1";
 
@@ -190,6 +191,32 @@ CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(\
 content, mem_id UNINDEXED, tokenize='trigram'\
 )";
 
+// #68 B4: net-value ledger — one row per recorded op cost. tax/benefit are
+// caller-supplied (harness measures; memory never estimates).
+pub const OP_LEDGER_DDL: &str = "\
+CREATE TABLE IF NOT EXISTS op_ledger (\
+  id INTEGER PRIMARY KEY AUTOINCREMENT,\
+  at INTEGER NOT NULL,\
+  tenant TEXT NOT NULL DEFAULT '',\
+  op TEXT NOT NULL,\
+  class TEXT NOT NULL,\
+  memory_id TEXT,\
+  benefit REAL NOT NULL DEFAULT 0,\
+  tax REAL NOT NULL DEFAULT 0\
+)";
+pub const INDEX_OP_LEDGER_CLASS: &str = "\
+CREATE INDEX IF NOT EXISTS idx_op_ledger_class ON op_ledger(tenant, class, at)";
+
+// #68 B4: auto-shutdown state per op class (window-avg net below floor).
+pub const SHUTDOWN_STATE_DDL: &str = "\
+CREATE TABLE IF NOT EXISTS shutdown_state (\
+  class TEXT PRIMARY KEY,\
+  tenant TEXT NOT NULL DEFAULT '',\
+  shutdown INTEGER NOT NULL DEFAULT 0,\
+  at INTEGER NOT NULL DEFAULT 0,\
+  reason TEXT NOT NULL DEFAULT ''\
+)";
+
 pub const ALL_DDL: &[&str] = &[
     MEMORY_ITEM_DDL,
     ENTITY_DDL,
@@ -213,6 +240,9 @@ pub const ALL_DDL: &[&str] = &[
     INDEX_MEMORY_REVISION_MID,
     SHARE_GRANT_DDL,
     INDEX_SHARE_GRANT_GRANTEE,
+    OP_LEDGER_DDL,
+    INDEX_OP_LEDGER_CLASS,
+    SHUTDOWN_STATE_DDL,
 ];
 
 pub const ALL_PRAGMAS: &[&str] = &[PRAGMA_BUSY, PRAGMA_SYNC, PRAGMA_FK];
@@ -227,7 +257,9 @@ pub const ALL_PRAGMAS: &[&str] = &[PRAGMA_BUSY, PRAGMA_SYNC, PRAGMA_FK];
 // v5: #39 加 memory_fts FTS5 虚表 (trigram 关键词路); 旧库迁移时回填全部明文行
 //     (enc:v1: 密文行不索引 — 加密部署不走 FTS, 无明文 token 落盘)。
 // v10: #57/#58 加 scope/authority/persistence/admission_json 列 + share_grant 表。
-pub const SCHEMA_VERSION: u32 = 10;
+// v11: #68 B5 加 stale_sources_json 列 (级联遗忘标注); B4 加 op_ledger + shutdown_state 表
+//      (net-value ledger + auto-shutdown 状态, ALL_DDL 幂等建表)。
+pub const SCHEMA_VERSION: u32 = 11;
 
 /// §1.10: 读旧库 user_version。新库/空 PRAGMA 返 0。
 pub fn user_version(conn: &rusqlite::Connection) -> rusqlite::Result<u32> {
@@ -395,6 +427,21 @@ pub fn migrate(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
             }
         }
         tracing::info!("migrate: ensured share_grant table (v10)");
+    }
+    // v10 → v11: #68 B5 级联遗忘标注列 + B4 ledger/shutdown 表 (ALL_DDL 幂等)。
+    if from < 11 {
+        let has: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('memory_item') WHERE name='stale_sources_json'",
+            [],
+            |r| r.get(0),
+        )?;
+        if has == 0 {
+            conn.execute_batch(
+                "ALTER TABLE memory_item ADD COLUMN stale_sources_json TEXT NOT NULL DEFAULT '[]'",
+            )?;
+            tracing::info!("migrate: added stale_sources_json column to memory_item (v11)");
+        }
+        tracing::info!("migrate: ensured op_ledger + shutdown_state tables (v11)");
     }
     // v7 → v8: #46 per-memory ACL — owner user id 列 (可空, 旧行 NULL = 共享/旧数据)。
     if from < 8 {
