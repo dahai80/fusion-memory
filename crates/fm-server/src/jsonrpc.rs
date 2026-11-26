@@ -218,6 +218,10 @@ pub async fn dispatch(
         "record_op_cost" => record_op_cost(params, engine, tenant).await,
         "net_value" => net_value(engine, tenant).await,
         "net_value_reenable" => net_value_reenable(params, engine, tenant).await,
+        "distill_lessons" => distill_lessons(params, engine, tenant).await,
+        "promote_guideline" => promote_guideline(params, engine, tenant).await,
+        "evaluate_guideline" => evaluate_guideline(params, engine, tenant).await,
+        "list_guidelines" => list_guidelines(params, engine, tenant).await,
         // v1.9.0 #53: governance panel — read-only scoring/forgetting parameter snapshot.
         "config" => Ok(fm_engine::scoring::governance_snapshot()),
         "health" => Ok(Value::String("ok".into())),
@@ -509,6 +513,139 @@ async fn net_value_reenable(
         .await
         .map_err(|e| RpcError::from_engine(&e))?;
     Ok(serde_json::json!({ "class": p.class, "was_shutdown": was }))
+}
+
+/// #72: store caller-distilled lessons (one per failure trajectory; the tap
+/// owns mining — memory owns storage).
+async fn distill_lessons(
+    params: Value,
+    engine: &EngineHandle,
+    tenant: &str,
+) -> Result<Value, RpcError> {
+    #[derive(Debug, Deserialize)]
+    struct DistillParams {
+        episodes: Vec<fm_core::DistillEpisode>,
+    }
+    let p: DistillParams =
+        serde_json::from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+    if p.episodes.is_empty() || p.episodes.len() > 100 {
+        return Err(RpcError::invalid_params(
+            "distill_lessons: episodes must hold 1..=100 entries",
+        ));
+    }
+    if p.episodes.iter().any(|e| {
+        e.lesson.trim().is_empty()
+            || e.failure_mode.trim().is_empty()
+            || e.session_id.trim().is_empty()
+    }) {
+        return Err(RpcError::invalid_params(
+            "distill_lessons: session_id, failure_mode and lesson must be non-empty",
+        ));
+    }
+    let ids = engine
+        .distill_lessons(p.episodes, tenant)
+        .await
+        .map_err(|e| RpcError::from_engine(&e))?;
+    serde_json::to_value(ids).map_err(|e| RpcError::internal(e.to_string()))
+}
+
+/// #72: merge a failure mode's lessons into one guideline (status trial until
+/// the regression-tax gate decides).
+async fn promote_guideline(
+    params: Value,
+    engine: &EngineHandle,
+    tenant: &str,
+) -> Result<Value, RpcError> {
+    #[derive(Debug, Deserialize)]
+    struct PromoteParams {
+        failure_mode: String,
+        #[serde(default)]
+        content: Option<String>,
+    }
+    let p: PromoteParams =
+        serde_json::from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+    if p.failure_mode.trim().is_empty() {
+        return Err(RpcError::invalid_params(
+            "promote_guideline: failure_mode must be non-empty",
+        ));
+    }
+    let entry = engine
+        .promote_guideline(&p.failure_mode, p.content.as_deref(), tenant)
+        .await
+        .map_err(|e| RpcError::from_engine(&e))?;
+    serde_json::to_value(entry).map_err(|e| RpcError::internal(e.to_string()))
+}
+
+/// #72: regression-tax gate — net gain (success delta − regressions) > 0
+/// takes a trial guideline live; anything else rejects it. Audited.
+async fn evaluate_guideline(
+    params: Value,
+    engine: &EngineHandle,
+    tenant: &str,
+) -> Result<Value, RpcError> {
+    #[derive(Debug, Deserialize)]
+    struct EvaluateParams {
+        memory_id: String,
+        success_with: f64,
+        success_without: f64,
+        regressions: f64,
+    }
+    let p: EvaluateParams =
+        serde_json::from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+    if p.memory_id.trim().is_empty() {
+        return Err(RpcError::invalid_params(
+            "evaluate_guideline: memory_id must be non-empty",
+        ));
+    }
+    let verdict = engine
+        .evaluate_guideline(
+            &p.memory_id,
+            p.success_with,
+            p.success_without,
+            p.regressions,
+            tenant,
+        )
+        .await
+        .map_err(|e| RpcError::from_engine(&e))?;
+    serde_json::to_value(verdict).map_err(|e| RpcError::internal(e.to_string()))
+}
+
+/// #72: injection surface — consumers pull status="live" guidelines into
+/// prompts / skill libraries.
+async fn list_guidelines(
+    params: Value,
+    engine: &EngineHandle,
+    tenant: &str,
+) -> Result<Value, RpcError> {
+    #[derive(Debug, Deserialize)]
+    struct ListParams {
+        #[serde(default)]
+        status: Option<String>,
+        #[serde(default = "default_guideline_limit")]
+        limit: u32,
+    }
+    fn default_guideline_limit() -> u32 {
+        50
+    }
+    let p: ListParams =
+        serde_json::from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+    if let Some(s) = p.status.as_deref() {
+        if !matches!(s, "trial" | "live" | "rejected") {
+            return Err(RpcError::invalid_params(
+                "list_guidelines: status must be trial|live|rejected",
+            ));
+        }
+    }
+    if p.limit == 0 || p.limit > 200 {
+        return Err(RpcError::invalid_params(
+            "list_guidelines: limit must be 1..=200",
+        ));
+    }
+    let rows = engine
+        .list_guidelines(p.status.as_deref(), p.limit, tenant)
+        .await
+        .map_err(|e| RpcError::from_engine(&e))?;
+    serde_json::to_value(rows).map_err(|e| RpcError::internal(e.to_string()))
 }
 
 async fn consolidate(params: Value, engine: &EngineHandle) -> Result<Value, RpcError> {
@@ -1496,6 +1633,65 @@ mod tests {
         ) -> fm_core::MemoryResult<bool> {
             Ok(class == "retrieve:default")
         }
+        // #72: canned guideline pipeline responses (wire-level tests only).
+        async fn distill_lessons(
+            &self,
+            episodes: Vec<fm_core::DistillEpisode>,
+            _tenant: &str,
+        ) -> fm_core::MemoryResult<Vec<String>> {
+            Ok(episodes
+                .iter()
+                .enumerate()
+                .map(|(i, _)| format!("lesson-{i}"))
+                .collect())
+        }
+        async fn promote_guideline(
+            &self,
+            failure_mode: &str,
+            _content: Option<&str>,
+            _tenant: &str,
+        ) -> fm_core::MemoryResult<fm_core::GuidelineEntry> {
+            Ok(fm_core::GuidelineEntry {
+                id: "guideline-1".into(),
+                failure_mode: failure_mode.into(),
+                status: "trial".into(),
+                content: "g".into(),
+                merge_count: 2,
+                sources: vec!["lesson-0".into(), "lesson-1".into()],
+                created_timestamp: 1,
+            })
+        }
+        async fn evaluate_guideline(
+            &self,
+            memory_id: &str,
+            success_with: f64,
+            success_without: f64,
+            regressions: f64,
+            _tenant: &str,
+        ) -> fm_core::MemoryResult<fm_core::GuidelineVerdict> {
+            let net = (success_with - success_without) - regressions;
+            Ok(fm_core::GuidelineVerdict {
+                id: memory_id.into(),
+                status: if net > 0.0 { "live" } else { "rejected" }.into(),
+                net_gain: net,
+            })
+        }
+        async fn list_guidelines(
+            &self,
+            status: Option<&str>,
+            _limit: u32,
+            _tenant: &str,
+        ) -> fm_core::MemoryResult<Vec<fm_core::GuidelineEntry>> {
+            Ok(vec![fm_core::GuidelineEntry {
+                id: "guideline-1".into(),
+                failure_mode: "pagination".into(),
+                status: status.unwrap_or("live").into(),
+                content: "g".into(),
+                merge_count: 2,
+                sources: vec![],
+                created_timestamp: 1,
+            }])
+        }
     }
 
     fn stub_handle() -> (EngineHandle, Arc<Mutex<Vec<String>>>) {
@@ -2281,6 +2477,95 @@ mod tests {
         )
         .await;
         assert_eq!(v["was_shutdown"], false);
+    }
+
+    // #72: guideline pipeline wire shapes + validation.
+    #[tokio::test]
+    async fn distill_lessons_validates_and_roundtrips() {
+        let (eng, _) = stub_handle();
+        let err = dispatch_err(&rpc("distill_lessons", serde_json::json!({}), 51), &eng).await;
+        assert_eq!(err.code, -32602, "missing episodes rejected");
+        let err = dispatch_err(
+            &rpc(
+                "distill_lessons",
+                serde_json::json!({"episodes": [{"session_id": "s", "failure_mode": "m", "lesson": ""}]}),
+                52,
+            ),
+            &eng,
+        )
+        .await;
+        assert_eq!(err.code, -32602, "blank lesson rejected");
+        let v = dispatch_ok(
+            &rpc(
+                "distill_lessons",
+                serde_json::json!({"episodes": [
+                    {"episode_id": "tap-1", "session_id": "s1", "failure_mode": "pagination", "lesson": "read the cursor"},
+                    {"session_id": "s2", "failure_mode": "pagination", "lesson": "stop on empty cursor"}
+                ]}),
+                53,
+            ),
+            &eng,
+        )
+        .await;
+        assert_eq!(v[0], "lesson-0");
+        assert_eq!(v[1], "lesson-1");
+    }
+
+    #[tokio::test]
+    async fn promote_and_evaluate_and_list_wire_shapes() {
+        let (eng, _) = stub_handle();
+        let v = dispatch_ok(
+            &rpc(
+                "promote_guideline",
+                serde_json::json!({"failure_mode": "pagination"}),
+                54,
+            ),
+            &eng,
+        )
+        .await;
+        assert_eq!(v["status"], "trial");
+        assert_eq!(v["merge_count"], 2);
+        let v = dispatch_ok(
+            &rpc(
+                "evaluate_guideline",
+                serde_json::json!({"memory_id": "guideline-1", "success_with": 0.9, "success_without": 0.6, "regressions": 0.05}),
+                55,
+            ),
+            &eng,
+        )
+        .await;
+        assert_eq!(v["status"], "live");
+        let v = dispatch_ok(
+            &rpc(
+                "evaluate_guideline",
+                serde_json::json!({"memory_id": "guideline-1", "success_with": 0.7, "success_without": 0.8, "regressions": 0.0}),
+                56,
+            ),
+            &eng,
+        )
+        .await;
+        assert_eq!(v["status"], "rejected", "no net gain = rejected");
+        let v = dispatch_ok(
+            &rpc(
+                "list_guidelines",
+                serde_json::json!({"status": "live", "limit": 10}),
+                57,
+            ),
+            &eng,
+        )
+        .await;
+        assert_eq!(v[0]["failure_mode"], "pagination");
+        assert_eq!(v[0]["status"], "live");
+        let err = dispatch_err(
+            &rpc(
+                "list_guidelines",
+                serde_json::json!({"status": "bogus"}),
+                58,
+            ),
+            &eng,
+        )
+        .await;
+        assert_eq!(err.code, -32602, "invalid status rejected");
     }
 
     #[tokio::test]

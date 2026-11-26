@@ -959,6 +959,309 @@ impl MemoryEngine {
         Ok(())
     }
 
+    // #72: lesson/guideline pipeline — storage, merge and the regression-tax
+    // gate live here; trajectory mining and cost/success measurement stay with
+    // the caller (office rollout tap / harness). Zero model calls (Rule 5).
+
+    /// Deterministic content-hash id (stable across replays, no RNG).
+    fn guideline_id(prefix: &str, key: &str, now: u64) -> String {
+        let mut h: u64 = 0xcbf29ce484222325;
+        for b in key.bytes() {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        h ^= now;
+        h = h.wrapping_mul(0x100000001b3);
+        format!("{prefix}-{h:016x}")
+    }
+
+    /// #72: store caller-distilled lessons (one per failure trajectory).
+    /// Lessons are Episodic rows with failure_mode set + provenance='lesson';
+    /// vector-less (accessed via the guideline surface, not KNN).
+    pub fn distill_lessons_core(
+        &self,
+        episodes: Vec<fm_core::DistillEpisode>,
+        tenant: &str,
+    ) -> fm_core::MemoryResult<Vec<String>> {
+        if episodes.is_empty() {
+            return Err(fm_core::MemoryError::Unsupported(
+                "distill_lessons: episodes must not be empty".into(),
+            ));
+        }
+        if episodes.len() > 100 {
+            return Err(fm_core::MemoryError::Unsupported(format!(
+                "distill_lessons: {} episodes exceeds cap 100",
+                episodes.len()
+            )));
+        }
+        let now = Self::now_ms();
+        let mut ids = Vec::with_capacity(episodes.len());
+        for ep in &episodes {
+            if ep.lesson.trim().is_empty() || ep.failure_mode.trim().is_empty() {
+                return Err(fm_core::MemoryError::Unsupported(
+                    "distill_lessons: lesson and failure_mode must be non-empty".into(),
+                ));
+            }
+            if ep.session_id.trim().is_empty() {
+                return Err(fm_core::MemoryError::Unsupported(
+                    "distill_lessons: session_id must be non-empty".into(),
+                ));
+            }
+        }
+        for ep in episodes {
+            let id = MemoryEngine::guideline_id(
+                "lesson",
+                &format!("{}|{}", ep.session_id, ep.lesson),
+                now,
+            );
+            let mut item = fm_core::MemoryItem::new_turn_skeleton(
+                id.clone(),
+                ep.episode_id.clone(),
+                0,
+                ep.session_id.clone(),
+                tenant.to_string(),
+                fm_core::MemoryType::Episodic,
+                ep.lesson,
+                now,
+            );
+            item.tier = fm_core::MemoryTier::Short;
+            item.provenance = Some("lesson".into());
+            item.failure_mode = Some(ep.failure_mode.clone());
+            if !ep.episode_id.is_empty() {
+                item.sources = vec![ep.episode_id.clone()];
+            }
+            let payload = serde_json::to_string(&item)
+                .map_err(|e| fm_core::MemoryError::Unsupported(format!("lesson serialize: {e}")))?;
+            self.persist
+                .put_memory_with_wop(&item, "guideline_replay", &payload, now)
+                .map_err(|e| e.to_memory())?;
+            if let Err(e) =
+                self.persist
+                    .append_audit(now, "guideline", "distill", &id, &ep.failure_mode)
+            {
+                warn!(error = %e, "audit_log append failed (guideline distill), non-fatal");
+            }
+            ids.push(id);
+        }
+        info!(count = ids.len(), "lessons distilled");
+        Ok(ids)
+    }
+
+    /// #72: merge a failure mode's lessons into one guideline (status trial).
+    /// Idempotent: re-promote after new lessons bumps merge_count + sources;
+    /// a previously rejected guideline refuses re-promotion (fail-safe).
+    pub fn promote_guideline_core(
+        &self,
+        failure_mode: &str,
+        content: Option<&str>,
+        tenant: &str,
+    ) -> fm_core::MemoryResult<fm_core::GuidelineEntry> {
+        if failure_mode.trim().is_empty() {
+            return Err(fm_core::MemoryError::Unsupported(
+                "promote_guideline: failure_mode must be non-empty".into(),
+            ));
+        }
+        let lessons = self
+            .persist
+            .lessons_by_mode(failure_mode, tenant)
+            .map_err(|e| e.to_memory())?;
+        if lessons.is_empty() {
+            return Err(fm_core::MemoryError::Unsupported(format!(
+                "promote_guideline: no lessons for failure mode '{failure_mode}'"
+            )));
+        }
+        let now = Self::now_ms();
+        let lesson_ids: Vec<String> = lessons.iter().map(|l| l.id.clone()).collect();
+        let merged_content = match content.map(str::trim).filter(|c| !c.is_empty()) {
+            Some(c) => c.to_string(),
+            None => lessons
+                .iter()
+                .map(|l| l.content.as_str())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        };
+        let existing = self
+            .persist
+            .guideline_by_mode(failure_mode, tenant)
+            .map_err(|e| e.to_memory())?;
+        let item = match existing {
+            Some(mut g) => {
+                if g.guideline_status.as_deref() == Some("rejected") {
+                    return Err(fm_core::MemoryError::Unsupported(format!(
+                        "promote_guideline: guideline for '{failure_mode}' was rejected by the regression-tax gate; distill corrective lessons and promote a new guideline"
+                    )));
+                }
+                // Idempotent re-promote: refresh merge state over current lessons.
+                g.content = merged_content;
+                g.sources = lesson_ids.clone();
+                g.merge_count = lessons.len() as u64;
+                g.last_accessed_timestamp = now;
+                g
+            }
+            None => {
+                let id = MemoryEngine::guideline_id("guideline", failure_mode, now);
+                let mut g = fm_core::MemoryItem::new_turn_skeleton(
+                    id,
+                    format!("guideline-{failure_mode}"),
+                    0,
+                    format!("guideline-{failure_mode}"),
+                    tenant.to_string(),
+                    fm_core::MemoryType::Semantic,
+                    merged_content,
+                    now,
+                );
+                g.tier = fm_core::MemoryTier::Long;
+                g.provenance = Some("guideline".into());
+                g.failure_mode = Some(failure_mode.to_string());
+                g.guideline_status = Some("trial".into());
+                g.sources = lesson_ids.clone();
+                g.merge_count = lessons.len() as u64;
+                g
+            }
+        };
+        let entry = fm_core::GuidelineEntry {
+            id: item.id.clone(),
+            failure_mode: failure_mode.to_string(),
+            status: item
+                .guideline_status
+                .clone()
+                .unwrap_or_else(|| "trial".into()),
+            content: item.content.clone(),
+            merge_count: item.merge_count,
+            sources: item.sources.clone(),
+            created_timestamp: item.created_timestamp,
+        };
+        let payload = serde_json::to_string(&item)
+            .map_err(|e| fm_core::MemoryError::Unsupported(format!("guideline serialize: {e}")))?;
+        self.persist
+            .put_memory_with_wop(&item, "guideline_replay", &payload, now)
+            .map_err(|e| e.to_memory())?;
+        if let Err(e) = self.persist.append_audit(
+            now,
+            "guideline",
+            "promote",
+            &item.id,
+            &format!("mode={failure_mode} lessons={}", lessons.len()),
+        ) {
+            warn!(error = %e, "audit_log append failed (guideline promote), non-fatal");
+        }
+        info!(
+            mode = failure_mode,
+            lessons = lessons.len(),
+            "guideline promoted (trial)"
+        );
+        Ok(entry)
+    }
+
+    /// #72: regression-tax gate — trial guideline goes live only if the
+    /// with/without comparison shows net gain (success delta > regressions).
+    /// Verdict audited; numbers come from the caller (memory never measures).
+    pub fn evaluate_guideline_core(
+        &self,
+        memory_id: &str,
+        success_with: f64,
+        success_without: f64,
+        regressions: f64,
+        tenant: &str,
+    ) -> fm_core::MemoryResult<fm_core::GuidelineVerdict> {
+        let Some(mut item) = self
+            .persist
+            .get_memory(memory_id)
+            .map_err(|e| e.to_memory())?
+        else {
+            return Err(fm_core::MemoryError::NotFound(memory_id.to_string()));
+        };
+        if !tenant.is_empty() && item.tenant != tenant {
+            return Err(fm_core::MemoryError::NotFound(memory_id.to_string()));
+        }
+        if item.guideline_status.as_deref() != Some("trial") {
+            return Err(fm_core::MemoryError::Unsupported(format!(
+                "evaluate_guideline: memory '{memory_id}' is not a trial guideline (status {:?})",
+                item.guideline_status
+            )));
+        }
+        if !(0.0..=1.0).contains(&success_with)
+            || !(0.0..=1.0).contains(&success_without)
+            || !(0.0..=success_with).contains(&regressions)
+        {
+            return Err(fm_core::MemoryError::Unsupported(
+                "evaluate_guideline: expect success rates in [0,1] and 0 <= regressions <= success_with"
+                    .into(),
+            ));
+        }
+        let net_gain = (success_with - success_without) - regressions;
+        let verdict = if net_gain > 0.0 { "live" } else { "rejected" };
+        let now = Self::now_ms();
+        item.guideline_status = Some(verdict.into());
+        if verdict == "live" {
+            // Corroboration ladder mid value: gate-passed product with
+            // caller-measured evidence (not extraction corroboration).
+            item.confidence = Some(0.75);
+        }
+        item.last_accessed_timestamp = now;
+        let payload = serde_json::to_string(&item)
+            .map_err(|e| fm_core::MemoryError::Unsupported(format!("guideline serialize: {e}")))?;
+        self.persist
+            .put_memory_with_wop(&item, "guideline_replay", &payload, now)
+            .map_err(|e| e.to_memory())?;
+        let detail = format!(
+            "with={success_with} without={success_without} regressions={regressions} net={net_gain:.4} verdict={verdict}"
+        );
+        if let Err(e) = self
+            .persist
+            .append_audit(now, "guideline", "evaluate", memory_id, &detail)
+        {
+            warn!(error = %e, "audit_log append failed (guideline evaluate), non-fatal");
+        }
+        info!(
+            id = memory_id,
+            verdict, net_gain, "regression-tax gate decided"
+        );
+        Ok(fm_core::GuidelineVerdict {
+            id: memory_id.to_string(),
+            status: verdict.into(),
+            net_gain,
+        })
+    }
+
+    /// #72: injection surface — list guidelines (optionally by status).
+    /// Consumers inject `status="live"` rows into prompts / skill libraries.
+    pub fn list_guidelines_core(
+        &self,
+        status: Option<&str>,
+        limit: u32,
+        tenant: &str,
+    ) -> fm_core::MemoryResult<Vec<fm_core::GuidelineEntry>> {
+        if let Some(s) = status {
+            if !matches!(s, "trial" | "live" | "rejected") {
+                return Err(fm_core::MemoryError::Unsupported(format!(
+                    "list_guidelines: invalid status {s:?} (expect trial|live|rejected)"
+                )));
+            }
+        }
+        if limit == 0 || limit > 200 {
+            return Err(fm_core::MemoryError::Unsupported(
+                "list_guidelines: limit must be 1..=200".into(),
+            ));
+        }
+        let rows = self
+            .persist
+            .list_guidelines(status, tenant, limit)
+            .map_err(|e| e.to_memory())?;
+        Ok(rows
+            .into_iter()
+            .map(|i| fm_core::GuidelineEntry {
+                id: i.id,
+                failure_mode: i.failure_mode.unwrap_or_default(),
+                status: i.guideline_status.unwrap_or_default(),
+                content: i.content,
+                merge_count: i.merge_count,
+                sources: i.sources,
+                created_timestamp: i.created_timestamp,
+            })
+            .collect())
+    }
+
     /// #68 B5: cascade forgetting — annotate live dependents of a forgotten
     /// memory with `stale_sources`, persist via full-item wop (cascade_forget
     /// op → follower put_item replay). One hop per forget event; transitivity
@@ -2135,6 +2438,51 @@ impl fm_core::FusionMemoryEngine for MemoryEngine {
 
     async fn net_value_reenable(&self, class: &str, tenant: &str) -> fm_core::MemoryResult<bool> {
         MemoryEngine::net_value_reenable_core(self, class, tenant)
+    }
+
+    // #72: lesson/guideline pipeline RPC impls (core fns above).
+    async fn distill_lessons(
+        &self,
+        episodes: Vec<fm_core::DistillEpisode>,
+        tenant: &str,
+    ) -> fm_core::MemoryResult<Vec<String>> {
+        MemoryEngine::distill_lessons_core(self, episodes, tenant)
+    }
+
+    async fn promote_guideline(
+        &self,
+        failure_mode: &str,
+        content: Option<&str>,
+        tenant: &str,
+    ) -> fm_core::MemoryResult<fm_core::GuidelineEntry> {
+        MemoryEngine::promote_guideline_core(self, failure_mode, content, tenant)
+    }
+
+    async fn evaluate_guideline(
+        &self,
+        memory_id: &str,
+        success_with: f64,
+        success_without: f64,
+        regressions: f64,
+        tenant: &str,
+    ) -> fm_core::MemoryResult<fm_core::GuidelineVerdict> {
+        MemoryEngine::evaluate_guideline_core(
+            self,
+            memory_id,
+            success_with,
+            success_without,
+            regressions,
+            tenant,
+        )
+    }
+
+    async fn list_guidelines(
+        &self,
+        status: Option<&str>,
+        limit: u32,
+        tenant: &str,
+    ) -> fm_core::MemoryResult<Vec<fm_core::GuidelineEntry>> {
+        MemoryEngine::list_guidelines_core(self, status, limit, tenant)
     }
 
     async fn list_audit_log(

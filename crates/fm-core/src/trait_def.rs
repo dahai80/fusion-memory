@@ -166,6 +166,62 @@ pub trait FusionMemoryEngine: Send + Sync {
         ))
     }
 
+    /// #72: store caller-distilled lessons (one per failure trajectory), one
+    /// lesson memory per episode. Returns created lesson ids, call order.
+    async fn distill_lessons(
+        &self,
+        _episodes: Vec<crate::guideline::DistillEpisode>,
+        _tenant: &str,
+    ) -> MemoryResult<Vec<String>> {
+        Err(crate::error::MemoryError::Unsupported(
+            "distill_lessons not implemented for this engine".into(),
+        ))
+    }
+
+    /// #72: merge a failure mode's lessons into one guideline (status trial —
+    /// goes live only through evaluate_guideline). Idempotent: re-promote bumps
+    /// merge_count + sources; a rejected guideline refuses re-promotion.
+    async fn promote_guideline(
+        &self,
+        _failure_mode: &str,
+        _content: Option<&str>,
+        _tenant: &str,
+    ) -> MemoryResult<crate::guideline::GuidelineEntry> {
+        Err(crate::error::MemoryError::Unsupported(
+            "promote_guideline not implemented for this engine".into(),
+        ))
+    }
+
+    /// #72: regression-tax gate — a trial guideline goes live only if the
+    /// with/without comparison shows net gain (success delta > regressions
+    /// it introduces). Audited; verdict final until re-promotion after
+    /// new lessons (rejected refuses direct re-evaluation).
+    async fn evaluate_guideline(
+        &self,
+        _memory_id: &str,
+        _success_with: f64,
+        _success_without: f64,
+        _regressions: f64,
+        _tenant: &str,
+    ) -> MemoryResult<crate::guideline::GuidelineVerdict> {
+        Err(crate::error::MemoryError::Unsupported(
+            "evaluate_guideline not implemented for this engine".into(),
+        ))
+    }
+
+    /// #72: injection surface — list guidelines, default all statuses,
+    /// `status="live"` for prompt injection (ungated statuses stay internal).
+    async fn list_guidelines(
+        &self,
+        _status: Option<&str>,
+        _limit: u32,
+        _tenant: &str,
+    ) -> MemoryResult<Vec<crate::guideline::GuidelineEntry>> {
+        Err(crate::error::MemoryError::Unsupported(
+            "list_guidelines not implemented for this engine".into(),
+        ))
+    }
+
     /// #64 T2: distinct namespace_key values per tenant + tier (team anchors
     /// enumeration for agent-studio). Returns keys only, never content.
     /// Empty/unknown tier → Unsupported-style error (fail-closed).

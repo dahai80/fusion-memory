@@ -7,6 +7,7 @@ pub mod browse;
 pub mod context;
 pub mod entity;
 pub mod error;
+pub mod guideline;
 pub mod interaction;
 pub mod ledger;
 pub mod memory;
@@ -19,6 +20,7 @@ pub use browse::{AuditEntry, ListQuery, MemoryRevision, MergeEntry, ProvenanceRe
 pub use context::{ContextBlock, FormattedContext, RetrieveQuery};
 pub use entity::{EntityNode, EntityType};
 pub use error::{MemoryError, MemoryResult};
+pub use guideline::{DistillEpisode, GuidelineEntry, GuidelineVerdict};
 pub use interaction::{Interaction, ToolCall, Turn};
 pub use ledger::{LedgerStatus, OpClassNet, OpCostRecord};
 pub use memory::{

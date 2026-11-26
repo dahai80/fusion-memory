@@ -31,7 +31,10 @@ CREATE TABLE IF NOT EXISTS memory_item (\
   confidence REAL,\
   sources_json TEXT NOT NULL DEFAULT '[]',\
   owner TEXT,\
-  stale_sources_json TEXT NOT NULL DEFAULT '[]'\
+  stale_sources_json TEXT NOT NULL DEFAULT '[]',\
+  guideline_status TEXT,\
+  failure_mode TEXT,\
+  merge_count INTEGER NOT NULL DEFAULT 0\
 )";
 
 pub const MEMORY_ITEM_DDL_INSERT: &str = "\
@@ -39,8 +42,9 @@ INSERT OR REPLACE INTO memory_item(\
   id,interaction_id,turn_idx,session_id,tenant,memory_type,tier,content,vector_ref,weight,\
   access_count,last_accessed_timestamp,created_timestamp,provenance,tombstone,entities_pending,entities_json,\
   namespace,namespace_key,valid_from,valid_until,confidence,sources_json,owner,\
-  scope,authority,persistence,admission_json,stale_sources_json\
-) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29)";
+  scope,authority,persistence,admission_json,stale_sources_json,\
+  guideline_status,failure_mode,merge_count\
+) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32)";
 
 pub const MEMORY_ITEM_DDL_SELECT_BY_ID: &str = "SELECT * FROM memory_item WHERE id=?1";
 
@@ -259,7 +263,9 @@ pub const ALL_PRAGMAS: &[&str] = &[PRAGMA_BUSY, PRAGMA_SYNC, PRAGMA_FK];
 // v10: #57/#58 加 scope/authority/persistence/admission_json 列 + share_grant 表。
 // v11: #68 B5 加 stale_sources_json 列 (级联遗忘标注); B4 加 op_ledger + shutdown_state 表
 //      (net-value ledger + auto-shutdown 状态, ALL_DDL 幂等建表)。
-pub const SCHEMA_VERSION: u32 = 11;
+// v12: #72 加 guideline_status/failure_mode/merge_count 列 (lesson/guideline pipeline
+//      + 回归税门禁; guideline_status NULL = 非 guideline 行)。
+pub const SCHEMA_VERSION: u32 = 12;
 
 /// §1.10: 读旧库 user_version。新库/空 PRAGMA 返 0。
 pub fn user_version(conn: &rusqlite::Connection) -> rusqlite::Result<u32> {
@@ -453,6 +459,36 @@ pub fn migrate(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
         if has == 0 {
             conn.execute_batch("ALTER TABLE memory_item ADD COLUMN owner TEXT")?;
             tracing::info!("migrate: added owner column to memory_item (v8)");
+        }
+    }
+    // v11 → v12: #72 lesson/guideline pipeline — 三列 guarded ALTER
+    // (guideline_status NULL = 非 guideline 行; merge_count NOT NULL DEFAULT 0)。
+    if from < 12 {
+        for (col, ddl) in [
+            (
+                "guideline_status",
+                "ALTER TABLE memory_item ADD COLUMN guideline_status TEXT",
+            ),
+            (
+                "failure_mode",
+                "ALTER TABLE memory_item ADD COLUMN failure_mode TEXT",
+            ),
+            (
+                "merge_count",
+                "ALTER TABLE memory_item ADD COLUMN merge_count INTEGER NOT NULL DEFAULT 0",
+            ),
+        ] {
+            let has: i64 = conn.query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM pragma_table_info('memory_item') WHERE name='{col}'"
+                ),
+                [],
+                |r| r.get(0),
+            )?;
+            if has == 0 {
+                conn.execute_batch(ddl)?;
+                tracing::info!(col, "migrate: added guideline column to memory_item (v12)");
+            }
         }
     }
     set_user_version(conn, SCHEMA_VERSION)?;
