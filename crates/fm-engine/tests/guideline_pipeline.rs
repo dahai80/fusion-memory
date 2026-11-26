@@ -34,7 +34,7 @@ fn episode(session: &str, mode: &str, lesson: &str) -> fm_core::DistillEpisode {
 // injection surface with merge_count and lesson provenance.
 #[tokio::test]
 async fn pipeline_pass_gate_goes_live() {
-    let (engine, persist) = setup();
+    let (engine, _persist) = setup();
     let ids = engine
         .distill_lessons(
             vec![
