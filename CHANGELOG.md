@@ -21,6 +21,13 @@ Internal path-dep private ecosystem (not on crates.io); versions tag + GitHub re
 
 ## [Unreleased]
 
+## [1.13.1] — 2026-11-26
+
+PATCH release — commit `Cargo.lock` (issue #70 P2, workspace audit 2026-11-26). Infra-only; zero Rust code/API change; crate versions bumped for release bookkeeping only.
+
+### Changed
+- **Build**: `Cargo.lock` removed from `.gitignore` and committed. Lockfile was previously regenerated per checkout, so the CI `rust-cache` key (derived from the lock) drifted and every run fell back to a full recompile of the 12-crate workspace; a committed lock pins the dependency graph, stabilizes the cache key, and makes CI builds reproducible. P1 of the same audit (103G `target/debug`) was resolved operationally by `cargo clean` — no repo change.
+
 ## [1.13.0] — 2026-11-18
 
 MINOR release — net-value ledger (B4) + cascade forgetting (B5), issue #68. Additive only; schema v11 (1 guarded ALTER `stale_sources_json` + `op_ledger`/`shutdown_state` tables, `CREATE IF NOT EXISTS` idempotent, no wire-contract change). Three new envs (`FUSION_MEMORY_NET_VALUE_FLOOR`/`_WINDOW_MS`/`_MIN_SAMPLES`) + three new RPCs (UDS + HTTP): `record_op_cost`, `net_value`, `net_value_reenable`.
