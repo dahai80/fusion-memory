@@ -98,6 +98,16 @@ pub fn app(state: HttpState) -> axum::Router {
             "/v1/memory/net_value_reenable",
             post(net_value_reenable_route),
         )
+        .route("/v1/memory/distill_lessons", post(distill_lessons_route))
+        .route(
+            "/v1/memory/promote_guideline",
+            post(promote_guideline_route),
+        )
+        .route(
+            "/v1/memory/evaluate_guideline",
+            post(evaluate_guideline_route),
+        )
+        .route("/v1/memory/list_guidelines", post(list_guidelines_route))
         // #33: web UI static assets (web/dist embedded at compile time, no runtime file dependency). Public shell; data goes through Bearer.
         .route("/app", get(web_index))
         .route("/app/*path", get(web_asset))
@@ -302,6 +312,18 @@ async fn net_value_route(st: State<HttpState>, h: HeaderMap, j: Json<Value>) -> 
     handle_rpc(st, h, j).await
 }
 async fn net_value_reenable_route(st: State<HttpState>, h: HeaderMap, j: Json<Value>) -> Response {
+    handle_rpc(st, h, j).await
+}
+async fn distill_lessons_route(st: State<HttpState>, h: HeaderMap, j: Json<Value>) -> Response {
+    handle_rpc(st, h, j).await
+}
+async fn promote_guideline_route(st: State<HttpState>, h: HeaderMap, j: Json<Value>) -> Response {
+    handle_rpc(st, h, j).await
+}
+async fn evaluate_guideline_route(st: State<HttpState>, h: HeaderMap, j: Json<Value>) -> Response {
+    handle_rpc(st, h, j).await
+}
+async fn list_guidelines_route(st: State<HttpState>, h: HeaderMap, j: Json<Value>) -> Response {
     handle_rpc(st, h, j).await
 }
 async fn audit_log_route(st: State<HttpState>, h: HeaderMap, j: Json<Value>) -> Response {

@@ -256,6 +256,16 @@ pub struct MemoryItem {
     /// 下游读路径 (get/retrieve/provenance) 携带此字段, 孤儿引用不再静默。
     #[serde(default)]
     pub stale_sources: Vec<String>,
+    /// #72 lesson/guideline pipeline: guideline 生命周期 (None = 非 guideline 行)。
+    /// 'trial' (待回归税门禁) / 'live' (净收益 > 0, 可注入) / 'rejected' (门禁否决)。
+    #[serde(default)]
+    pub guideline_status: Option<String>,
+    /// #72 失败模式聚类 key (lesson 与 guideline 共用; None = 普通记忆)。
+    #[serde(default)]
+    pub failure_mode: Option<String>,
+    /// #72 guideline 吸收的 lesson 计数 (promote 合并次数; 非 guideline 恒 0)。
+    #[serde(default)]
+    pub merge_count: u64,
 }
 
 impl MemoryItem {
@@ -302,6 +312,9 @@ impl MemoryItem {
             persistence: SafetyPersistence::Normal,
             admission: None,
             stale_sources: Vec::new(),
+            guideline_status: None,
+            failure_mode: None,
+            merge_count: 0,
         }
     }
 

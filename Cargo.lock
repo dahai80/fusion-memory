@@ -950,7 +950,7 @@ dependencies = [
 
 [[package]]
 name = "fm-cli"
-version = "1.13.1"
+version = "1.14.0"
 dependencies = [
  "clap",
  "fm-cluster",
@@ -971,7 +971,7 @@ dependencies = [
 
 [[package]]
 name = "fm-cluster"
-version = "1.13.1"
+version = "1.14.0"
 dependencies = [
  "async-trait",
  "fm-core",
@@ -986,7 +986,7 @@ dependencies = [
 
 [[package]]
 name = "fm-core"
-version = "1.13.1"
+version = "1.14.0"
 dependencies = [
  "async-trait",
  "serde",
@@ -997,7 +997,7 @@ dependencies = [
 
 [[package]]
 name = "fm-embed"
-version = "1.13.1"
+version = "1.14.0"
 dependencies = [
  "async-trait",
  "fm-core",
@@ -1012,7 +1012,7 @@ dependencies = [
 
 [[package]]
 name = "fm-engine"
-version = "1.13.1"
+version = "1.14.0"
 dependencies = [
  "async-trait",
  "fg-redact",
@@ -1037,7 +1037,7 @@ dependencies = [
 
 [[package]]
 name = "fm-fuzz"
-version = "1.13.1"
+version = "1.14.0"
 dependencies = [
  "fm-server",
  "libfuzzer-sys",
@@ -1046,7 +1046,7 @@ dependencies = [
 
 [[package]]
 name = "fm-graph"
-version = "1.13.1"
+version = "1.14.0"
 dependencies = [
  "fm-core",
  "fm-persist",
@@ -1058,7 +1058,7 @@ dependencies = [
 
 [[package]]
 name = "fm-persist"
-version = "1.13.1"
+version = "1.14.0"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -1077,7 +1077,7 @@ dependencies = [
 
 [[package]]
 name = "fm-py"
-version = "1.13.1"
+version = "1.14.0"
 dependencies = [
  "fm-core",
  "fm-embed",
@@ -1093,7 +1093,7 @@ dependencies = [
 
 [[package]]
 name = "fm-server"
-version = "1.13.1"
+version = "1.14.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -1119,7 +1119,7 @@ dependencies = [
 
 [[package]]
 name = "fm-similarity"
-version = "1.13.1"
+version = "1.14.0"
 dependencies = [
  "fm-core",
  "serde",
@@ -1128,7 +1128,7 @@ dependencies = [
 
 [[package]]
 name = "fm-store"
-version = "1.13.1"
+version = "1.14.0"
 dependencies = [
  "fm-core",
  "fs-core",

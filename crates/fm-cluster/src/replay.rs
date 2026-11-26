@@ -193,6 +193,16 @@ pub async fn replay_one(sink: &dyn ReplaySink, entry: &WopEntry) -> ClusterResul
             sink.put_item(&item).await?;
             Ok(true)
         }
+        // #72: lesson/guideline pipeline — full item write (lesson insert,
+        // guideline promote/evaluate verdict). payload = MemoryItem JSON,
+        // follower put_item.
+        "guideline_replay" => {
+            let item: MemoryItem = serde_json::from_str(&entry.payload).map_err(|e| {
+                ClusterError::PermanentReplay(format!("guideline_replay payload decode: {e}"))
+            })?;
+            sink.put_item(&item).await?;
+            Ok(true)
+        }
         other => {
             // summarize/reextract/未知 op: 本地 consolidate 各节点独立, 跳过。
             // (summarize 产生新 Semantic 记忆, follower 经其 own consolidate 生成, 跳过避免双重摘要)
@@ -394,6 +404,49 @@ mod tests {
             op: "cascade_forget".into(),
             payload: "not-json".into(),
             at: 300,
+        }];
+        let out = replay_wops(&sink, &entries).await;
+        assert_eq!(out.applied, 0);
+        assert!(out.permanent, "corrupt payload is permanent, not transient");
+    }
+
+    // #72: guideline_replay wop = full-item write (lesson insert / guideline
+    // promote / evaluate verdict); corrupt payload = permanent replay error.
+    #[tokio::test]
+    async fn replay_guideline_replay_writes_item() {
+        let sink = FakeSink::new();
+        let mut item = sample_item();
+        item.guideline_status = Some("live".into());
+        item.failure_mode = Some("pagination".into());
+        item.merge_count = 2;
+        let payload = serde_json::to_string(&item).unwrap();
+        let entries = vec![WopEntry {
+            seq: 9,
+            op: "guideline_replay".into(),
+            payload,
+            at: 310,
+        }];
+        let out = replay_wops(&sink, &entries).await;
+        assert_eq!(out.applied, 1);
+        assert!(!out.failed);
+        assert!(
+            sink.vectors.lock().unwrap().is_empty(),
+            "vector untouched by guideline_replay"
+        );
+        let puts = sink.puts.lock().unwrap();
+        assert_eq!(puts.len(), 1);
+        assert_eq!(puts[0].guideline_status.as_deref(), Some("live"));
+        assert_eq!(puts[0].merge_count, 2);
+    }
+
+    #[tokio::test]
+    async fn replay_guideline_replay_bad_payload_permanent() {
+        let sink = FakeSink::new();
+        let entries = vec![WopEntry {
+            seq: 10,
+            op: "guideline_replay".into(),
+            payload: "not-json".into(),
+            at: 310,
         }];
         let out = replay_wops(&sink, &entries).await;
         assert_eq!(out.applied, 0);

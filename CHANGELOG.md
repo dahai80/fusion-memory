@@ -21,6 +21,18 @@ Internal path-dep private ecosystem (not on crates.io); versions tag + GitHub re
 
 ## [Unreleased]
 
+## [1.14.0] — 2026-11-26
+
+MINOR release — lesson/guideline pipeline with a mandatory regression-tax gate (issue #72; source: office-research frontier-watch #5, arxiv Self-Distilled Memory 2611.26361 / GrepMem 2611.25123 / IBM CUGA altk-evolve pattern). Additive only; schema v12 (3 guarded ALTERs `guideline_status`/`failure_mode`/`merge_count`, no wire-contract change). Four new RPCs (UDS + HTTP): `distill_lessons`, `promote_guideline`, `evaluate_guideline`, `list_guidelines`. No new envs.
+
+- **Boundary ruling (issue #72)**: the caller (office rollout tap / harness) owns failure-trajectory mining, lesson text, and with/without success measurement — fusion-memory owns lesson storage, guideline merge, the gate policy, and the injection surface. Zero model calls (Rule 5): every input arrives caller-distilled. Grep-retrieval over raw tap logs (GrepMem) stays outside memory — guidelines handle procedural rules only.
+- **Lessons**: `distill_lessons {episodes: [{episode_id?, session_id, failure_mode, lesson}]}` (1..=100 per call) stores one Episodic memory per trajectory (`provenance='lesson'`, `failure_mode` set, episode id in `sources`), vector-less, tenant-scoped.
+- **Guidelines**: `promote_guideline {failure_mode, content?}` merges that mode's lessons into one Semantic guideline (`status='trial'`, `merge_count=N`, `sources`=lesson ids, caller content overrides the deterministic join default). Idempotent re-promote absorbs new lessons into the same guideline; a rejected guideline refuses re-promotion (no silent revival).
+- **Regression-tax gate (mandatory)**: `evaluate_guideline {memory_id, success_with, success_without, regressions}` — the trial guideline goes live only if net gain `(success_with − success_without) − regressions > 0`; anything else rejects it. Inputs validated (`success ∈ [0,1]`, `0 ≤ regressions ≤ success_with`); verdict + measured numbers audited (`guideline/evaluate`); live guidelines carry confidence 0.75. Ungated injection is exactly how a memory system makes the agent worse — the gate is not optional.
+- **Injection surface**: `list_guidelines {status?, limit 1..=200}` — consumers pull `status="live"` rows into system prompts / skill libraries; trial/rejected stay internal. Guidelines age and expire through the standard forgetting curve like every other memory.
+- **Replication**: all three write paths emit the full-item wop op `guideline_replay` (follower `put_item`; corrupt payload = PermanentReplay) — cluster followers converge on lesson inserts, promote merges, and gate verdicts.
+- **Acceptance**: `crates/fm-engine/tests/guideline_pipeline.rs` (6 e2e: pass-gate goes live with merge provenance, fail-gate rejects and blocks re-promotion, idempotent re-promote absorbs new lessons, input validation fail-closed, tenant-scoped isolation incl. cross-tenant NotFound, row shapes); fm-persist (v12 migration restoring 3 columns, guideline query helpers incl. provenance filter + tombstone exclusion); fm-cluster (`guideline_replay` put_item + corrupt-payload permanent); fm-server wire (validation + round-trips). 614 offline tests / 42 suites green (was 602/41).
+
 ## [1.13.1] — 2026-11-26
 
 PATCH release — commit `Cargo.lock` (issue #70 P2, workspace audit 2026-11-26). Infra-only; zero Rust code/API change; crate versions bumped for release bookkeeping only.

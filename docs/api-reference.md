@@ -53,6 +53,10 @@ source_of_truth:
 | `POST /v1/memory/publish_playbook` | — | v1.10.0 #58 发布到共享库：`{memory_id, publisher_key}` → `{playbook_id}`（playbook 命名空间 / team 权威 / pinned / 署名） |
 | `POST /v1/memory/sleep_run` | — | v1.11.0 #60 睡眠治理：无参数，幂等触发一趟离线预计算 + 准入门重放 → `SleepReport`（consolidated/replay_checked/replay_downweighted/playbook_demoted/duration_ms） |
 | `POST /v1/memory/list_namespaces` | — | v1.12.0 #64 命名空间 key 枚举：`{namespace: <tier>}` → 该租户该层的 distinct `namespace_key` 列表（只出 key 不出内容；空/未知层 invalid_params） |
+| `POST /v1/memory/distill_lessons` | — | v1.14.0 #72 教训入库：`{episodes: [{episode_id?, session_id, failure_mode, lesson}]}`（1..=100/次；轨迹挖掘归调用方，memory 只存）→ 教训 id 列表（Episodic 行，provenance=lesson） |
+| `POST /v1/memory/promote_guideline` | — | v1.14.0 #72 教训合并：`{failure_mode, content?}` → 该模式教训合并为一条 guideline（trial 态，merge_count=教训数）；幂等再晋升吸收新教训；被拒准则拒绝再晋升 |
+| `POST /v1/memory/evaluate_guideline` | — | v1.14.0 #72 回归税门禁（强制）：`{memory_id, success_with, success_without, regressions}` → 净收益 `(with−without)−regressions > 0` 才上线（live），否则 rejected；审计 `guideline/evaluate` |
+| `POST /v1/memory/list_guidelines` | — | v1.14.0 #72 注入面：`{status?, limit 1..=200}` → guideline 列表；注入用 `status="live"`，trial/rejected 不出 |
 | `POST /v1/memory/record_op_cost` | — | v1.13.0 #68 B4 净值台账：`{op, class, memory_id?, benefit?, tax, at?}`（tax 为调用方实测 — memory 永不估算成本）→ `LedgerStatus`（class/ops/net/shutdown/just_shutdown）；样本足够且窗口均净值破下限时该 class 关停 |
 | `POST /v1/memory/net_value` | — | v1.13.0 #68 B4 净值报告：无参数 → `[{class, ops, benefit, tax, net, shutdown}]`（按策略窗口聚合，租户作用域） |
 | `POST /v1/memory/net_value_reenable` | ✔ | v1.13.0 #68 B4 运维重新启用：`{class, confirm=true}` → `{class, was_shutdown}`；审计 `netvalue/reenable` |

@@ -311,6 +311,9 @@ pub async fn run_import(engine: &MemoryEngine, source_db: &str) -> Result<Import
             admission: None,
             // #68 B5: legacy rows have no stale-source annotations.
             stale_sources: Vec::new(),
+            guideline_status: None,
+            failure_mode: None,
+            merge_count: 0,
         };
         if let Err(e) = engine.persist().put_memory(&item) {
             warn!(id = %row.id, error = %e, "persist failed");

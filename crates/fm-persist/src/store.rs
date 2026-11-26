@@ -205,6 +205,9 @@ impl Persist {
                     .map(|a| serde_json::to_string(a).expect("admission_json serialize"))
                     .unwrap_or_default(),
                 serde_json::to_string(&item.stale_sources).expect("stale_sources_json serialize"),
+                item.guideline_status,
+                item.failure_mode,
+                item.merge_count as i64,
             ],
         )?;
         for e in &item.entities {
@@ -297,6 +300,9 @@ impl Persist {
                     .map(|a| serde_json::to_string(a).expect("admission_json serialize"))
                     .unwrap_or_default(),
                 serde_json::to_string(&item.stale_sources).expect("stale_sources_json serialize"),
+                item.guideline_status,
+                item.failure_mode,
+                item.merge_count as i64,
             ],
         )?;
         for e in &item.entities {
@@ -871,6 +877,67 @@ impl Persist {
         let conn = self.conn()?;
         conn.execute("DROP TABLE IF EXISTS merge_log", [])?;
         Ok(())
+    }
+
+    /// #72: 按 failure_mode 取活跃 lesson 行 (guideline_status IS NULL 且 provenance='lesson',
+    /// tenant 作用域, tombstone 排除, 创建时间升序 = 最早失败先吸收)。
+    pub fn lessons_by_mode(&self, mode: &str, tenant: &str) -> PersistResult<Vec<MemoryItem>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT * FROM memory_item WHERE failure_mode=?1 AND tenant=?2 AND tombstone=0 \
+             AND guideline_status IS NULL AND provenance='lesson' ORDER BY created_timestamp ASC",
+        )?;
+        let rows = stmt.query_map(params![mode, tenant], |r| {
+            row_to_memory(r, self.cipher.as_ref())
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// #72: 取某 failure_mode 当前 guideline (同 mode 至多一条活跃 guideline)。
+    pub fn guideline_by_mode(&self, mode: &str, tenant: &str) -> PersistResult<Option<MemoryItem>> {
+        let conn = self.conn()?;
+        conn.query_row(
+            "SELECT * FROM memory_item WHERE failure_mode=?1 AND tenant=?2 AND tombstone=0 \
+             AND guideline_status IS NOT NULL LIMIT 1",
+            params![mode, tenant],
+            |r| row_to_memory(r, self.cipher.as_ref()),
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    /// #72: 列 guideline 行, 可选 status 过滤 (注入面默认只取 'live')。
+    /// 租户作用域, tombstone 排除, merge_count 降序 (吸收越多越靠前)。
+    pub fn list_guidelines(
+        &self,
+        status: Option<&str>,
+        tenant: &str,
+        limit: u32,
+    ) -> PersistResult<Vec<MemoryItem>> {
+        let conn = self.conn()?;
+        let sql = match status {
+            Some(_) => {
+                "SELECT * FROM memory_item WHERE guideline_status=?1 AND tenant=?2 AND tombstone=0 \
+                 ORDER BY merge_count DESC, created_timestamp DESC LIMIT ?3"
+            }
+            None => {
+                "SELECT * FROM memory_item WHERE guideline_status IS NOT NULL AND tenant=?2 \
+                 AND tombstone=0 ORDER BY merge_count DESC, created_timestamp DESC LIMIT ?3"
+            }
+        };
+        let mut stmt = conn.prepare(sql)?;
+        let rows = stmt.query_map(params![status, tenant, limit as i64], |r| {
+            row_to_memory(r, self.cipher.as_ref())
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
     }
 
     /// 按 session_id 批量软删 (issue #2 delete_scope)。返被 tombstone 行数。
@@ -1794,6 +1861,14 @@ fn row_to_memory(
                 .unwrap_or_default(),
         )
         .unwrap_or_default(),
+        // #72 lesson/guideline pipeline (NULL status = non-guideline row; corrupt
+        // status degrades to None like admission_json).
+        guideline_status: row
+            .get::<_, Option<String>>("guideline_status")
+            .unwrap_or(None)
+            .filter(|s| matches!(s.as_str(), "trial" | "live" | "rejected")),
+        failure_mode: row.get::<_, Option<String>>("failure_mode").unwrap_or(None),
+        merge_count: row.get::<_, i64>("merge_count").unwrap_or(0).max(0) as u64,
     })
 }
 
@@ -2506,6 +2581,120 @@ mod tests {
         // replay identical content → no duplicate revision
         p.put_memory(&item).unwrap();
         assert_eq!(p.list_revisions("r1", 10).unwrap().len(), 1);
+    }
+
+    // #72: v12 加 guideline_status/failure_mode/merge_count 列;
+    // 模拟 v11 旧库 (DROP COLUMN + 回退版本) → migrate 补齐。
+    #[test]
+    fn schema_v12_guideline_columns_migration() {
+        let p = Persist::open_in_memory().unwrap();
+        {
+            let c = p.conn().unwrap();
+            c.execute_batch(
+                "ALTER TABLE memory_item DROP COLUMN guideline_status;
+                 ALTER TABLE memory_item DROP COLUMN failure_mode;
+                 ALTER TABLE memory_item DROP COLUMN merge_count;
+                 PRAGMA user_version=11;",
+            )
+            .unwrap();
+            schema::migrate(&c).unwrap();
+            assert_eq!(schema::user_version(&c).unwrap(), schema::SCHEMA_VERSION);
+            for col in ["guideline_status", "failure_mode", "merge_count"] {
+                let n: i64 = c
+                    .query_row(
+                        &format!(
+                            "SELECT COUNT(*) FROM pragma_table_info('memory_item') WHERE name='{col}'"
+                        ),
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(n, 1, "v12 {col} column restored by migrate");
+            }
+        }
+        // 旧行迁移后 guideline_status 可读为 None, merge_count 默认 0。
+        let item = MemoryItem::new_turn_skeleton(
+            "oldg".into(),
+            "ix".into(),
+            0,
+            "s".into(),
+            String::new(),
+            MemoryType::Episodic,
+            "legacy row".into(),
+            1000,
+        );
+        p.put_memory(&item).unwrap();
+        let got = p.get_memory("oldg").unwrap().unwrap();
+        assert!(got.guideline_status.is_none());
+        assert!(got.failure_mode.is_none());
+        assert_eq!(got.merge_count, 0);
+    }
+
+    // #72: guideline 读路径 — lessons_by_mode / guideline_by_mode /
+    // list_guidelines (tenant 作用域, tombstone 排除, provenance 过滤)。
+    #[test]
+    fn guideline_query_helpers() {
+        let p = Persist::open_in_memory().unwrap();
+        let mut lesson = MemoryItem::new_turn_skeleton(
+            "l1".into(),
+            "tap-1".into(),
+            0,
+            "s1".into(),
+            String::new(),
+            MemoryType::Episodic,
+            "read the cursor".into(),
+            1000,
+        );
+        lesson.provenance = Some("lesson".into());
+        lesson.failure_mode = Some("pagination".into());
+        p.put_memory(&lesson).unwrap();
+        // provenance != lesson 的行不算 lesson (普通行同 failure_mode 不干扰)。
+        let mut plain = MemoryItem::new_turn_skeleton(
+            "p1".into(),
+            "ix".into(),
+            0,
+            "s1".into(),
+            String::new(),
+            MemoryType::Episodic,
+            "plain row".into(),
+            1001,
+        );
+        plain.failure_mode = Some("pagination".into());
+        p.put_memory(&plain).unwrap();
+
+        let mut g = MemoryItem::new_turn_skeleton(
+            "g1".into(),
+            "ix".into(),
+            0,
+            "s1".into(),
+            String::new(),
+            MemoryType::Semantic,
+            "merged rule".into(),
+            1002,
+        );
+        g.guideline_status = Some("trial".into());
+        g.failure_mode = Some("pagination".into());
+        g.merge_count = 1;
+        p.put_memory(&g).unwrap();
+
+        assert_eq!(p.lessons_by_mode("pagination", "").unwrap().len(), 1);
+        assert!(p.guideline_by_mode("pagination", "").unwrap().is_some());
+        assert!(p.guideline_by_mode("ghost", "").unwrap().is_none());
+        // 全量 list 含 trial guideline; live 过滤不命中。
+        assert_eq!(p.list_guidelines(None, "", 50).unwrap().len(), 1);
+        assert!(p.list_guidelines(Some("live"), "", 50).unwrap().is_empty());
+        assert_eq!(p.list_guidelines(Some("trial"), "", 50).unwrap().len(), 1);
+        // tombstone 排除。
+        p.tombstone_memory("g1").unwrap();
+        assert!(p.guideline_by_mode("pagination", "").unwrap().is_none());
+        assert!(p.list_guidelines(None, "", 50).unwrap().is_empty());
+        // tenant 隔离: lesson 归 tenant A, tenant B 不可见。
+        let mut lt = lesson.clone();
+        lt.id = "l2".into();
+        lt.tenant = "A".into();
+        p.put_memory(&lt).unwrap();
+        assert_eq!(p.lessons_by_mode("pagination", "A").unwrap().len(), 1);
+        assert!(p.lessons_by_mode("pagination", "B").unwrap().is_empty());
     }
 
     // #68 B5/B4: v11 加 stale_sources_json 列 + op_ledger/shutdown_state 表;
